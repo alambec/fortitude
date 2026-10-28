@@ -674,6 +674,7 @@ dependencies = [
  "dicom-object",
  "memchr",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -685,6 +686,7 @@ dependencies = [
  "bytes",
  "dicom-core",
  "dicom-dictionary-std",
+ "form_urlencoded",
  "fortitude-core",
  "fortitude-store",
  "fortitude-testkit",
@@ -710,6 +712,7 @@ dependencies = [
  "dicom-object",
  "fortitude-core",
  "fortitude-testkit",
+ "memchr",
  "rusqlite",
  "serde_json",
  "tempfile",

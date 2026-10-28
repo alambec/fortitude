@@ -69,7 +69,16 @@ fn ddl() -> String {
                     Kind::PersonName => format!("{}_key", a.column),
                     _ => a.column.to_owned(),
                 };
-                format!("CREATE INDEX {0}_{column} ON {0}({column});", level.table())
+                // Parent keys make the index covering for searches at upper levels.
+                let parents = match level {
+                    Level::Study => "",
+                    Level::Series => ", study_pk",
+                    Level::Instance => ", study_pk, series_pk",
+                };
+                format!(
+                    "CREATE INDEX {0}_{column} ON {0}({column}{parents});",
+                    level.table()
+                )
             })
             .collect()
     };

@@ -42,6 +42,7 @@ readers = 0                # read connections; 0 = one per CPU
 [dicomweb]
 stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
 max_instance_size_mib = 4096
+qido_max_results = 10000   # QIDO-RS results per request (0 = no limit); page with offset
 
 [log]
 filter = "info"
@@ -69,6 +70,12 @@ bench/run.sh orthanc-pg http://localhost:8043/dicom-web
 bench/serve-fortitude.sh &        # empty store on :8045, pinned to SERVER_CPUS
 bench/run.sh fortitude http://localhost:8045/dicom-web
 python3 bench/summarize.py bench/results/*.jsonl
+
+# 4. Check that both servers agree (search results and metadata).
+python3 bench/diff_qido.py http://localhost:8043/dicom-web http://localhost:8045/dicom-web \
+    bench/datasets/mixed/manifest.jsonl
+python3 bench/diff_metadata.py http://localhost:8043/dicom-web http://localhost:8045/dicom-web \
+    bench/datasets/mixed/manifest.jsonl
 ```
 
 Servers are pinned to CPUs 0-5 and the load generator to 6-11 (`SERVER_CPUS`, `CLIENT_CPUS`).

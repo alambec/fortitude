@@ -3,6 +3,7 @@
 
 pub mod attrs;
 pub mod json;
+pub mod qido;
 pub mod uid;
 
 pub use dicom_core::Tag;

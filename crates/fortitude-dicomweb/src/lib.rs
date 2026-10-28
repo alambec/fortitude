@@ -3,6 +3,7 @@
 pub mod media;
 pub mod multipart;
 pub mod negotiate;
+mod qido;
 mod stow;
 mod wado;
 
@@ -13,7 +14,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use fortitude_store::Store;
 
 pub const DICOM_JSON: &str = "application/dicom+json";
@@ -29,6 +30,8 @@ pub struct Config {
     pub stow_concurrency: usize,
     /// Largest accepted instance, in bytes.
     pub max_instance_size: usize,
+    /// Maximum number of QIDO-RS results per request, 0 for no limit.
+    pub qido_max_results: usize,
 }
 
 #[derive(Clone)]
@@ -41,7 +44,15 @@ pub struct DicomWeb {
 pub fn router(state: DicomWeb) -> Router {
     const INSTANCE: &str = "/studies/{study}/series/{series}/instances/{instance}";
     Router::new()
-        .route("/studies", post(stow::store_instances))
+        .route("/studies", get(qido::studies).post(stow::store_instances))
+        .route("/series", get(qido::series))
+        .route("/instances", get(qido::instances))
+        .route("/studies/{study}/series", get(qido::study_series))
+        .route("/studies/{study}/instances", get(qido::study_instances))
+        .route(
+            "/studies/{study}/series/{series}/instances",
+            get(qido::series_instances),
+        )
         .route(
             "/studies/{study}",
             get(wado::study).post(stow::store_study_instances),
@@ -114,6 +125,7 @@ mod tests {
             public_url: public_url.map(Into::into),
             stow_concurrency: 1,
             max_instance_size: 1,
+            qido_max_results: 0,
         }
     }
 

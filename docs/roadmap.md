@@ -37,6 +37,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
    every level, frames, bulk data; `transfer-syntax=*` (stored syntax) first. *(done)*
 3. **QIDO-RS** — single value, UID list, wildcard, range (DA/TM/DT), case-insensitive PN;
    `includefield`, `limit`/`offset`, `fuzzymatching`; queries across all studies/series/instances.
+   *(done)*
 4. **WADO-URI + rendering** — `application/dicom`, then JPEG/PNG rendering with windowing
    (shared with WADO-RS `/rendered` and `/thumbnail`); decompression to Explicit VR Little Endian.
    JPEG 2000 / JPEG-LS codecs behind cargo features.

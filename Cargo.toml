@@ -28,6 +28,7 @@ dicom-dictionary-std = "0.10.1"
 dicom-object = "0.10.1"
 dicom-parser = "0.10.1"
 dicom-transfer-syntax-registry = "0.10.1"
+form_urlencoded = "1.2.2"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 futures = "0.3.34"
 hdrhistogram = "7.6.0"

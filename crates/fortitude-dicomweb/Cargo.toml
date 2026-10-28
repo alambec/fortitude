@@ -16,6 +16,7 @@ axum.workspace = true
 bytes.workspace = true
 dicom-core.workspace = true
 dicom-dictionary-std.workspace = true
+form_urlencoded.workspace = true
 futures.workspace = true
 memchr.workspace = true
 thiserror.workspace = true

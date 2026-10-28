@@ -99,6 +99,77 @@ or one part per frame (encapsulated).
 study), `400` for an invalid frame list, `406` when no accepted representation can be
 produced.
 
+## QIDO-RS — Search (PS3.18 §10.6)
+
+| Resource | Level |
+|---|---|
+| `{root}/studies` | studies |
+| `{root}/series`, `{root}/studies/{study}/series` | series |
+| `{root}/instances`, `{root}/studies/{study}/instances`, `{root}/studies/{study}/series/{series}/instances` | instances |
+
+Responses are `application/dicom+json` (`application/json` is accepted too); an empty match
+is `200` with `[]`.
+
+**Query parameters**
+- `{attributeID}={value}`, where the attribute ID is a keyword (`PatientName`), a tag
+  (`00100010`), or a sequence path (`RequestAttributesSequence.ScheduledProcedureStepID`).
+  Unknown attributes are rejected with `400`.
+- `includefield={attributeID}[,…]`, repeatable, or `includefield=all`: every attribute of the
+  representative instance except bulk data.
+- `fuzzymatching=true`: person names match when the value is the beginning of any name
+  component.
+- `limit`, `offset`. Results are capped at `dicomweb.qido_max_results` (default 10,000). When
+  the cap truncates a result set, the response has the header
+  `Warning: 299 fortitude: "The number of results exceeded the maximum supported by the server. …"`.
+
+**Matching** (PS3.4 §C.2.2.2)
+
+| Value | Matching |
+|---|---|
+| empty, `*` | universal: matches everything, and the attribute is returned |
+| `a,b` or `a\b` on UIDs | UID list |
+| `a\b` on other VRs | any of the values |
+| contains `*` or `?` | wildcard (not on UIDs, which answer `400`) |
+| `a-b`, `a-`, `-b` on DA, TM, DT | inclusive range |
+| anything else | single value |
+
+- Matching is case sensitive, except for person names.
+- Attributes of a deeper level are matched against the children of each result: for example
+  `/studies?Modality=MR` or `/studies?SOPInstanceUID=…`.
+- ModalitiesInStudy matches the modalities of the study's series.
+
+**Indexed attributes** are matched in the database:
+- **Study:** Study Instance UID, Study Date, Study Time, Accession Number, Study ID, Study
+  Description, Referring Physician's Name, Patient's Name, Patient ID, Issuer of Patient ID,
+  Patient's Birth Date, Patient's Sex.
+- **Series:** Series Instance UID, Modality, Series Number, Series Description, Series Date,
+  Series Time, Body Part Examined, Performed Procedure Step Start Date and Time.
+- **Instance:** SOP Instance UID, SOP Class UID, Instance Number.
+
+Any other attribute is matched against the stored metadata of the first instance received
+for each study or series (or of the instance itself). This is slower: pagination then
+happens after filtering.
+
+**Returned attributes**
+- **Studies:** Specific Character Set, Study Date, Study Time, Accession Number, Referring
+  Physician's Name, Timezone Offset From UTC, Study Description, Patient's Name, Patient ID,
+  Issuer of Patient ID, Patient's Birth Date, Patient's Sex, Study Instance UID, Study ID,
+  Modalities in Study (sorted), Number of Study Related Series and Instances, Instance
+  Availability (`ONLINE`), Retrieve URL.
+- **Series:** Specific Character Set, Series Date, Series Time, Modality, Timezone Offset
+  From UTC, Series Description, Performed Procedure Step Start Date and Time, Request
+  Attributes Sequence, Body Part Examined, Series Instance UID, Series Number, Number of
+  Series Related Instances, Instance Availability, Retrieve URL. Study attributes are added
+  when the request does not name the study.
+- **Instances:** Specific Character Set, SOP Class UID, SOP Instance UID, Timezone Offset
+  From UTC, Instance Number, Rows, Columns, Bits Allocated, Number of Frames, Instance
+  Availability, Retrieve URL. Series and study attributes are added when the request does
+  not name them.
+- Also returned: attributes requested with `includefield`, and those used as matching keys.
+
+Study and series attributes are taken from the first instance received for the study or
+series.
+
 ## DICOM JSON
 
 - All strings are UTF-8. Specific Character Set (0008,0005), when present, is returned as

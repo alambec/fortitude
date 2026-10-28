@@ -18,6 +18,8 @@ use crate::ingest::InstanceRecord;
 
 /// Maximum number of commands applied in one transaction.
 const MAX_BATCH: usize = 512;
+/// Inserts between refreshes of the query planner statistics.
+const ANALYZE_EVERY: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
@@ -46,6 +48,9 @@ pub(crate) fn spawn(conn: Connection) -> std::io::Result<mpsc::Sender<Command>> 
 fn run(mut conn: Connection, mut rx: mpsc::Receiver<Command>) {
     let statements = Statements::new();
     let mut batch = Vec::with_capacity(MAX_BATCH);
+    // Without statistics, SQLite cannot tell a selective index from one that is not.
+    optimize(&conn);
+    let mut since_analyze = 0;
     while let Some(first) = rx.blocking_recv() {
         batch.push(first);
         while batch.len() < MAX_BATCH {
@@ -54,7 +59,19 @@ fn run(mut conn: Connection, mut rx: mpsc::Receiver<Command>) {
                 Err(_) => break,
             }
         }
+        since_analyze += batch.len();
         apply(&mut conn, &statements, &mut batch);
+        if since_analyze >= ANALYZE_EVERY {
+            optimize(&conn);
+            since_analyze = 0;
+        }
+    }
+}
+
+fn optimize(conn: &Connection) {
+    // 0x10002: analyze every table whose statistics may be stale, without size limit.
+    if let Err(e) = conn.execute_batch("PRAGMA optimize = 0x10002;") {
+        tracing::warn!(error = %e, "cannot refresh index statistics");
     }
 }
 

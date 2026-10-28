@@ -1,1 +1,0 @@
-{"kind":"stow","label":"fortitude","url":"http://localhost:8045/dicom-web/studies","concurrency":8,"batch":20,"instances":1530,"failed_instances":0,"requests":170,"error_statuses":{},"wall_s":2.268396999,"instances_per_s":674.4851102670675,"mib_per_s":668.5208255560954,"p50_ms":28.527,"p90_ms":116.671,"p99_ms":518.399,"max_ms":632.831}

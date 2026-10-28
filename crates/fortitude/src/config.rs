@@ -76,6 +76,9 @@ pub struct DicomWebConfig {
     pub stow_concurrency: usize,
     /// Largest accepted instance, in MiB.
     pub max_instance_size_mib: usize,
+    /// Maximum number of QIDO-RS results per request (0 for no limit). Clients can page
+    /// through larger result sets with `offset`.
+    pub qido_max_results: usize,
 }
 
 impl Default for DicomWebConfig {
@@ -83,6 +86,7 @@ impl Default for DicomWebConfig {
         Self {
             stow_concurrency: 4,
             max_instance_size_mib: 4096,
+            qido_max_results: 10_000,
         }
     }
 }

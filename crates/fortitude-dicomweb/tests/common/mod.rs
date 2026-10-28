@@ -36,6 +36,7 @@ pub fn app() -> App {
         public_url: None,
         stow_concurrency: 4,
         max_instance_size: 1 << 24,
+        qido_max_results: 50,
     };
     let router = fortitude_dicomweb::router(DicomWeb {
         store: store.clone(),

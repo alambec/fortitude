@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
                 .dicomweb
                 .max_instance_size_mib
                 .saturating_mul(1 << 20),
+            qido_max_results: config.dicomweb.qido_max_results,
         }),
     };
 
