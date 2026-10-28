@@ -15,28 +15,38 @@ publish = false
 fortitude-core = { path = "crates/fortitude-core" }
 fortitude-store = { path = "crates/fortitude-store" }
 fortitude-dicomweb = { path = "crates/fortitude-dicomweb" }
+fortitude-testkit = { path = "crates/fortitude-testkit" }
 
 anyhow = "1.0.104"
+async-stream = "0.3.6"
 axum = "0.8.9"
+base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dicom-core = "0.10.1"
 dicom-dictionary-std = "0.10.1"
 dicom-object = "0.10.1"
+dicom-parser = "0.10.1"
 dicom-transfer-syntax-registry = "0.10.1"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 futures = "0.3.34"
-humantime = "2.3.0"
 hdrhistogram = "7.6.0"
+humantime = "2.3.0"
+memchr = "2.8.3"
 rayon = "1.12.0"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 walkdir = "2.5.0"
 
 [workspace.lints.rust]

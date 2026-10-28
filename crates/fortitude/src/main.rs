@@ -1,11 +1,14 @@
 mod config;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
+use fortitude_dicomweb::DicomWeb;
+use fortitude_store::{Store, StoreOptions};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -25,9 +28,36 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(cli.config.as_deref()).context("invalid configuration")?;
     init_tracing(&config);
 
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let store = Store::open(StoreOptions {
+        path: config.storage.path.clone(),
+        fsync: config.storage.fsync,
+        index_readers: match config.index.readers {
+            0 => cpus,
+            n => n,
+        },
+        inline_binary_max: config.storage.inline_binary_max,
+    })
+    .with_context(|| format!("cannot open storage at {}", config.storage.path.display()))?;
+    let dicomweb = DicomWeb {
+        store,
+        config: Arc::new(fortitude_dicomweb::Config {
+            root: config.http.dicomweb_root.clone(),
+            public_url: config.http.public_url.clone(),
+            stow_concurrency: config.dicomweb.stow_concurrency,
+            max_instance_size: config
+                .dicomweb
+                .max_instance_size_mib
+                .saturating_mul(1 << 20),
+        }),
+    };
+
     let app = Router::new()
         .route("/health", get(health))
-        .nest(&config.http.dicomweb_root, fortitude_dicomweb::router())
+        .nest(
+            &config.http.dicomweb_root,
+            fortitude_dicomweb::router(dicomweb),
+        )
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(config.http.listen)

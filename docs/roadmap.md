@@ -32,6 +32,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 0. **Foundation** — workspace, CI, config, benchmark tool, Orthanc baseline. *(done)*
 1. **Ingest + STOW-RS** — streamed multipart, header parsing, offsets, pre-encoded JSON,
    group-committing SQLite writer, Specific Character Set to UTF-8, duplicate policy above.
+   *(done)*
 2. **WADO-RS** — study/series/instance retrieval (multipart `application/dicom`), metadata at
    every level, frames, bulk data; `transfer-syntax=*` (stored syntax) first.
 3. **QIDO-RS** — single value, UID list, wildcard, range (DA/TM/DT), case-insensitive PN;

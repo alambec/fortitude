@@ -29,16 +29,27 @@ variables with `__` between sections.
 [http]
 listen = "0.0.0.0:8042"
 dicomweb_root = "/dicom-web"
+# public_url = "https://pacs.example.org"   # default: from Host / X-Forwarded-* headers
 
 [storage]
-path = "./data"
+path = "./data"            # files/ and index.sqlite
+fsync = false              # flush each file before acknowledging it
+inline_binary_max = 1024   # larger binary attributes are served as BulkDataURI
+
+[index]
+readers = 0                # read connections; 0 = one per CPU
+
+[dicomweb]
+stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
+max_instance_size_mib = 4096
 
 [log]
 filter = "info"
 format = "text"   # or "json"
 ```
 
-`GET /health` reports liveness.
+`GET /health` reports liveness. The supported DICOMweb services are described in the
+[conformance statement](docs/conformance.md).
 
 ## Benchmarks
 
@@ -55,12 +66,12 @@ docker compose -f bench/orthanc/docker-compose.yml up -d
 
 # 3. Run the suite against an empty server, then compare.
 bench/run.sh orthanc-pg http://localhost:8043/dicom-web
-bench/run.sh fortitude http://localhost:8042/dicom-web
+bench/serve-fortitude.sh &        # empty store on :8045, pinned to SERVER_CPUS
+bench/run.sh fortitude http://localhost:8045/dicom-web
 python3 bench/summarize.py bench/results/*.jsonl
 ```
 
-Servers are pinned to CPUs 0-5 and the load generator to 6-11 (`SERVER_CPUS`, `CLIENT_CPUS`);
-run Fortitude with `taskset -c 0-5` for a fair comparison.
+Servers are pinned to CPUs 0-5 and the load generator to 6-11 (`SERVER_CPUS`, `CLIENT_CPUS`).
 
 ## License
 

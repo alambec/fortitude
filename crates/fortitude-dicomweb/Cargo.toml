@@ -8,7 +8,24 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+fortitude-core.workspace = true
+fortitude-store.workspace = true
+
 axum.workspace = true
+bytes.workspace = true
+dicom-core.workspace = true
+dicom-dictionary-std.workspace = true
+futures.workspace = true
+memchr.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+fortitude-testkit.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true

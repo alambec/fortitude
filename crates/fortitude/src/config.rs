@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub http: HttpConfig,
     pub storage: StorageConfig,
+    pub index: IndexConfig,
+    pub dicomweb: DicomWebConfig,
     pub log: LogConfig,
 }
 
@@ -22,6 +24,9 @@ pub struct HttpConfig {
     pub listen: SocketAddr,
     /// Path under which the DICOMweb services are mounted.
     pub dicomweb_root: String,
+    /// Public origin used in returned URLs (e.g. `https://pacs.example.org`); derived from
+    /// the `Host` and `X-Forwarded-*` request headers when unset.
+    pub public_url: Option<String>,
 }
 
 impl Default for HttpConfig {
@@ -29,6 +34,7 @@ impl Default for HttpConfig {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 8042)),
             dicomweb_root: "/dicom-web".to_owned(),
+            public_url: None,
         }
     }
 }
@@ -38,12 +44,45 @@ impl Default for HttpConfig {
 pub struct StorageConfig {
     /// Directory holding the DICOM files and the index database.
     pub path: PathBuf,
+    /// Flush every received file to disk before acknowledging it. Safer on power loss,
+    /// much slower on most disks.
+    pub fsync: bool,
+    /// Binary attributes up to this size (bytes) are inlined in metadata responses; larger
+    /// ones are referenced with a BulkDataURI.
+    pub inline_binary_max: usize,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from("./data"),
+            fsync: false,
+            inline_binary_max: 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexConfig {
+    /// Read connections to the index; 0 means one per CPU.
+    pub readers: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DicomWebConfig {
+    /// Instances of one STOW-RS request processed concurrently.
+    pub stow_concurrency: usize,
+    /// Largest accepted instance, in MiB.
+    pub max_instance_size_mib: usize,
+}
+
+impl Default for DicomWebConfig {
+    fn default() -> Self {
+        Self {
+            stow_concurrency: 4,
+            max_instance_size_mib: 4096,
         }
     }
 }

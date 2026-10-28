@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 fortitude-dicomweb.workspace = true
+fortitude-store.workspace = true
 
 anyhow.workspace = true
 axum.workspace = true
