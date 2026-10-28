@@ -1,0 +1,7 @@
+/target
+/data
+/bench/datasets
+/bench/results/*.raw
+*.dcm
+.env
+/bench/var

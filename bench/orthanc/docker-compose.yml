@@ -1,0 +1,78 @@
+# Orthanc baselines for the Fortitude benchmarks.
+#
+#   orthanc-pg      http://localhost:8043   PostgreSQL index, filesystem storage
+#   orthanc-sqlite  http://localhost:8044   built-in SQLite index (same engine as Fortitude)
+#
+# Configuration follows the Orthanc Book recommendations for DICOMweb: the DICOMweb plugin
+# keeps its default "Full" metadata mode with the metadata cache, and ExtraMainDicomTags is
+# the sample from https://orthanc.uclouvain.be/book/faq/main-dicom-tags.html#dicomweb.
+#
+# Servers are pinned to SERVER_CPUS (default 0-5); run the load generator on the other cores
+# (`taskset -c 6-11 fortitude-bench ...`). Data lives under bench/var (bind mounts, so it can
+# sit on a larger filesystem than /var/lib/docker).
+
+name: fortitude-bench
+
+x-orthanc-env: &orthanc-env
+  ORTHANC__NAME: "orthanc-bench"
+  ORTHANC__AUTHENTICATION_ENABLED: "false"
+  ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
+  ORTHANC__SAVE_JOBS: "false"
+  ORTHANC__KEEP_ALIVE: "true"
+  ORTHANC__TCP_NO_DELAY: "true"
+  ORTHANC__HTTP_THREADS_COUNT: "50"
+  ORTHANC__STORAGE_COMPRESSION: "false"
+  ORTHANC__VERBOSE_ENABLED: "false"
+  DICOM_WEB_PLUGIN_ENABLED: "true"
+  ORTHANC__DICOM_WEB__ENABLE: "true"
+  ORTHANC__EXTRA_MAIN_DICOM_TAGS: |
+    {
+      "Instance": ["Rows", "Columns", "ImageType", "SOPClassUID", "ContentDate", "ContentTime",
+                   "FrameOfReferenceUID", "PixelSpacing", "SpecificCharacterSet",
+                   "BitsAllocated", "BitsStored"],
+      "Series": ["TimezoneOffsetFromUTC", "PerformedProcedureStepStartDate",
+                 "PerformedProcedureStepStartTime", "RequestAttributesSequence"],
+      "Study": ["TimezoneOffsetFromUTC"],
+      "Patient": []
+    }
+
+services:
+  postgres:
+    image: postgres:17
+    cpuset: "${SERVER_CPUS:-0-5}"
+    environment:
+      POSTGRES_PASSWORD: postgres
+    command: postgres -c shared_buffers=1GB -c max_connections=200
+    volumes:
+      - ../var/postgres:/var/lib/postgresql/data:Z
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+
+  orthanc-pg:
+    image: orthancteam/orthanc:26.9.1
+    cpuset: "${SERVER_CPUS:-0-5}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports: ["8043:8042"]
+    environment:
+      <<: *orthanc-env
+      ORTHANC__POSTGRESQL__HOST: postgres
+      ORTHANC__POSTGRESQL__USERNAME: postgres
+      ORTHANC__POSTGRESQL__PASSWORD: postgres
+      ORTHANC__POSTGRESQL__DATABASE: postgres
+      ORTHANC__POSTGRESQL__ENABLE_INDEX: "true"
+      ORTHANC__POSTGRESQL__ENABLE_STORAGE: "false"
+    volumes:
+      - ../var/orthanc-pg:/var/lib/orthanc/db:Z
+
+  orthanc-sqlite:
+    image: orthancteam/orthanc:26.9.1
+    cpuset: "${SERVER_CPUS:-0-5}"
+    ports: ["8044:8042"]
+    environment:
+      <<: *orthanc-env
+    volumes:
+      - ../var/orthanc-sqlite:/var/lib/orthanc/db:Z

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bench/fortitude-bench"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license-file = "LICENSE"
+repository = "https://github.com/alambec/fortitude"
+publish = false
+
+[workspace.dependencies]
+fortitude-core = { path = "crates/fortitude-core" }
+fortitude-store = { path = "crates/fortitude-store" }
+fortitude-dicomweb = { path = "crates/fortitude-dicomweb" }
+
+anyhow = "1.0.104"
+axum = "0.8.9"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dicom-core = "0.10.1"
+dicom-dictionary-std = "0.10.1"
+dicom-object = "0.10.1"
+dicom-transfer-syntax-registry = "0.10.1"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+futures = "0.3.34"
+humantime = "2.3.0"
+hdrhistogram = "7.6.0"
+rayon = "1.12.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+walkdir = "2.5.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+# The bench tool rewrites many DICOM files; keep dev builds of dicom-rs usable.
+[profile.dev.package."*"]
+opt-level = 2
