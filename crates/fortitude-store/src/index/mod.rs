@@ -13,6 +13,7 @@ pub use readers::Readers;
 pub use writer::{InsertOutcome, person_name_key};
 
 use crate::ingest::InstanceRecord;
+use crate::retrieve::Scope;
 use writer::Command;
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -70,6 +71,16 @@ impl Index {
         let (reply, response) = oneshot::channel();
         self.writer
             .send(Command::Insert(Box::new(record), reply))
+            .await
+            .map_err(|_| IndexError::WriterStopped)?;
+        response.await.map_err(|_| IndexError::WriterStopped)?
+    }
+
+    /// Delete the instances of `scope` from the index; returns the paths of their files.
+    pub async fn delete(&self, scope: Scope) -> Result<Vec<String>, IndexError> {
+        let (reply, response) = oneshot::channel();
+        self.writer
+            .send(Command::Delete(scope, reply))
             .await
             .map_err(|_| IndexError::WriterStopped)?;
         response.await.map_err(|_| IndexError::WriterStopped)?

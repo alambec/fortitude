@@ -137,3 +137,55 @@ async fn rejects_unsupported_requests() {
         .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn deletes_resources() {
+    let app = app();
+    let instances: Vec<Instance> = fortitude_testkit::series("1.2.3", "1.2.3.1", 2);
+    let other = Instance::new("1.2.3", "1.2.3.2", "1.2.3.2.1").with(|i| i.modality = "SR".into());
+    let mut all: Vec<&Instance> = instances.iter().collect();
+    all.push(&other);
+    app.stow("/studies", &all).await;
+
+    let delete = |path: &str| {
+        axum::http::Request::delete(path)
+            .header("host", common::HOST)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let reply = app
+        .send(delete("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1"))
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        app.send(delete("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.send(delete("/studies/9.9/series/1.2.3.2")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.send(delete("/studies/1.2.3/series/1.2.3.2"))
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+
+    let study = &app.get("/studies", "application/dicom+json").await.json()[0];
+    assert_eq!(study["00201206"]["Value"][0], 1);
+    assert_eq!(study["00201208"]["Value"][0], 1);
+    assert_eq!(study["00080061"]["Value"], serde_json::json!(["CT"]));
+    let gone = app
+        .get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1", "*/*")
+        .await;
+    assert_eq!(gone.status, StatusCode::NOT_FOUND);
+
+    // Deleted instances can be stored again.
+    assert_eq!(
+        app.stow("/studies", &[&instances[0]]).await.status,
+        StatusCode::OK
+    );
+}

@@ -1,16 +1,15 @@
+mod admin;
+mod app;
+mod auth;
 mod config;
+mod metrics;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Context;
-use axum::routing::get;
 use axum::serve::ListenerExt;
-use axum::{Json, Router};
 use clap::Parser;
-use fortitude_dicomweb::DicomWeb;
 use fortitude_store::{Store, StoreOptions};
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, LogFormat};
@@ -40,31 +39,18 @@ async fn main() -> anyhow::Result<()> {
         inline_binary_max: config.storage.inline_binary_max,
     })
     .with_context(|| format!("cannot open storage at {}", config.storage.path.display()))?;
-    let dicomweb = DicomWeb {
-        store,
-        config: Arc::new(fortitude_dicomweb::Config {
-            root: config.http.dicomweb_root.clone(),
-            public_url: config.http.public_url.clone(),
-            stow_concurrency: config.dicomweb.stow_concurrency,
-            max_instance_size: config
-                .dicomweb
-                .max_instance_size_mib
-                .saturating_mul(1 << 20),
-            qido_max_results: config.dicomweb.qido_max_results,
-        }),
+    let metrics_handle = if config.metrics.enabled {
+        let recorder = metrics::recorder();
+        let handle = recorder.handle();
+        ::metrics::set_global_recorder(recorder).context("cannot install the metrics recorder")?;
+        Some(handle)
+    } else {
+        None
     };
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(fortitude_dicomweb::wado_uri_router(
-            &config.http.wado_root,
-            dicomweb.clone(),
-        ))
-        .nest(
-            &config.http.dicomweb_root,
-            fortitude_dicomweb::router(dicomweb),
-        )
-        .layer(TraceLayer::new_for_http());
+    if config.auth.users.is_empty() && config.auth.tokens.is_empty() {
+        tracing::warn!("no credentials configured: authentication is disabled");
+    }
+    let app = app::build(&config, store, metrics_handle);
 
     // Without TCP_NODELAY, the last segment of a streamed response can wait for the
     // client's delayed ACK (~40 ms).
@@ -93,10 +79,6 @@ fn init_tracing(config: &Config) {
         LogFormat::Text => builder.init(),
         LogFormat::Json => builder.json().init(),
     }
-}
-
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 async fn shutdown_signal() {

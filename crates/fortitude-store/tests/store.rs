@@ -247,3 +247,56 @@ fn walkdir_count(dir: &std::path::Path) -> usize {
         })
         .sum()
 }
+
+#[tokio::test]
+async fn deletion_keeps_counts_consistent() {
+    use fortitude_store::retrieve::Scope;
+    let (dir, s) = open();
+    for (series, modality, count) in [("1.8.1", "CT", 3), ("1.8.2", "SR", 1)] {
+        for i in 0..count {
+            let instance = Instance::new("1.8", series, &format!("{series}.{i}"))
+                .with(|inst| inst.modality = modality.into());
+            store(&s, &instance).await.unwrap();
+        }
+    }
+    let study = |s: Arc<Store>| async move {
+        s.index()
+            .readers()
+            .run(|conn| {
+                Ok(conn.query_row(
+                    "SELECT num_series, num_instances, modalities, rep_instance IS NOT NULL FROM studies",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?)),
+                )?)
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(s.statistics().await.unwrap().instances, 4);
+
+    assert_eq!(
+        s.delete(Scope::instance("1.8", "1.8.1", "1.8.1.0"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(study(s.clone()).await, (2, 3, "CT\\SR".into(), true));
+
+    assert_eq!(s.delete(Scope::series("1.8", "1.8.2")).await.unwrap(), 1);
+    assert_eq!(study(s.clone()).await, (1, 2, "CT".into(), true));
+    assert_eq!(s.delete(Scope::series("1.8", "1.8.2")).await.unwrap(), 0);
+
+    assert_eq!(s.delete(Scope::study("1.8")).await.unwrap(), 2);
+    let stats = s.statistics().await.unwrap();
+    assert_eq!(
+        (stats.studies, stats.series, stats.instances, stats.size),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(walkdir_count(&dir.path().join("files")), 0);
+
+    // The study can be stored again.
+    store(&s, &Instance::new("1.8", "1.8.1", "1.8.1.0"))
+        .await
+        .unwrap();
+    assert_eq!(s.statistics().await.unwrap().studies, 1);
+}

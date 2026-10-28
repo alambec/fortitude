@@ -221,6 +221,25 @@ happens after filtering.
 Study and series attributes are taken from the first instance received for the study or
 series.
 
+## Deletion
+
+PS3.18 defines no deletion transaction. Like other archives, Fortitude accepts `DELETE` on
+`{root}/studies/{study}`, `{root}/studies/{study}/series/{series}` and
+`{root}/studies/{study}/series/{series}/instances/{instance}`:
+- `204 No Content` when instances were deleted, `404` when the resource does not exist.
+- Their files are removed. Series and studies left empty are removed.
+- Counts and Modalities in Study of the remaining ones are updated.
+- Deleted instances can be stored again.
+
+## Security
+
+When credentials are configured (`auth.users` for HTTP Basic, `auth.tokens` for Bearer),
+every service except `/health` and `/metrics` requires them:
+- `401` without valid credentials.
+- `403` for read-only credentials on methods other than `GET`, `HEAD` and `OPTIONS`.
+
+There is no per-study access control. TLS is expected to be terminated by a reverse proxy.
+
 ## DICOM JSON
 
 - All strings are UTF-8. Specific Character Set (0008,0005), when present, is returned as

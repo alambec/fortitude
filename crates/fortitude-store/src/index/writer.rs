@@ -5,7 +5,8 @@
 //! commit): under concurrent STOW-RS, the cost of a commit is shared by many instances. Each
 //! command runs in its own savepoint, so one failing instance does not affect the others.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::BTreeSet;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fortitude_core::attrs::{self, INDEXED, Kind, Level};
 use rusqlite::types::Value;
@@ -15,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::IndexError;
 use super::schema;
 use crate::ingest::InstanceRecord;
+use crate::retrieve::Scope;
 
 /// Maximum number of commands applied in one transaction.
 const MAX_BATCH: usize = 512;
@@ -35,6 +37,13 @@ pub(crate) enum Command {
         Box<InstanceRecord>,
         oneshot::Sender<Result<InsertOutcome, IndexError>>,
     ),
+    /// Delete the instances of a scope; replies with the paths of their files.
+    Delete(Scope, oneshot::Sender<Result<Vec<String>, IndexError>>),
+}
+
+enum Applied {
+    Insert(rusqlite::Result<InsertOutcome>),
+    Delete(rusqlite::Result<Vec<String>>),
 }
 
 pub(crate) fn spawn(conn: Connection) -> std::io::Result<mpsc::Sender<Command>> {
@@ -79,35 +88,108 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
+    let started = Instant::now();
     let mut results = Vec::with_capacity(batch.len());
     let committed = (|| -> rusqlite::Result<()> {
         let mut tx = conn.transaction()?;
         for command in batch.iter() {
-            let Command::Insert(record, _) = command;
             let sp = tx.savepoint()?;
-            let result = insert(&sp, statements, record, now);
-            if matches!(result, Ok(InsertOutcome::Inserted)) {
+            let (applied, keep) = match command {
+                Command::Insert(record, _) => {
+                    let result = insert(&sp, statements, record, now);
+                    let keep = matches!(result, Ok(InsertOutcome::Inserted));
+                    (Applied::Insert(result), keep)
+                }
+                Command::Delete(scope, _) => {
+                    let result = delete(&sp, scope);
+                    let keep = result.as_ref().is_ok_and(|paths| !paths.is_empty());
+                    (Applied::Delete(result), keep)
+                }
+            };
+            if keep {
                 sp.commit()?;
             }
-            results.push(result.map_err(IndexError::from));
+            results.push(applied);
         }
         tx.commit()
     })();
+    metrics::histogram!("fortitude_index_batch_size").record(batch.len() as f64);
+    metrics::histogram!("fortitude_index_commit_seconds").record(started.elapsed().as_secs_f64());
 
-    for (command, result) in batch.drain(..).zip(
-        results
-            .into_iter()
-            .map(Some)
-            .chain(std::iter::repeat_with(|| None)),
-    ) {
-        let Command::Insert(_, reply) = command;
-        let result = match (&committed, result) {
-            (Ok(()), Some(result)) => result,
-            (Err(e), _) => Err(IndexError::Sqlite(e.to_string())),
-            (Ok(()), None) => Err(IndexError::Sqlite("transaction aborted".into())),
+    let mut results = results.into_iter();
+    for command in batch.drain(..) {
+        let applied = results.next();
+        let failure = || match &committed {
+            Err(e) => IndexError::Sqlite(e.to_string()),
+            Ok(()) => IndexError::Sqlite("transaction aborted".into()),
         };
-        let _ = reply.send(result);
+        match (command, applied) {
+            (Command::Insert(_, reply), Some(Applied::Insert(result))) if committed.is_ok() => {
+                let _ = reply.send(result.map_err(IndexError::from));
+            }
+            (Command::Delete(_, reply), Some(Applied::Delete(result))) if committed.is_ok() => {
+                let _ = reply.send(result.map_err(IndexError::from));
+            }
+            (Command::Insert(_, reply), _) => {
+                let _ = reply.send(Err(failure()));
+            }
+            (Command::Delete(_, reply), _) => {
+                let _ = reply.send(Err(failure()));
+            }
+        }
     }
+}
+
+/// Delete the instances of `scope`, then the series and studies left empty, and refresh
+/// the counters, representative instances and modalities of the others.
+fn delete(conn: &Connection, scope: &Scope) -> rusqlite::Result<Vec<String>> {
+    let (sql, params) = scope.select("i.pk, i.path, i.series_pk, i.study_pk");
+    let rows: Vec<(i64, String, i64, i64)> = conn
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut series = BTreeSet::new();
+    let mut studies = BTreeSet::new();
+    for (pk, _, series_pk, study_pk) in &rows {
+        conn.prepare_cached("DELETE FROM instances WHERE pk = ?")?
+            .execute([pk])?;
+        series.insert(*series_pk);
+        studies.insert(*study_pk);
+    }
+    for pk in series {
+        conn.prepare_cached(
+            "DELETE FROM series WHERE pk = ?1 AND NOT EXISTS (SELECT 1 FROM instances WHERE series_pk = ?1)",
+        )?
+        .execute([pk])?;
+        conn.prepare_cached(
+            "UPDATE series SET
+                num_instances = (SELECT count(*) FROM instances WHERE series_pk = ?1),
+                rep_instance = (SELECT min(pk) FROM instances WHERE series_pk = ?1)
+             WHERE pk = ?1",
+        )?
+        .execute([pk])?;
+    }
+    for pk in studies {
+        conn.prepare_cached(
+            "DELETE FROM studies WHERE pk = ?1 AND NOT EXISTS (SELECT 1 FROM series WHERE study_pk = ?1)",
+        )?
+        .execute([pk])?;
+        conn.prepare_cached(
+            "UPDATE studies SET
+                num_series = (SELECT count(*) FROM series WHERE study_pk = ?1),
+                num_instances = (SELECT count(*) FROM instances WHERE study_pk = ?1),
+                rep_instance = (SELECT min(pk) FROM instances WHERE study_pk = ?1),
+                modalities = coalesce((SELECT group_concat(m, '\\') FROM (
+                    SELECT DISTINCT modality AS m FROM series
+                    WHERE study_pk = ?1 AND coalesce(modality, '') != ''
+                )), '')
+             WHERE pk = ?1",
+        )?
+        .execute([pk])?;
+    }
+    Ok(rows.into_iter().map(|(_, path, _, _)| path).collect())
 }
 
 /// SQL statements built once from the indexed attributes.

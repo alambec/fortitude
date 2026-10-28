@@ -42,8 +42,17 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
    (shared with WADO-RS `/rendered` and `/thumbnail`); decompression to Explicit VR Little Endian.
    JPEG 2000 / JPEG-LS codecs behind cargo features. *(done; JPEG-LS not available yet, see
    the conformance statement)*
-5. **Operations** — admin API (delete, statistics), authentication, Prometheus metrics; then
-   PostgreSQL index, DIMSE.
+5. **Operations** — admin API (delete, statistics), authentication, Prometheus metrics, Docker
+   image. *(done)*
+
+## Next
+
+- **JPEG-LS** decoding (CharLS build on RHEL-family systems), and a faster JPEG 2000
+  decoder.
+- **DIMSE**: C-STORE SCP first (modalities pushing images), then C-FIND and C-MOVE.
+- **PostgreSQL index** behind the same writer/reader interface.
+- **Retention and integrity**: periodic check of files against the index, orphan file
+  cleanup after crashes.
 
 ## Benchmarks
 

@@ -223,6 +223,14 @@ fn response(
         members.push(json::sequence_member(tags::OTHER_FAILURES_SEQUENCE, &items));
     }
 
+    let duplicates = warnings as u64;
+    metrics::counter!("fortitude_stow_instances_total", "outcome" => "stored")
+        .increment(referenced.len() as u64 - duplicates);
+    metrics::counter!("fortitude_stow_instances_total", "outcome" => "duplicate")
+        .increment(duplicates);
+    metrics::counter!("fortitude_stow_instances_total", "outcome" => "failed")
+        .increment((failed.len() + other_failures.len()) as u64);
+
     let status = if referenced.is_empty() {
         if failed.is_empty() && other_failures.is_empty() {
             StatusCode::BAD_REQUEST

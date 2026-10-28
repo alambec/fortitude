@@ -50,7 +50,7 @@ impl Scope {
 
     /// `FROM … WHERE …` clause selecting the instances of the scope, with its parameters.
     /// Instances are ordered by series number and instance number.
-    fn select(&self, columns: &str) -> (String, Vec<String>) {
+    pub(crate) fn select(&self, columns: &str) -> (String, Vec<String>) {
         let from = "FROM instances i JOIN series s ON s.pk = i.series_pk JOIN studies st ON st.pk = i.study_pk";
         let order = "ORDER BY s.series_number, s.pk, i.instance_number, i.pk";
         match (&self.series, &self.instance) {

@@ -1,5 +1,6 @@
 //! DICOMweb HTTP services: STOW-RS, WADO-RS, QIDO-RS and WADO-URI.
 
+mod delete;
 pub mod media;
 pub mod multipart;
 pub mod negotiate;
@@ -57,15 +58,20 @@ pub fn router(state: DicomWeb) -> Router {
         )
         .route(
             "/studies/{study}",
-            get(wado::study).post(stow::store_study_instances),
+            get(wado::study)
+                .post(stow::store_study_instances)
+                .delete(delete::study),
         )
         .route("/studies/{study}/metadata", get(wado::study_metadata))
-        .route("/studies/{study}/series/{series}", get(wado::series))
+        .route(
+            "/studies/{study}/series/{series}",
+            get(wado::series).delete(delete::series),
+        )
         .route(
             "/studies/{study}/series/{series}/metadata",
             get(wado::series_metadata),
         )
-        .route(INSTANCE, get(wado::instance))
+        .route(INSTANCE, get(wado::instance).delete(delete::instance))
         .route(
             &format!("{INSTANCE}/metadata"),
             get(wado::instance_metadata),

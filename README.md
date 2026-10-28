@@ -20,6 +20,9 @@ See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 
 ```sh
 cargo run --release -p fortitude -- --config fortitude.toml
+# or
+docker build -t fortitude .
+docker run -p 8042:8042 -v fortitude-data:/var/lib/fortitude fortitude
 ```
 
 Configuration is layered: defaults, then the TOML file, then `FORTITUDE_*` environment
@@ -45,13 +48,48 @@ stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
 max_instance_size_mib = 4096
 qido_max_results = 10000   # QIDO-RS results per request (0 = no limit); page with offset
 
+[metrics]
+enabled = true             # Prometheus metrics on /metrics
+
+# Without any user or token, authentication is disabled.
+[[auth.users]]             # HTTP Basic
+name = "admin"
+password = "change-me"
+[[auth.users]]
+name = "viewer"
+password = "change-me-too"
+read_only = true           # GET, HEAD and OPTIONS only
+[[auth.tokens]]            # HTTP Bearer
+token = "a-long-random-token"
+
 [log]
 filter = "info"
 format = "text"   # or "json"
 ```
 
-`GET /health` reports liveness. The supported DICOMweb services are described in the
-[conformance statement](docs/conformance.md).
+Environment variables take precedence over the file, e.g.
+`FORTITUDE_AUTH__TOKENS='[{token="…"}]'`. Credentials are plain text: keep the file
+readable only by the server, or inject them through the environment.
+
+| Endpoint | Purpose |
+|---|---|
+| `{dicomweb_root}/…` | DICOMweb: STOW-RS, WADO-RS, QIDO-RS, rendered resources, thumbnails; `DELETE` on studies, series and instances |
+| `{wado_root}` | WADO-URI |
+| `GET /admin/statistics` | Number of studies, series and instances, and stored size |
+| `GET /health` | Liveness (never authenticated) |
+| `GET /metrics` | Prometheus metrics (never authenticated) |
+
+The DICOMweb services are described in the [conformance statement](docs/conformance.md).
+
+### Metrics
+
+| Metric | Labels |
+|---|---|
+| `fortitude_http_requests_total` | `method`, `route`, `status` |
+| `fortitude_http_request_duration_seconds` (histogram, until response headers) | `method`, `route` |
+| `fortitude_stow_instances_total` | `outcome`: `stored`, `duplicate`, `failed` |
+| `fortitude_index_batch_size` (histogram: instances per index transaction) | |
+| `fortitude_index_commit_seconds` (histogram) | |
 
 ## Benchmarks
 

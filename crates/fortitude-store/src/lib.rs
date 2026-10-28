@@ -188,6 +188,61 @@ impl Store {
     }
 }
 
+/// Counts and size of the stored data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Statistics {
+    pub studies: u64,
+    pub series: u64,
+    pub instances: u64,
+    /// Total size of the stored files, in bytes.
+    pub size: u64,
+}
+
+impl Store {
+    /// Delete the instances of `scope` and their files; returns how many were deleted.
+    pub async fn delete(self: &Arc<Self>, scope: retrieve::Scope) -> Result<usize, IndexError> {
+        let paths = self.index.delete(scope).await?;
+        let count = paths.len();
+        let store = self.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            for path in &paths {
+                if let Err(e) = store.files.remove(path) {
+                    tracing::warn!(%path, error = %e, "cannot remove deleted file");
+                }
+            }
+        })
+        .await;
+        if let Err(e) = removed {
+            tracing::warn!(error = %e, "file removal task failed");
+        }
+        Ok(count)
+    }
+
+    pub async fn statistics(self: &Arc<Self>) -> Result<Statistics, IndexError> {
+        self.index
+            .readers()
+            .run(|conn| {
+                let count = |table: &str| -> rusqlite::Result<u64> {
+                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .map(|n| n as u64)
+                };
+                Ok(Statistics {
+                    studies: count("studies")?,
+                    series: count("series")?,
+                    instances: count("instances")?,
+                    size: conn.query_row(
+                        "SELECT coalesce(sum(size), 0) FROM instances",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )? as u64,
+                })
+            })
+            .await
+    }
+}
+
 fn failed(ids: Identifiers, failure: StoreFailure) -> StoreResult {
     StoreResult {
         sop_class_uid: ids.sop_class_uid,

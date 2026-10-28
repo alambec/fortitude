@@ -15,6 +15,8 @@ pub struct Config {
     pub storage: StorageConfig,
     pub index: IndexConfig,
     pub dicomweb: DicomWebConfig,
+    pub auth: AuthConfig,
+    pub metrics: MetricsConfig,
     pub log: LogConfig,
 }
 
@@ -94,6 +96,48 @@ impl Default for DicomWebConfig {
     }
 }
 
+/// Credentials accepted by the server. With none, authentication is disabled; `/health` and
+/// `/metrics` never require it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// HTTP Basic credentials.
+    pub users: Vec<User>,
+    /// HTTP Bearer tokens.
+    pub tokens: Vec<Token>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct User {
+    pub name: String,
+    pub password: String,
+    /// Only `GET`, `HEAD` and `OPTIONS` requests are allowed.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Token {
+    pub token: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Expose Prometheus metrics on `/metrics`.
+    pub enabled: bool,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
@@ -155,6 +199,29 @@ mod tests {
             assert_eq!(config.http.listen, "127.0.0.1:9001".parse().unwrap());
             assert_eq!(config.storage.path, PathBuf::from("/srv/fortitude"));
             assert_eq!(config.http.dicomweb_root, "/dicom-web");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn credentials_from_file() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "fortitude.toml",
+                r#"
+                [[auth.users]]
+                name = "admin"
+                password = "s3cret"
+                [[auth.tokens]]
+                token = "abc"
+                read_only = true
+                "#,
+            )?;
+            let config = Config::load(Some(Path::new("fortitude.toml"))).map_err(|e| *e)?;
+            assert_eq!(config.auth.users[0].name, "admin");
+            assert!(!config.auth.users[0].read_only);
+            assert!(config.auth.tokens[0].read_only);
+            assert!(config.metrics.enabled);
             Ok(())
         });
     }
