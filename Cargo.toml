@@ -25,14 +25,18 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dicom-core = "0.10.1"
 dicom-dictionary-std = "0.10.1"
+dicom-encoding = "0.10.1"
 dicom-object = "0.10.1"
 dicom-parser = "0.10.1"
+dicom-pixeldata = { version = "0.10.1", default-features = false, features = ["image", "native", "openjp2", "rayon"] }
 dicom-transfer-syntax-registry = "0.10.1"
 form_urlencoded = "1.2.2"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 futures = "0.3.34"
 hdrhistogram = "7.6.0"
 humantime = "2.3.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 memchr = "2.8.3"
 rayon = "1.12.0"
 rusqlite = { version = "0.41.1", features = ["bundled"] }

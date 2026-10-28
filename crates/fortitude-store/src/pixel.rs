@@ -3,6 +3,8 @@
 //! Computed once at ingest from the walker output and the image attributes, then stored in
 //! the index as a compact binary blob.
 
+use dicom_dictionary_std::tags;
+
 use crate::walker::{Fragment, PixelElement, PixelValue};
 
 /// A byte range of the stored file.
@@ -21,10 +23,33 @@ pub enum PixelLayout {
         length: u64,
         frame_length: u64,
         frames: u32,
+        sample: Sample,
     },
     /// Encapsulated pixel data: the fragments of each frame. Empty when fragments could not
     /// be attributed to frames.
     Encapsulated { frames: Vec<Vec<Range>> },
+}
+
+/// Type of native samples, after the attribute holding them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sample {
+    /// Pixel Data (7FE0,0010).
+    Integer,
+    /// Float Pixel Data (7FE0,0008).
+    Float,
+    /// Double Float Pixel Data (7FE0,0009).
+    Double,
+}
+
+impl Sample {
+    /// Kind byte of the encoded layout.
+    fn code(self) -> u8 {
+        match self {
+            Sample::Integer => 1,
+            Sample::Float => 3,
+            Sample::Double => 4,
+        }
+    }
 }
 
 /// Image attributes needed to compute frame boundaries.
@@ -58,11 +83,17 @@ impl PixelLayout {
                 } else {
                     0
                 };
+                let sample = match element.tag {
+                    tags::FLOAT_PIXEL_DATA => Sample::Float,
+                    tags::DOUBLE_FLOAT_PIXEL_DATA => Sample::Double,
+                    _ => Sample::Integer,
+                };
                 PixelLayout::Native {
                     offset: element.value_offset,
                     length: *length,
                     frame_length,
                     frames,
+                    sample,
                 }
             }
             PixelValue::Encapsulated {
@@ -125,8 +156,9 @@ impl PixelLayout {
                 length,
                 frame_length,
                 frames,
+                sample,
             } => {
-                out.push(1);
+                out.push(sample.code());
                 out.extend_from_slice(&offset.to_le_bytes());
                 out.extend_from_slice(&length.to_le_bytes());
                 out.extend_from_slice(&frame_length.to_le_bytes());
@@ -150,11 +182,16 @@ impl PixelLayout {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut cursor = Cursor(bytes);
         match cursor.u8()? {
-            1 => Some(PixelLayout::Native {
+            code @ (1 | 3 | 4) => Some(PixelLayout::Native {
                 offset: cursor.u64()?,
                 length: cursor.u64()?,
                 frame_length: cursor.u64()?,
                 frames: cursor.u32()?,
+                sample: match code {
+                    3 => Sample::Float,
+                    4 => Sample::Double,
+                    _ => Sample::Integer,
+                },
             }),
             2 => {
                 let count = cursor.u32()? as usize;

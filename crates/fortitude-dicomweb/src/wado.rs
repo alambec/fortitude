@@ -10,20 +10,20 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use fortitude_store::Store;
-use fortitude_store::pixel::Range;
+use fortitude_store::imaging::ImagingError;
 use fortitude_store::retrieve::{self, BulkData, PixelSource, Scope, StoredInstance};
 use futures::{StreamExt, stream};
 use tokio_util::io::ReaderStream;
 
-use crate::negotiate::{self, InstanceFormat, Representation};
+use crate::negotiate::{self, InstanceFormat, PixelPlan, Representation};
 use crate::{BaseUrl, DICOM_JSON, DicomWeb, error, media};
 
 /// Instance files up to this size are read in one operation, larger ones are streamed.
 const WHOLE_FILE_MAX: u64 = 4 << 20;
-/// Instance files read ahead of the one being sent.
+/// Instance files read (or transcoded) ahead of the one being sent.
 const READ_AHEAD: usize = 4;
 
-fn representations(headers: &HeaderMap) -> Vec<Representation> {
+pub(crate) fn representations(headers: &HeaderMap) -> Vec<Representation> {
     negotiate::representations(&media::accept(
         headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()),
     ))
@@ -34,15 +34,27 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> Response {
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not found")
 }
 
-fn not_acceptable() -> Response {
+pub(crate) fn not_acceptable() -> Response {
     error(
         StatusCode::NOT_ACCEPTABLE,
         "none of the accepted media types can be provided",
     )
+}
+
+pub(crate) fn imaging_error(e: ImagingError) -> Response {
+    match e {
+        ImagingError::NotFound => not_found(),
+        e @ (ImagingError::NoPixelData | ImagingError::NoFrame(_)) => {
+            error(StatusCode::NOT_FOUND, e.to_string())
+        }
+        ImagingError::Unsupported(message) => error(StatusCode::NOT_ACCEPTABLE, message),
+        ImagingError::Index(e) => internal(e),
+        ImagingError::Failed(e) => internal(e),
+    }
 }
 
 pub async fn study(
@@ -130,12 +142,21 @@ async fn instances(store: &Arc<Store>, scope: Scope, headers: &HeaderMap) -> Res
         .collect();
     match negotiate::instances(&representations(headers), &stored, instances.len()) {
         None => not_acceptable(),
-        Some(InstanceFormat::Single) => single_instance(&instances[0]).await,
-        Some(InstanceFormat::Multipart) => multipart_instances(instances),
+        Some((InstanceFormat::Single, None)) => single_instance(&instances[0]).await,
+        Some((InstanceFormat::Single, Some(ts))) => {
+            match Store::transcoded(&instances[0].path, &ts).await {
+                Ok(bytes) => {
+                    let content_type = format!("application/dicom; transfer-syntax={ts}");
+                    ([(header::CONTENT_TYPE, header_value(&content_type))], bytes).into_response()
+                }
+                Err(e) => imaging_error(e),
+            }
+        }
+        Some((InstanceFormat::Multipart, target)) => multipart_instances(instances, target).await,
     }
 }
 
-async fn single_instance(instance: &StoredInstance) -> Response {
+pub(crate) async fn single_instance(instance: &StoredInstance) -> Response {
     let file = match tokio::fs::File::open(&instance.path).await {
         Ok(file) => file,
         Err(e) => return internal(e),
@@ -152,17 +173,17 @@ async fn single_instance(instance: &StoredInstance) -> Response {
     response
 }
 
-fn boundary() -> String {
+pub(crate) fn boundary() -> String {
     format!("fortitude-{}", uuid::Uuid::new_v4().simple())
 }
 
-fn multipart_content_type(part_type: &str, boundary: &str) -> HeaderValue {
+pub(crate) fn multipart_content_type(part_type: &str, boundary: &str) -> HeaderValue {
     header_value(&format!(
         "multipart/related; type=\"{part_type}\"; boundary={boundary}"
     ))
 }
 
-fn header_value(value: &str) -> HeaderValue {
+pub(crate) fn header_value(value: &str) -> HeaderValue {
     HeaderValue::from_str(value)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
 }
@@ -172,29 +193,60 @@ enum PartBody {
     File(std::path::PathBuf),
 }
 
-/// Stream instance files as `multipart/related; type="application/dicom"`.
-fn multipart_instances(instances: Vec<StoredInstance>) -> Response {
+/// Stream instances as `multipart/related; type="application/dicom"`, transcoding to
+/// `target` those stored in another transfer syntax.
+async fn multipart_instances(instances: Vec<StoredInstance>, target: Option<String>) -> Response {
+    let needs_transcoding =
+        |i: &StoredInstance| target.as_deref().is_some_and(|ts| ts != i.transfer_syntax);
+    // Transcode the first instance that needs it before answering, so that an unsupported
+    // conversion is reported with a status rather than as a truncated body.
+    let mut first_transcoded = None;
+    if let (Some(ts), Some(index)) = (&target, instances.iter().position(needs_transcoding)) {
+        match Store::transcoded(&instances[index].path, ts).await {
+            Ok(bytes) => first_transcoded = Some((index, Bytes::from(bytes))),
+            Err(e) => return imaging_error(e),
+        }
+    }
+
     let boundary = boundary();
-    let headers: Vec<String> = instances
-        .iter()
-        .map(|i| {
-            format!(
-                "--{boundary}\r\nContent-Type: application/dicom; transfer-syntax={}\r\n\r\n",
-                i.transfer_syntax
-            )
+    let part_header = |ts: &str| {
+        format!("--{boundary}\r\nContent-Type: application/dicom; transfer-syntax={ts}\r\n\r\n")
+    };
+    let closing = format!("--{boundary}--\r\n");
+    let length = first_transcoded.is_none().then(|| {
+        instances
+            .iter()
+            .map(|i| part_header(&i.transfer_syntax).len() as u64 + 2 + i.size)
+            .sum::<u64>()
+            + closing.len() as u64
+    });
+
+    let parts: Vec<_> = instances
+        .into_iter()
+        .enumerate()
+        .map(|(index, instance)| {
+            let transcode = target.clone().filter(|ts| *ts != instance.transfer_syntax);
+            let header = part_header(transcode.as_deref().unwrap_or(&instance.transfer_syntax));
+            let ready = match &first_transcoded {
+                Some((i, bytes)) if *i == index => Some(bytes.clone()),
+                _ => None,
+            };
+            (instance, header, transcode, ready)
         })
         .collect();
-    let closing = format!("--{boundary}--\r\n");
-    let length = headers.iter().map(|h| h.len() as u64 + 2).sum::<u64>()
-        + instances.iter().map(|i| i.size).sum::<u64>()
-        + closing.len() as u64;
-
-    let parts = stream::iter(instances.into_iter().zip(headers))
-        .map(|(instance, header)| async move {
-            let body = if instance.size <= WHOLE_FILE_MAX {
-                PartBody::Whole(Bytes::from(tokio::fs::read(&instance.path).await?))
-            } else {
-                PartBody::File(instance.path)
+    let parts = stream::iter(parts)
+        .map(|(instance, header, transcode, ready)| async move {
+            let body = match (ready, transcode) {
+                (Some(bytes), _) => PartBody::Whole(bytes),
+                (None, Some(ts)) => PartBody::Whole(Bytes::from(
+                    Store::transcoded(&instance.path, &ts)
+                        .await
+                        .map_err(io::Error::other)?,
+                )),
+                (None, None) if instance.size <= WHOLE_FILE_MAX => {
+                    PartBody::Whole(Bytes::from(tokio::fs::read(&instance.path).await?))
+                }
+                (None, None) => PartBody::File(instance.path),
             };
             Ok::<_, io::Error>((header, body))
         })
@@ -226,7 +278,9 @@ fn multipart_instances(instances: Vec<StoredInstance>) -> Response {
         header::CONTENT_TYPE,
         multipart_content_type("application/dicom", &boundary),
     );
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    if let Some(length) = length {
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    }
     response
 }
 
@@ -238,41 +292,55 @@ pub async fn frames(
     let Some(numbers) = parse_frame_list(&list) else {
         return error(StatusCode::BAD_REQUEST, "invalid frame list");
     };
-    let source = match s
-        .store
-        .pixels(Scope::instance(&study, &series, &instance))
-        .await
-    {
+    let scope = Scope::instance(&study, &series, &instance);
+    let source = match s.store.pixels(scope.clone()).await {
         Ok(Some(source)) => source,
         Ok(None) => return not_found(),
         Err(e) => return internal(e),
     };
-    let Some(layout) = &source.layout else {
-        return error(StatusCode::NOT_FOUND, "instance has no pixel data");
+    let Some(plan) = pixel_plan(&source, &headers) else {
+        return not_acceptable();
     };
-    let mut ranges = Vec::with_capacity(numbers.len());
-    for number in numbers {
-        match layout.frame(number - 1) {
-            Some(frame) => ranges.push(frame),
-            None if layout.frame_count() == 0 => {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "frames of this instance cannot be located",
-                );
-            }
-            None => {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    format!("frame {number} does not exist"),
-                );
+    if !plan.multipart && numbers.len() != 1 {
+        return not_acceptable();
+    }
+    let indexes: Vec<usize> = numbers.iter().map(|n| n - 1).collect();
+    let data = if plan.decode {
+        match s.store.decoded_frames(scope, indexes).await {
+            Ok(data) => data,
+            Err(e) => return imaging_error(e),
+        }
+    } else {
+        let Some(layout) = &source.layout else {
+            return imaging_error(ImagingError::NoPixelData);
+        };
+        let mut ranges = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            match layout.frame(index) {
+                Some(frame) => ranges.push(frame),
+                None if layout.frame_count() == 0 => {
+                    return error(
+                        StatusCode::NOT_FOUND,
+                        "frames of this instance cannot be located",
+                    );
+                }
+                None => return imaging_error(ImagingError::NoFrame(index + 1)),
             }
         }
-    }
-    pixel_parts(&source, ranges, &headers).await
+        match read_parts(&source, ranges).await {
+            Ok(data) => data,
+            Err(e) => return internal(e),
+        }
+    };
+    pixel_response(&plan, data)
+}
+
+fn pixel_plan(source: &PixelSource, headers: &HeaderMap) -> Option<PixelPlan> {
+    negotiate::pixels(&representations(headers), &source.transfer_syntax)
 }
 
 /// Frame numbers (1-based) of a comma-separated list.
-fn parse_frame_list(list: &str) -> Option<Vec<usize>> {
+pub(crate) fn parse_frame_list(list: &str) -> Option<Vec<usize>> {
     let numbers: Option<Vec<usize>> = list
         .split(',')
         .map(|n| n.trim().parse().ok().filter(|n| *n > 0))
@@ -280,41 +348,34 @@ fn parse_frame_list(list: &str) -> Option<Vec<usize>> {
     numbers.filter(|n| !n.is_empty())
 }
 
-/// Return pixel data parts (one per entry of `parts`) read from the stored file.
-async fn pixel_parts(
+async fn read_parts(
     source: &PixelSource,
-    parts: Vec<Vec<Range>>,
-    headers: &HeaderMap,
-) -> Response {
-    let Some((multipart, content_type)) =
-        negotiate::pixels(&representations(headers), &source.transfer_syntax)
-    else {
-        return not_acceptable();
-    };
-    if !multipart && parts.len() != 1 {
-        return not_acceptable();
-    }
+    parts: Vec<Vec<fortitude_store::pixel::Range>>,
+) -> io::Result<Vec<Vec<u8>>> {
     let path = source.path.clone();
-    let read = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         parts
             .iter()
             .map(|ranges| retrieve::read_ranges(&path, ranges))
-            .collect::<io::Result<Vec<_>>>()
+            .collect()
     })
-    .await;
-    let data = match read {
-        Ok(Ok(data)) => data,
-        Ok(Err(e)) => return internal(e),
-        Err(e) => return internal(e),
-    };
-    if !multipart {
-        let body = data.into_iter().next().unwrap_or_default();
-        return ([(header::CONTENT_TYPE, header_value(&content_type))], body).into_response();
-    }
-    multipart_bytes(&content_type, data)
+    .await
+    .map_err(io::Error::other)?
 }
 
-fn multipart_bytes(content_type: &str, parts: Vec<Vec<u8>>) -> Response {
+fn pixel_response(plan: &PixelPlan, data: Vec<Vec<u8>>) -> Response {
+    if plan.multipart {
+        return multipart_bytes(&plan.content_type, data);
+    }
+    let body = data.into_iter().next().unwrap_or_default();
+    (
+        [(header::CONTENT_TYPE, header_value(&plan.content_type))],
+        body,
+    )
+        .into_response()
+}
+
+pub(crate) fn multipart_bytes(content_type: &str, parts: Vec<Vec<u8>>) -> Response {
     let boundary = boundary();
     let part_header = format!("--{boundary}\r\nContent-Type: {content_type}\r\n\r\n");
     let mut body = Vec::with_capacity(
@@ -346,29 +407,44 @@ pub async fn bulk(
     Path((study, series, instance, path)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    match s
-        .store
-        .bulk_data(Scope::instance(&study, &series, &instance), &path)
-        .await
-    {
+    let scope = Scope::instance(&study, &series, &instance);
+    match s.store.bulk_data(scope.clone(), &path).await {
         Ok(Some(BulkData::Pixels(source))) => {
             let Some(layout) = &source.layout else {
                 return not_found();
             };
-            let parts = if layout.is_encapsulated() {
-                (0..layout.frame_count())
-                    .filter_map(|i| layout.frame(i))
-                    .collect()
-            } else {
-                vec![layout.all()]
+            let Some(plan) = pixel_plan(&source, &headers) else {
+                return not_acceptable();
             };
-            if parts.is_empty() {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "frames of this instance cannot be located",
-                );
+            let data = if plan.decode {
+                let frames = (0..layout.frame_count().max(1)).collect();
+                match s.store.decoded_frames(scope, frames).await {
+                    Ok(frames) => vec![frames.concat()],
+                    Err(e) => return imaging_error(e),
+                }
+            } else {
+                let parts: Vec<_> = if layout.is_encapsulated() {
+                    (0..layout.frame_count())
+                        .filter_map(|i| layout.frame(i))
+                        .collect()
+                } else {
+                    vec![layout.all()]
+                };
+                if parts.is_empty() {
+                    return error(
+                        StatusCode::NOT_FOUND,
+                        "frames of this instance cannot be located",
+                    );
+                }
+                match read_parts(&source, parts).await {
+                    Ok(data) => data,
+                    Err(e) => return internal(e),
+                }
+            };
+            if !plan.multipart && data.len() != 1 {
+                return not_acceptable();
             }
-            pixel_parts(&source, parts, &headers).await
+            pixel_response(&plan, data)
         }
         Ok(Some(BulkData::Bytes(bytes))) => {
             let accepted = representations(&headers).into_iter().find_map(|r| {

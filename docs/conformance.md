@@ -66,22 +66,23 @@ instance.
 | `…/metadata` at the three levels above | `application/dicom+json` (also served for `application/json`) |
 | `…/instances/{instance}/frames/{list}` | `multipart/related` of `application/octet-stream` or the compressed media type; single part for one frame |
 | `…/instances/{instance}/bulk/{path}` | `multipart/related; type="application/octet-stream"`, or single part |
+| `…/instances/{instance}/rendered`, `…/frames/{list}/rendered` | `image/jpeg` (default), `image/png`; multipart for several frames |
+| `{root}/studies/{study}/thumbnail`, `…/series/{series}/thumbnail`, `…/instances/{instance}/thumbnail`, `…/frames/{frame}/thumbnail` | `image/jpeg` (default), `image/png` |
 
 **Instances** are returned byte for byte as stored, in study order (series number, instance
-number). Each part's `Content-Type` carries the stored `transfer-syntax`. When the request
-names no transfer syntax, the stored one is used (other archives do the same; PS3.18's
-default would be Explicit VR Little Endian). A specific transfer syntax is accepted only when
-it is the stored one; otherwise the response is `406 Not Acceptable` (transcoding comes
-with phase 4).
+number). Each part's `Content-Type` carries its `transfer-syntax`. When the request names no
+transfer syntax, the stored one is used (other archives do the same; PS3.18's default would
+be Explicit VR Little Endian). When a specific transfer syntax is requested, instances stored
+in another one are transcoded (see *Codecs* below); `406` when that is not possible.
 
 **Frames** are read directly from the stored file through byte offsets computed at ingest,
 without decoding:
 - With `transfer-syntax=*`, frames are returned in the stored transfer syntax. The part
   media type is the requested one (`application/octet-stream`, or e.g. `image/jpeg`), with a
   `transfer-syntax` parameter.
-- `application/octet-stream` without `transfer-syntax` means uncompressed little endian. It
-  is served for natively encoded little endian instances, and `406` for compressed ones
-  (until phase 4).
+- `application/octet-stream` without `transfer-syntax` (or with Explicit VR Little Endian)
+  means uncompressed little endian pixels: compressed frames are decoded; `406` when the
+  codec is not available.
 - Compressed media types (`image/jpeg`, `image/jls`, `image/jp2`, `image/jpx`,
   `image/jphc`, `image/dicom-rle`, video types) are served when they match the stored
   transfer syntax (PS3.18 Table 8.7.3-5).
@@ -95,9 +96,59 @@ without decoding:
 `GGGGEEEE/item/GGGGEEEE…` within sequences. Pixel data is returned as one part (native)
 or one part per frame (encapsulated).
 
+**Rendered resources and thumbnails** decode the frame and encode it as JPEG (quality 90 by
+default) or PNG, 8 bits per sample:
+- Query parameters: `window=center,width[,function]` (linear window; the function is
+  ignored), `viewport=width,height` (the image is scaled down to fit, keeping its aspect
+  ratio; never scaled up), `quality=1..100`. `annotation` and `charset` are ignored.
+- Without `window`, the instance's VOI LUT or first window is applied, or the values are
+  min-max normalized.
+- A rendered instance is its first frame.
+- Thumbnails fit in 128×128 pixels unless a viewport is given. The thumbnail of a series is
+  its middle instance (by instance number); that of a study is the thumbnail of its first
+  series.
+- Instances without pixel data answer `404`; pixel data that cannot be decoded answers `406`.
+
 **Errors**: `404` for unknown resources (including a series requested under the wrong
 study), `400` for an invalid frame list, `406` when no accepted representation can be
 produced.
+
+## WADO-URI (PS3.18 §9)
+
+`GET {wado_root}?requestType=WADO&studyUID=…&seriesUID=…&objectUID=…` (`http.wado_root`,
+default `/wado`).
+
+| Parameter | Support |
+|---|---|
+| `contentType` | `application/dicom`, `image/jpeg`, `image/png` (first supported of a comma-separated list; `406` if none). Default: `image/jpeg` for instances with pixel data, `application/dicom` otherwise. |
+| `transferSyntax` | With `application/dicom`: the instance is transcoded when stored in another transfer syntax. |
+| `frameNumber` | Frame to render (default 1). |
+| `rows`, `columns` | Maximum size of the rendered image; one of them bounds both dimensions. |
+| `windowCenter`, `windowWidth` | Window applied when rendering (both required). |
+| `imageQuality` | JPEG quality, 1 to 100 (default 90). |
+| `anonymize=yes` | Not supported: `400`. |
+| `charset`, `annotation`, `region`, `presentationUID`, `presentationSeriesUID` | Ignored. |
+
+Missing `requestType=WADO` or UIDs answer `400`; unknown objects `404`.
+
+## Codecs
+
+Pixel data is decoded (for rendering, uncompressed frames, and transcoding) with dicom-rs:
+
+| Transfer syntax | Decoding |
+|---|---|
+| Implicit and Explicit VR Little Endian, Deflated Explicit VR Little Endian | yes |
+| JPEG Baseline (Process 1), JPEG Lossless (Process 14, SV1) | yes |
+| JPEG Extended (Process 2 & 4), 8-bit | yes; 12-bit is not supported |
+| JPEG 2000 (lossless and lossy) | yes |
+| RLE Lossless | yes |
+| JPEG-LS | not supported |
+| Video (MPEG-2, MPEG-4, HEVC), JPEG XL, HTJ2K | not supported |
+
+Pixel data that cannot be decoded is still stored and served as is (`transfer-syntax=*`).
+Float and Double Float Pixel Data cannot be rendered. Transcoding targets are the
+uncompressed transfer syntaxes; compressed targets are attempted with the encoders of
+dicom-rs (JPEG Baseline), and answer `406` when no encoder is available.
 
 ## QIDO-RS — Search (PS3.18 §10.6)
 

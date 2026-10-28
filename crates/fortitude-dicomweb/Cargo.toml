@@ -26,6 +26,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+dicom-object.workspace = true
+image.workspace = true
 fortitude-testkit.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

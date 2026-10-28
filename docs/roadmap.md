@@ -40,7 +40,8 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
    *(done)*
 4. **WADO-URI + rendering** — `application/dicom`, then JPEG/PNG rendering with windowing
    (shared with WADO-RS `/rendered` and `/thumbnail`); decompression to Explicit VR Little Endian.
-   JPEG 2000 / JPEG-LS codecs behind cargo features.
+   JPEG 2000 / JPEG-LS codecs behind cargo features. *(done; JPEG-LS not available yet, see
+   the conformance statement)*
 5. **Operations** — admin API (delete, statistics), authentication, Prometheus metrics; then
    PostgreSQL index, DIMSE.
 

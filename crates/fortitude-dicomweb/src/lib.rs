@@ -4,8 +4,10 @@ pub mod media;
 pub mod multipart;
 pub mod negotiate;
 mod qido;
+mod rendered;
 mod stow;
 mod wado;
+mod wado_uri;
 
 use std::sync::Arc;
 
@@ -70,6 +72,31 @@ pub fn router(state: DicomWeb) -> Router {
         )
         .route(&format!("{INSTANCE}/frames/{{frames}}"), get(wado::frames))
         .route(&format!("{INSTANCE}/bulk/{{*path}}"), get(wado::bulk))
+        .route(&format!("{INSTANCE}/rendered"), get(rendered::instance))
+        .route(
+            &format!("{INSTANCE}/frames/{{frames}}/rendered"),
+            get(rendered::frames),
+        )
+        .route("/studies/{study}/thumbnail", get(rendered::study_thumbnail))
+        .route(
+            "/studies/{study}/series/{series}/thumbnail",
+            get(rendered::series_thumbnail),
+        )
+        .route(
+            &format!("{INSTANCE}/thumbnail"),
+            get(rendered::instance_thumbnail),
+        )
+        .route(
+            &format!("{INSTANCE}/frames/{{frames}}/thumbnail"),
+            get(rendered::frame_thumbnail),
+        )
+        .with_state(state)
+}
+
+/// The WADO-URI service, at `path` (e.g. `/wado`) of the server root.
+pub fn wado_uri_router(path: &str, state: DicomWeb) -> Router {
+    Router::new()
+        .route(path, get(wado_uri::retrieve))
         .with_state(state)
 }
 

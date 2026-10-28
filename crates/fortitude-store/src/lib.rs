@@ -2,6 +2,7 @@
 //! pre-encoded metadata) and the SQLite index with its group-committing writer.
 
 pub mod files;
+pub mod imaging;
 pub mod index;
 pub mod ingest;
 pub mod pixel;

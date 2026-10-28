@@ -1,5 +1,7 @@
 //! Content negotiation for WADO-RS (PS3.18 §8.7.3).
 
+use fortitude_store::imaging::{self, ImageFormat};
+
 use crate::media::MediaType;
 
 pub const EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
@@ -13,12 +15,6 @@ pub struct Representation {
     pub media: String,
     /// Requested transfer syntax: `None` for the media type default, `Some("*")` for any.
     pub transfer_syntax: Option<String>,
-}
-
-impl Representation {
-    fn any_transfer_syntax(&self) -> bool {
-        self.transfer_syntax.as_deref() == Some("*")
-    }
 }
 
 pub fn representations(accept: &[MediaType]) -> Vec<Representation> {
@@ -53,30 +49,33 @@ pub enum InstanceFormat {
     Single,
 }
 
-/// Pick how to return instances stored with `stored` transfer syntaxes.
+/// Pick how to return instances stored with `stored` transfer syntaxes, and the transfer
+/// syntax to transcode them to, if any.
 ///
 /// Instances are returned in their stored transfer syntax when none is requested (as other
-/// archives do); a specific transfer syntax is only accepted when it is the stored one.
+/// archives do).
 pub fn instances(
     representations: &[Representation],
     stored: &[&str],
     count: usize,
-) -> Option<InstanceFormat> {
+) -> Option<(InstanceFormat, Option<String>)> {
     representations.iter().find_map(|r| {
-        let media_ok = r.media == "application/dicom" || is_any(&r.media);
-        let syntax_ok = match r.transfer_syntax.as_deref() {
-            None | Some("*") => true,
-            Some(ts) => stored.iter().all(|s| *s == ts),
-        };
-        if !(media_ok && syntax_ok) {
+        if !(r.media == "application/dicom" || is_any(&r.media)) {
             return None;
         }
-        match (r.multipart, r.media.as_str()) {
-            (true, _) => Some(InstanceFormat::Multipart),
-            (false, "application/dicom") if count == 1 => Some(InstanceFormat::Single),
-            (false, media) if is_any(media) => Some(InstanceFormat::Multipart),
-            _ => None,
-        }
+        let target = match r.transfer_syntax.as_deref() {
+            None | Some("*") => None,
+            Some(ts) if stored.iter().all(|s| *s == ts) => None,
+            Some(ts) if imaging::can_transcode_to(ts) => Some(ts.to_owned()),
+            Some(_) => return None,
+        };
+        let format = match (r.multipart, r.media.as_str()) {
+            (true, _) => InstanceFormat::Multipart,
+            (false, "application/dicom") if count == 1 => InstanceFormat::Single,
+            (false, media) if is_any(media) => InstanceFormat::Multipart,
+            _ => return None,
+        };
+        Some((format, target))
     })
 }
 
@@ -110,30 +109,52 @@ pub fn is_native_little_endian(transfer_syntax: &str) -> bool {
     matches!(transfer_syntax, EXPLICIT_VR_LE | IMPLICIT_VR_LE)
 }
 
-/// Pick the media type of each part when returning pixel data stored with `stored`, as
-/// `(multipart, part content type)`.
-pub fn pixels(representations: &[Representation], stored: &str) -> Option<(bool, String)> {
+/// How to return pixel data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PixelPlan {
+    pub multipart: bool,
+    /// Content type of each part.
+    pub content_type: String,
+    /// Frames must be decoded to native little endian pixels.
+    pub decode: bool,
+}
+
+/// Pick how to return pixel data stored with `stored`.
+pub fn pixels(representations: &[Representation], stored: &str) -> Option<PixelPlan> {
     let stored_media = pixel_media_type(stored);
+    let native = is_native_little_endian(stored);
     representations.iter().find_map(|r| {
         let media = if is_any(&r.media) {
             stored_media
         } else {
             r.media.as_str()
         };
-        let acceptable = match r.transfer_syntax.as_deref() {
-            _ if r.any_transfer_syntax() => {
-                media == "application/octet-stream" || media == stored_media
-            }
-            Some(ts) => ts == stored || (ts == EXPLICIT_VR_LE && is_native_little_endian(stored)),
-            None if media == "application/octet-stream" => is_native_little_endian(stored),
-            None => media == stored_media,
+        let octets = media == "application/octet-stream";
+        let decode = match r.transfer_syntax.as_deref() {
+            Some("*") if octets || media == stored_media => false,
+            Some(ts) if ts == stored => false,
+            Some(EXPLICIT_VR_LE) | None if octets => !native,
+            None if media == stored_media => false,
+            _ => return None,
         };
-        acceptable.then(|| {
-            (
-                r.multipart || is_any(&r.media),
-                format!("{media}; transfer-syntax={stored}"),
-            )
+        let transfer_syntax = if decode { EXPLICIT_VR_LE } else { stored };
+        Some(PixelPlan {
+            multipart: r.multipart || is_any(&r.media),
+            content_type: format!("{media}; transfer-syntax={transfer_syntax}"),
+            decode,
         })
+    })
+}
+
+/// Pick the image format of rendered resources (JPEG by default).
+pub fn rendered(representations: &[Representation], quality: u8) -> Option<(bool, ImageFormat)> {
+    representations.iter().find_map(|r| {
+        let format = match r.media.as_str() {
+            "image/jpeg" | "image/*" | "*/*" => ImageFormat::Jpeg { quality },
+            "image/png" => ImageFormat::Png,
+            _ => return None,
+        };
+        Some((r.multipart, format))
     })
 }
 
@@ -163,49 +184,74 @@ mod tests {
     fn instance_formats() {
         assert_eq!(
             instances(&reps("*/*"), &[JPEG], 2),
-            Some(InstanceFormat::Multipart)
+            Some((InstanceFormat::Multipart, None))
         );
         assert_eq!(
             instances(&reps("application/dicom"), &[JPEG], 1),
-            Some(InstanceFormat::Single)
+            Some((InstanceFormat::Single, None))
         );
         assert_eq!(instances(&reps("application/dicom"), &[JPEG], 2), None);
         let explicit =
             r#"multipart/related; type="application/dicom"; transfer-syntax=1.2.840.10008.1.2.1"#;
-        assert_eq!(instances(&reps(explicit), &[JPEG], 1), None);
+        assert_eq!(
+            instances(&reps(explicit), &[JPEG], 1),
+            Some((InstanceFormat::Multipart, Some(EXPLICIT_VR_LE.into())))
+        );
         assert_eq!(
             instances(&reps(explicit), &[EXPLICIT_VR_LE], 1),
-            Some(InstanceFormat::Multipart)
+            Some((InstanceFormat::Multipart, None))
         );
+        let unknown = r#"multipart/related; type="application/dicom"; transfer-syntax=1.2.3"#;
+        assert_eq!(instances(&reps(unknown), &[JPEG], 1), None);
         assert_eq!(instances(&reps("application/json"), &[JPEG], 1), None);
     }
 
     #[test]
     fn pixel_formats() {
         let any = r#"multipart/related; type="application/octet-stream"; transfer-syntax=*"#;
+        let plan = pixels(&reps(any), JPEG).unwrap();
         assert_eq!(
-            pixels(&reps(any), JPEG),
-            Some((
-                true,
-                format!("application/octet-stream; transfer-syntax={JPEG}")
-            ))
+            plan.content_type,
+            format!("application/octet-stream; transfer-syntax={JPEG}")
         );
+        assert!(plan.multipart && !plan.decode);
+
         let raw = r#"multipart/related; type="application/octet-stream""#;
-        assert_eq!(pixels(&reps(raw), JPEG), None);
-        assert!(pixels(&reps(raw), EXPLICIT_VR_LE).is_some());
+        let decoded = pixels(&reps(raw), JPEG).unwrap();
+        assert!(decoded.decode);
+        assert_eq!(
+            decoded.content_type,
+            format!("application/octet-stream; transfer-syntax={EXPLICIT_VR_LE}")
+        );
+        assert!(!pixels(&reps(raw), EXPLICIT_VR_LE).unwrap().decode);
+
         let jpeg = r#"multipart/related; type="image/jpeg""#;
         assert_eq!(
-            pixels(&reps(jpeg), JPEG),
-            Some((true, format!("image/jpeg; transfer-syntax={JPEG}")))
+            pixels(&reps(jpeg), JPEG).unwrap().content_type,
+            format!("image/jpeg; transfer-syntax={JPEG}")
         );
         assert_eq!(pixels(&reps(jpeg), EXPLICIT_VR_LE), None);
         assert_eq!(
-            pixels(&reps("*/*"), JPEG),
-            Some((true, format!("image/jpeg; transfer-syntax={JPEG}")))
+            pixels(&reps("*/*"), JPEG).unwrap().content_type,
+            format!("image/jpeg; transfer-syntax={JPEG}")
+        );
+        assert!(
+            !pixels(&reps("application/octet-stream"), EXPLICIT_VR_LE)
+                .unwrap()
+                .multipart
+        );
+    }
+
+    #[test]
+    fn rendered_formats() {
+        assert_eq!(
+            rendered(&reps("*/*"), 90),
+            Some((false, ImageFormat::Jpeg { quality: 90 }))
         );
         assert_eq!(
-            pixels(&reps("application/octet-stream"), EXPLICIT_VR_LE).map(|p| p.0),
-            Some(false)
+            rendered(&reps("image/png"), 90),
+            Some((false, ImageFormat::Png))
         );
+        assert_eq!(rendered(&reps("application/dicom"), 90), None);
     }
 }

@@ -29,6 +29,7 @@ variables with `__` between sections.
 [http]
 listen = "0.0.0.0:8042"
 dicomweb_root = "/dicom-web"
+wado_root = "/wado"        # WADO-URI
 # public_url = "https://pacs.example.org"   # default: from Host / X-Forwarded-* headers
 
 [storage]

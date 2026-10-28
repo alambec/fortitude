@@ -24,6 +24,8 @@ pub struct HttpConfig {
     pub listen: SocketAddr,
     /// Path under which the DICOMweb services are mounted.
     pub dicomweb_root: String,
+    /// Path of the WADO-URI service.
+    pub wado_root: String,
     /// Public origin used in returned URLs (e.g. `https://pacs.example.org`); derived from
     /// the `Host` and `X-Forwarded-*` request headers when unset.
     pub public_url: Option<String>,
@@ -34,6 +36,7 @@ impl Default for HttpConfig {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 8042)),
             dicomweb_root: "/dicom-web".to_owned(),
+            wado_root: "/wado".to_owned(),
             public_url: None,
         }
     }

@@ -35,6 +35,8 @@ pub enum Scenario {
     Frame,
     /// WADO-URI retrieve of one instance as application/dicom.
     WadoUri,
+    /// WADO-RS rendered CT instance as JPEG.
+    Rendered,
 }
 
 #[derive(Debug, clap::Args)]
@@ -87,6 +89,8 @@ struct Targets {
     years: Vec<String>,
     studies: Vec<String>,
     series: Vec<usize>,
+    /// CT instances: images every server can decode.
+    images: Vec<usize>,
 }
 
 impl Targets {
@@ -111,6 +115,9 @@ impl Targets {
             years: unique(&|e| e.study_date.chars().take(4).collect()),
             studies: unique(&|e| e.study_uid.clone()),
             series,
+            images: (0..entries.len())
+                .filter(|&i| entries[i].modality == "CT")
+                .collect(),
             entries,
         })
     }
@@ -195,6 +202,16 @@ impl Targets {
                         e.sop_uid
                     ),
                     "application/dicom",
+                )
+            }
+            Scenario::Rendered => {
+                let e = &self.entries[self.images[rng.index(self.images.len())]];
+                (
+                    format!(
+                        "{base}/studies/{}/series/{}/instances/{}/rendered",
+                        e.study_uid, e.series_uid, e.sop_uid
+                    ),
+                    "image/jpeg",
                 )
             }
         }

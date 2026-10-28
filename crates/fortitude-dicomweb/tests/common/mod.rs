@@ -38,10 +38,12 @@ pub fn app() -> App {
         max_instance_size: 1 << 24,
         qido_max_results: 50,
     };
-    let router = fortitude_dicomweb::router(DicomWeb {
+    let state = DicomWeb {
         store: store.clone(),
         config: Arc::new(config),
-    });
+    };
+    let router = fortitude_dicomweb::router(state.clone())
+        .merge(fortitude_dicomweb::wado_uri_router("/wado", state));
     App {
         router,
         store,

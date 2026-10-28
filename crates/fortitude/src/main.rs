@@ -56,6 +56,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .merge(fortitude_dicomweb::wado_uri_router(
+            &config.http.wado_root,
+            dicomweb.clone(),
+        ))
         .nest(
             &config.http.dicomweb_root,
             fortitude_dicomweb::router(dicomweb),

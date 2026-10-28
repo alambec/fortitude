@@ -19,9 +19,12 @@ pub enum Pixels {
     /// Uncompressed 8-bit monochrome frames.
     Native,
     /// Encapsulated frames, each split into this many fragments, without offset table.
+    /// Frames are fake codestreams: they can be located but not decoded.
     Encapsulated {
         fragments_per_frame: usize,
     },
+    /// Real JPEG baseline frames (one fragment each) of the native pattern, decodable.
+    Jpeg,
 }
 
 #[derive(Debug, Clone)]
@@ -78,13 +81,28 @@ impl Instance {
         self
     }
 
+    /// Pixels of frame `index` (0-based) before any compression: 8-bit samples.
+    pub fn pixels(&self, index: u32) -> Vec<u8> {
+        let size = usize::from(self.rows) * usize::from(self.columns);
+        (0..size).map(|k| (index as usize * 31 + k) as u8).collect()
+    }
+
     /// Bytes of frame `index` (0-based) as stored: raw pixels, or the encapsulated
     /// codestream (concatenation of its fragments).
     pub fn frame(&self, index: u32) -> Vec<u8> {
         match self.pixels {
-            Pixels::Native | Pixels::None => {
-                let size = usize::from(self.rows) * usize::from(self.columns);
-                (0..size).map(|k| (index as usize * 31 + k) as u8).collect()
+            Pixels::Native | Pixels::None => self.pixels(index),
+            Pixels::Jpeg => {
+                let mut out = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95)
+                    .encode(
+                        &self.pixels(index),
+                        u32::from(self.columns),
+                        u32::from(self.rows),
+                        image::ExtendedColorType::L8,
+                    )
+                    .expect("encodable frame");
+                out
             }
             Pixels::Encapsulated { .. } => {
                 // A fake JPEG codestream: SOI, payload without any 0xFF, EOI.
@@ -140,6 +158,22 @@ impl Instance {
                     tags::PIXEL_DATA,
                     VR::OB,
                     PrimitiveValue::from(data),
+                ));
+            }
+            Pixels::Jpeg => {
+                let fragments: Vec<Vec<u8>> = (0..self.frames)
+                    .map(|i| {
+                        let mut frame = self.frame(i);
+                        if frame.len() % 2 == 1 {
+                            frame.push(0);
+                        }
+                        frame
+                    })
+                    .collect();
+                obj.put(DataElement::new(
+                    tags::PIXEL_DATA,
+                    VR::OB,
+                    Value::PixelSequence(PixelFragmentSequence::new(Vec::<u32>::new(), fragments)),
                 ));
             }
             Pixels::Encapsulated {

@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 
 out=bench/results/$(date +%F)-${label}.jsonl
 bench=(taskset -c "${CLIENT_CPUS:-6-11}" ./target/release/fortitude-bench)
-scenarios=${SCENARIOS:-qido-patient qido-name-wildcard qido-date-modality qido-series qido-instances series-metadata instance frame wado-uri}
+scenarios=${SCENARIOS:-qido-patient qido-name-wildcard qido-date-modality qido-series qido-instances series-metadata instance frame wado-uri rendered}
 
 cargo build --quiet --release -p fortitude-bench
 
