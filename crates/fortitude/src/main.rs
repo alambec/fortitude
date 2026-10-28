@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use clap::Parser;
 use fortitude_dicomweb::DicomWeb;
@@ -60,9 +61,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(TraceLayer::new_for_http());
 
+    // Without TCP_NODELAY, the last segment of a streamed response can wait for the
+    // client's delayed ACK (~40 ms).
     let listener = tokio::net::TcpListener::bind(config.http.listen)
         .await
-        .with_context(|| format!("cannot listen on {}", config.http.listen))?;
+        .with_context(|| format!("cannot listen on {}", config.http.listen))?
+        .tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                tracing::warn!(error = %e, "cannot set TCP_NODELAY");
+            }
+        });
     tracing::info!(listen = %config.http.listen, "fortitude started");
 
     axum::serve(listener, app)

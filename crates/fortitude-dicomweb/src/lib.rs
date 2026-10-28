@@ -2,7 +2,9 @@
 
 pub mod media;
 pub mod multipart;
+pub mod negotiate;
 mod stow;
+mod wado;
 
 use std::sync::Arc;
 
@@ -11,7 +13,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use fortitude_store::Store;
 
 pub const DICOM_JSON: &str = "application/dicom+json";
@@ -37,9 +39,26 @@ pub struct DicomWeb {
 
 /// Routes of the DICOMweb services, to be nested under [`Config::root`].
 pub fn router(state: DicomWeb) -> Router {
+    const INSTANCE: &str = "/studies/{study}/series/{series}/instances/{instance}";
     Router::new()
         .route("/studies", post(stow::store_instances))
-        .route("/studies/{study}", post(stow::store_study_instances))
+        .route(
+            "/studies/{study}",
+            get(wado::study).post(stow::store_study_instances),
+        )
+        .route("/studies/{study}/metadata", get(wado::study_metadata))
+        .route("/studies/{study}/series/{series}", get(wado::series))
+        .route(
+            "/studies/{study}/series/{series}/metadata",
+            get(wado::series_metadata),
+        )
+        .route(INSTANCE, get(wado::instance))
+        .route(
+            &format!("{INSTANCE}/metadata"),
+            get(wado::instance_metadata),
+        )
+        .route(&format!("{INSTANCE}/frames/{{frames}}"), get(wado::frames))
+        .route(&format!("{INSTANCE}/bulk/{{*path}}"), get(wado::bulk))
         .with_state(state)
 }
 

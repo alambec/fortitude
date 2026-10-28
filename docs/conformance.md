@@ -56,6 +56,49 @@ The response body is `application/dicom+json`. Retrieve URL (0008,1190) is given
 level when every stored instance belongs to the same study, and for each referenced
 instance.
 
+## WADO-RS — Retrieve (PS3.18 §10.4)
+
+| Resource | Representations |
+|---|---|
+| `{root}/studies/{study}` | `multipart/related; type="application/dicom"` |
+| `{root}/studies/{study}/series/{series}` | same |
+| `{root}/studies/{study}/series/{series}/instances/{instance}` | same, or `application/dicom` (single part) |
+| `…/metadata` at the three levels above | `application/dicom+json` (also served for `application/json`) |
+| `…/instances/{instance}/frames/{list}` | `multipart/related` of `application/octet-stream` or the compressed media type; single part for one frame |
+| `…/instances/{instance}/bulk/{path}` | `multipart/related; type="application/octet-stream"`, or single part |
+
+**Instances** are returned byte for byte as stored, in study order (series number, instance
+number). Each part's `Content-Type` carries the stored `transfer-syntax`. When the request
+names no transfer syntax, the stored one is used (other archives do the same; PS3.18's
+default would be Explicit VR Little Endian). A specific transfer syntax is accepted only when
+it is the stored one; otherwise the response is `406 Not Acceptable` (transcoding comes
+with phase 4).
+
+**Frames** are read directly from the stored file through byte offsets computed at ingest,
+without decoding:
+- With `transfer-syntax=*`, frames are returned in the stored transfer syntax. The part
+  media type is the requested one (`application/octet-stream`, or e.g. `image/jpeg`), with a
+  `transfer-syntax` parameter.
+- `application/octet-stream` without `transfer-syntax` means uncompressed little endian. It
+  is served for natively encoded little endian instances, and `406` for compressed ones
+  (until phase 4).
+- Compressed media types (`image/jpeg`, `image/jls`, `image/jp2`, `image/jpx`,
+  `image/jphc`, `image/dicom-rle`, video types) are served when they match the stored
+  transfer syntax (PS3.18 Table 8.7.3-5).
+- Frames of encapsulated pixel data are found through the Basic or Extended Offset Table,
+  one fragment per frame, or JPEG / JPEG 2000 start markers. Instances whose fragments
+  cannot be attributed to frames answer `404` for frame requests.
+- Float and Double Float Pixel Data frames are supported. Native YBR_FULL_422 frames account
+  for chroma subsampling.
+
+**Bulk data** paths are those of the `BulkDataURI`s in metadata: `GGGGEEEE`, or
+`GGGGEEEE/item/GGGGEEEE…` within sequences. Pixel data is returned as one part (native)
+or one part per frame (encapsulated).
+
+**Errors**: `404` for unknown resources (including a series requested under the wrong
+study), `400` for an invalid frame list, `406` when no accepted representation can be
+produced.
+
 ## DICOM JSON
 
 - All strings are UTF-8. Specific Character Set (0008,0005), when present, is returned as
@@ -64,3 +107,10 @@ instance.
   `InlineBinary`; larger ones, and pixel data, as `BulkDataURI`.
 - URLs use `http.public_url` when configured, else the request's `X-Forwarded-Proto`,
   `X-Forwarded-Host` or `Host` headers.
+- DS and IS values are JSON numbers (PS3.18 F.2.3), keeping their original decimal text
+  when it is a valid JSON number.
+- Padding is trimmed from string values. Attributes whose value is only padding have no
+  `Value` member.
+- Private attributes of implicit VR instances have no known VR and are returned as `UN`
+  (binary).
+- Attributes after Pixel Data (e.g. Data Set Trailing Padding) are not part of metadata.

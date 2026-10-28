@@ -132,3 +132,29 @@ impl App {
         .await
     }
 }
+
+impl Reply {
+    /// Parts of a multipart response, as (content type, body).
+    pub async fn parts(&self) -> Vec<(String, Vec<u8>)> {
+        let media =
+            fortitude_dicomweb::media::MediaType::parse(self.content_type()).expect("content type");
+        assert_eq!(
+            media.essence,
+            "multipart/related",
+            "{}",
+            self.content_type()
+        );
+        let boundary = media.param("boundary").expect("boundary").to_owned();
+        let chunks = vec![Ok::<_, std::convert::Infallible>(self.body.clone())];
+        let mut reader = fortitude_dicomweb::multipart::MultipartReader::new(
+            futures::stream::iter(chunks),
+            &boundary,
+            usize::MAX,
+        );
+        let mut parts = Vec::new();
+        while let Some(part) = reader.next_part().await.expect("valid multipart") {
+            parts.push((part.content_type.unwrap_or_default(), part.body.to_vec()));
+        }
+        parts
+    }
+}

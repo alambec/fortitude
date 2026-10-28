@@ -34,7 +34,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
    group-committing SQLite writer, Specific Character Set to UTF-8, duplicate policy above.
    *(done)*
 2. **WADO-RS** — study/series/instance retrieval (multipart `application/dicom`), metadata at
-   every level, frames, bulk data; `transfer-syntax=*` (stored syntax) first.
+   every level, frames, bulk data; `transfer-syntax=*` (stored syntax) first. *(done)*
 3. **QIDO-RS** — single value, UID list, wildcard, range (DA/TM/DT), case-insensitive PN;
    `includefield`, `limit`/`offset`, `fuzzymatching`; queries across all studies/series/instances.
 4. **WADO-URI + rendering** — `application/dicom`, then JPEG/PNG rendering with windowing

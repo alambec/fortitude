@@ -5,6 +5,7 @@ pub mod files;
 pub mod index;
 pub mod ingest;
 pub mod pixel;
+pub mod retrieve;
 pub mod walker;
 
 use std::path::PathBuf;

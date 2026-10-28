@@ -29,6 +29,12 @@ impl From<rusqlite::Error> for IndexError {
     }
 }
 
+impl From<rusqlite::types::FromSqlError> for IndexError {
+    fn from(e: rusqlite::types::FromSqlError) -> Self {
+        IndexError::Sqlite(e.to_string())
+    }
+}
+
 pub struct Index {
     writer: mpsc::Sender<Command>,
     readers: Readers,

@@ -254,6 +254,16 @@ fn encode_primitive(
     if value.multiplicity() == 0 || matches!(value, PrimitiveValue::Empty) {
         return;
     }
+    // A textual value made only of padding and separators has no value at all (PS3.18 F.2.5).
+    if matches!(value, PrimitiveValue::Str(_) | PrimitiveValue::Strs(_))
+        && !matches!(
+            vr,
+            VR::OB | VR::OD | VR::OF | VR::OL | VR::OV | VR::OW | VR::UN
+        )
+        && value.to_str().trim_matches([' ', '\0', '\\']).is_empty()
+    {
+        return;
+    }
     match vr {
         VR::OB | VR::OD | VR::OF | VR::OL | VR::OV | VR::OW | VR::UN => {
             let bytes = value.to_bytes();
@@ -531,6 +541,11 @@ mod tests {
             ),
             DataElement::new(tags::REFERENCED_FRAME_NUMBER, VR::IS, PrimitiveValue::Empty),
             DataElement::new(
+                tags::REFERRING_PHYSICIAN_NAME,
+                VR::PN,
+                PrimitiveValue::from(" "),
+            ),
+            DataElement::new(
                 Tag(0x0009, 0x1001),
                 VR::OB,
                 PrimitiveValue::U8(vec![1, 2, 3].into()),
@@ -557,6 +572,7 @@ mod tests {
         assert_eq!(json["00280010"]["Value"], serde_json::json!([512]));
         assert_eq!(json["00280009"]["Value"], serde_json::json!(["00181063"]));
         assert_eq!(json["00081160"], serde_json::json!({"vr": "IS"}));
+        assert_eq!(json["00080090"], serde_json::json!({"vr": "PN"}));
         assert_eq!(json["00091001"]["InlineBinary"], "AQID");
         assert_eq!(
             json["00091002"]["BulkDataURI"],

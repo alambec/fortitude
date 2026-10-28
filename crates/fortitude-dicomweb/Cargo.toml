@@ -11,6 +11,7 @@ publish.workspace = true
 fortitude-core.workspace = true
 fortitude-store.workspace = true
 
+async-stream.workspace = true
 axum.workspace = true
 bytes.workspace = true
 dicom-core.workspace = true
@@ -19,7 +20,9 @@ futures.workspace = true
 memchr.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 fortitude-testkit.workspace = true
