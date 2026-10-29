@@ -83,6 +83,9 @@ async fn main() -> anyhow::Result<()> {
     if config.auth.users.is_empty() && config.auth.tokens.is_empty() {
         tracing::warn!("no credentials configured: authentication is disabled");
     }
+    if config.http.ui && config.auth.users.is_empty() {
+        tracing::warn!("no user configured: the web explorer is disabled");
+    }
     let dimse = config
         .dimse
         .service(

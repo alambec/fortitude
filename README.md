@@ -35,7 +35,7 @@ listen = "0.0.0.0:8042"
 dicomweb_root = "/dicom-web"
 wado_root = "/wado"        # WADO-URI
 # public_url = "https://pacs.example.org"   # default: from Host / X-Forwarded-* headers
-ui = true                  # web explorer at /ui/
+ui = true                  # web explorer at /ui/, for auth.users only
 
 [storage]
 path = "./data"            # files/ (filesystem backend), and index.sqlite with the SQLite index
@@ -81,7 +81,8 @@ port = 104
 [metrics]
 enabled = true             # Prometheus metrics on /metrics
 
-# Without any user or token, authentication is disabled.
+# Without any user or token, authentication is disabled. Only users open the web explorer:
+# without any, it is not served.
 [[auth.users]]             # HTTP Basic
 name = "admin"
 password = "change-me"
@@ -127,8 +128,8 @@ study, series or instance by UID. Patients, studies and series download as ZIP a
 (`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files. Its upload page stores files or whole folders with
 STOW-RS, one request per file, and reports each failure. Text fields match prefixes (IDs) or substrings (name,
 description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
-case-insensitively. With authentication, the browser asks for a Basic user: Bearer tokens
-alone cannot log a browser in.
+case-insensitively. It is served only when `auth.users` is configured, and only to those
+users (the browser asks for one): Bearer tokens do not open it.
 
 The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
 DIMSE has no authentication beyond AE titles: restrict its port at the network level.

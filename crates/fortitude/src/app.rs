@@ -13,8 +13,9 @@ use crate::auth::{self, Auth};
 use crate::config::Config;
 use crate::{admin, metrics, ui};
 
-/// The application: DICOMweb, WADO-URI and administration services and the web explorer,
-/// behind authentication when configured; `/health` and `/metrics` stay public.
+/// The application: DICOMweb, WADO-URI and administration services, behind authentication
+/// when configured, and the web explorer, for configured users only; `/health` and `/metrics`
+/// stay public.
 pub fn build(
     config: &Config,
     store: Arc<Store>,
@@ -44,15 +45,15 @@ pub fn build(
             fortitude_dicomweb::router(dicomweb),
         )
         .nest("/admin", admin::router(store.clone()));
-    if config.http.ui {
-        services = services.merge(ui::router(
-            store,
-            &config.http.dicomweb_root,
-            &config.http.wado_root,
-        ));
-    }
     if let Some(auth) = Auth::new(&config.auth) {
         services = services.layer(middleware::from_fn_with_state(auth, auth::require));
+    }
+    // Only for users: without any, it is not served.
+    if let Some(auth) = Auth::users(&config.auth).filter(|_| config.http.ui) {
+        services = services.merge(
+            ui::router(store, &config.http.dicomweb_root, &config.http.wado_root)
+                .layer(middleware::from_fn_with_state(auth, auth::require)),
+        );
     }
     // Outermost, so that rejected requests are counted too.
     services = services.layer(middleware::from_fn(metrics::track));
@@ -170,6 +171,19 @@ mod tests {
         format!("Basic {}", BASE64.encode(format!("{user}:{password}")))
     }
 
+    /// Configures a user, which the web explorer requires.
+    fn with_user(config: &mut Config) {
+        config.auth.users = vec![User {
+            name: "user".into(),
+            password: "pass".into(),
+            read_only: false,
+        }];
+    }
+
+    fn user() -> String {
+        basic("user", "pass")
+    }
+
     #[tokio::test]
     async fn open_without_credentials() {
         let h = harness(|_| {});
@@ -249,11 +263,16 @@ mod tests {
 
     #[tokio::test]
     async fn web_explorer() {
-        let h = harness(|c| c.http.dicomweb_root = "/dw".into());
-        let response = h.app.clone().oneshot(get("/", None)).await.unwrap();
+        let user = user();
+        let user = Some(user.as_str());
+        let h = harness(|c| {
+            with_user(c);
+            c.http.dicomweb_root = "/dw".into();
+        });
+        let response = h.app.clone().oneshot(get("/", user)).await.unwrap();
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(response.headers()[header::LOCATION], "/ui/");
-        let (status, body) = h.send(get("/ui/", None)).await;
+        let (status, body) = h.send(get("/ui/", user)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             body.contains(r#"<meta name="dicomweb-root" content="/dw">"#),
@@ -261,13 +280,13 @@ mod tests {
         );
         assert!(body.contains(r#"<meta name="wado-root" content="/wado">"#));
         for asset in ["/ui/app.js", "/ui/style.css"] {
-            assert_eq!(h.send(get(asset, None)).await.0, StatusCode::OK);
+            assert_eq!(h.send(get(asset, user)).await.0, StatusCode::OK);
         }
 
         let (status, body) = h
             .send(get(
                 "/ui/api/names?tags=00100010,7FE00010,00091010,zz&uids=1.2.840.10008.5.1.4.1.1.2,1.2.3",
-                None,
+                user,
             ))
             .await;
         assert_eq!(status, StatusCode::OK);
@@ -280,8 +299,11 @@ mod tests {
             })
         );
 
-        let h = harness(|c| c.http.ui = false);
-        assert_eq!(h.send(get("/ui/", None)).await.0, StatusCode::NOT_FOUND);
+        let h = harness(|c| {
+            with_user(c);
+            c.http.ui = false;
+        });
+        assert_eq!(h.send(get("/ui/", user)).await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -290,7 +312,8 @@ mod tests {
         use dicom_dictionary_std::tags;
         use fortitude_testkit::Instance;
 
-        let h = harness(|_| {});
+        let user = user();
+        let h = harness(with_user);
         let instances = [
             Instance::new("1.1", "1.1.1", "1.1.1.1"),
             Instance::new("1.1", "1.1.1", "1.1.1.2").with(|i| i.instance_number = Some(2)),
@@ -307,10 +330,13 @@ mod tests {
                 (i.rows, i.columns) = (2048, 2100);
             }),
         ];
-        assert_eq!(h.stow_instances(&instances, None).await, StatusCode::OK);
+        assert_eq!(
+            h.stow_instances(&instances, Some(&user)).await,
+            StatusCode::OK
+        );
 
         let archive = |query: &str| {
-            let request = get(&format!("/ui/api/archive?{query}"), None);
+            let request = get(&format!("/ui/api/archive?{query}"), Some(&user));
             let app = h.app.clone();
             async move {
                 let response = app.oneshot(request).await.unwrap();
@@ -389,22 +415,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_explorer_requires_credentials() {
+    async fn web_explorer_requires_a_user() {
         let h = harness(|c| {
             c.auth.users = vec![User {
                 name: "viewer".into(),
                 password: "look".into(),
                 read_only: true,
             }];
+            c.auth.tokens = vec![Token {
+                token: "t0ken".into(),
+                read_only: false,
+            }];
         });
-        assert_eq!(h.send(get("/ui/", None)).await.0, StatusCode::UNAUTHORIZED);
+        let response = h.app.clone().oneshot(get("/ui/", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response.headers()[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .starts_with("Basic ")
+        );
         assert_eq!(
             h.send(get("/ui/", Some(&basic("viewer", "look")))).await.0,
             StatusCode::OK
         );
+        for path in ["/", "/ui/", "/ui/app.js", "/ui/api/archive?study=1.2"] {
+            assert_eq!(
+                h.send(get(path, Some("Bearer t0ken"))).await.0,
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+        }
         assert_eq!(
             h.send(get("/ui/api/archive?study=1.2", None)).await.0,
             StatusCode::UNAUTHORIZED
+        );
+        // Tokens still open the other services.
+        assert_eq!(
+            h.send(get("/dicom-web/studies", Some("Bearer t0ken")))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // Without users, the explorer is not served, with or without other credentials.
+        let h = harness(|_| {});
+        assert_eq!(h.send(get("/ui/", None)).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(h.send(get("/", None)).await.0, StatusCode::NOT_FOUND);
+        let h = harness(|c| {
+            c.auth.tokens = vec![Token {
+                token: "t0ken".into(),
+                read_only: false,
+            }];
+        });
+        assert_eq!(
+            h.send(get("/ui/", Some("Bearer t0ken"))).await.0,
+            StatusCode::NOT_FOUND
         );
     }
 

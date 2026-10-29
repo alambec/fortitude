@@ -1,4 +1,5 @@
-//! HTTP authentication: Basic (users) and Bearer (tokens), each optionally read-only.
+//! HTTP authentication: Basic (users) and Bearer (tokens), each optionally read-only. The web
+//! explorer accepts users only.
 //!
 //! Credentials are compared in constant time. Read-only credentials may only use `GET`,
 //! `HEAD` and `OPTIONS`.
@@ -44,6 +45,14 @@ impl Auth {
             .collect();
         (!basic.is_empty() || !bearer.is_empty())
             .then(|| Auth(Arc::new(Credentials { basic, bearer })))
+    }
+
+    /// Users only, without tokens; `None` when no user is configured.
+    pub fn users(config: &AuthConfig) -> Option<Self> {
+        Self::new(&AuthConfig {
+            users: config.users.clone(),
+            tokens: Vec::new(),
+        })
     }
 
     /// The read-only flag of the request's credentials, or `None` when they are missing or

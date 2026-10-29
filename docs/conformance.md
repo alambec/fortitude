@@ -239,6 +239,9 @@ every service except `/health` and `/metrics` requires them:
 - `401` without valid credentials.
 - `403` for read-only credentials on methods other than `GET`, `HEAD` and `OPTIONS`.
 
+The web explorer (`/ui/`) accepts `auth.users` only, not tokens, and is not served when no
+user is configured, even with authentication otherwise disabled.
+
 There is no per-study access control. TLS is expected to be terminated by a reverse proxy.
 
 ## DICOM JSON

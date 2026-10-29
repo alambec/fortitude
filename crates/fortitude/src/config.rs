@@ -32,7 +32,8 @@ pub struct HttpConfig {
     /// Public origin used in returned URLs (e.g. `https://pacs.example.org`); derived from
     /// the `Host` and `X-Forwarded-*` request headers when unset.
     pub public_url: Option<String>,
-    /// Serve the web explorer at `/ui/`.
+    /// Serve the web explorer at `/ui/`, to `auth.users` only: without any, it is not
+    /// served.
     pub ui: bool,
 }
 
@@ -302,7 +303,8 @@ impl DimseConfig {
 }
 
 /// Credentials accepted by the server. With none, authentication is disabled; `/health` and
-/// `/metrics` never require it.
+/// `/metrics` never require it. The web explorer requires a user, whether or not
+/// authentication is enabled.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
