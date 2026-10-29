@@ -1,8 +1,10 @@
-//! Load generator used to compare Fortitude against other DICOMweb servers (Orthanc).
+//! Load generator used to compare Fortitude against other DICOM servers (Orthanc).
 //!
 //! The workflow is: `generate` a dataset once from seed files, `stow` it into every server
 //! under test, then run the `read` scenarios against each of them with identical parameters.
+//! The `dimse-*` scenarios do the same over DIMSE.
 
+mod dimse;
 mod generate;
 mod http;
 mod manifest;
@@ -28,6 +30,12 @@ enum Command {
     Stow(stow::Args),
     /// Run a read scenario (QIDO-RS, WADO-RS, WADO-URI) for a fixed duration.
     Read(read::Args),
+    /// Send a generated dataset with C-STORE and measure ingest throughput.
+    DimseStore(dimse::StoreArgs),
+    /// Run a C-FIND scenario for a fixed duration.
+    DimseFind(dimse::FindArgs),
+    /// C-MOVE every study of a dataset to a sink storage SCP run by the tool.
+    DimseMove(dimse::MoveArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -35,6 +43,9 @@ fn main() -> anyhow::Result<()> {
         Command::Generate(args) => generate::run(&args),
         Command::Stow(args) => runtime()?.block_on(stow::run(args)),
         Command::Read(args) => runtime()?.block_on(read::run(args)),
+        Command::DimseStore(args) => runtime()?.block_on(dimse::store(args)),
+        Command::DimseFind(args) => runtime()?.block_on(dimse::find(args)),
+        Command::DimseMove(args) => runtime()?.block_on(dimse::r#move(args)),
     }
 }
 

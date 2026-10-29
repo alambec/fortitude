@@ -1,7 +1,8 @@
-# DICOMweb conformance statement
+# Conformance statement
 
-This document describes how Fortitude implements DICOM PS3.18. It grows with each phase of
-the [roadmap](roadmap.md).
+This document describes how Fortitude implements the DICOMweb services (PS3.18) and the
+DIMSE services (PS3.4, PS3.7, PS3.8, [below](#dimse)). It grows with each phase of the
+[roadmap](roadmap.md).
 
 ## STOW-RS — Store Instances (PS3.18 §10.5)
 
@@ -255,3 +256,110 @@ There is no per-study access control. TLS is expected to be terminated by a reve
 - Private attributes of implicit VR instances have no known VR and are returned as `UN`
   (binary).
 - Attributes after Pixel Data (e.g. Data Set Trailing Padding) are not part of metadata.
+
+## DIMSE
+
+Fortitude is a DIMSE service class provider when `dimse.listen` is set (disabled by default).
+It initiates associations only for C-MOVE sub-operations.
+
+| | |
+|---|---|
+| AE title | `dimse.ae_title` (default `FORTITUDE`) |
+| Implementation Class UID | `2.25.331980162813764169807831877674859356756` |
+| Implementation Version Name | `FORTITUDE_<version>` |
+| Maximum PDU length received | `dimse.max_pdu_length` (default 262144) |
+| Concurrent associations | `dimse.max_associations` (default 64); more are rejected (transient, local limit exceeded) |
+| Asynchronous operations, role selection, extended negotiation | Not supported (not negotiated) |
+| Timeouts | `dimse.timeout_secs` (default 30) for each network read or write, and to connect to a move destination |
+
+### SOP classes (SCP)
+
+| SOP class | UID |
+|---|---|
+| Verification | `1.2.840.10008.1.1` |
+| Patient Root Query/Retrieve – FIND | `1.2.840.10008.5.1.4.1.2.1.1` |
+| Patient Root Query/Retrieve – MOVE | `1.2.840.10008.5.1.4.1.2.1.2` |
+| Study Root Query/Retrieve – FIND | `1.2.840.10008.5.1.4.1.2.2.1` |
+| Study Root Query/Retrieve – MOVE | `1.2.840.10008.5.1.4.1.2.2.2` |
+| Every standard storage SOP class (`1.2.840.10008.5.1.4.1.1.*`, retired ones included) | |
+| Storage SOP classes listed in `dimse.extra_sop_classes` (e.g. private ones) | |
+
+C-GET and the Modality Worklist are not supported; their presentation contexts are refused.
+
+### Association acceptance
+
+- With `dimse.check_called_ae_title`, the called AE title must be `dimse.ae_title`.
+- With `dimse.allow_unknown_peers = false`, the calling AE title must be one of
+  `dimse.peers`. AE titles are not authentication: restrict access to the DIMSE port at the
+  network level.
+- **Transfer syntaxes.** Every transfer syntax known to dicom-rs is accepted (uncompressed,
+  deflated, JPEG, JPEG-LS, JPEG 2000, HTJ2K, RLE, MPEG/HEVC). When a presentation context
+  proposes several: for storage SOP classes, the first non-native one in the requestor's
+  order (the sender's data is then not decompressed); for verification and query/retrieve,
+  the first native one (Explicit/Implicit VR Little Endian, Explicit VR Big Endian, Deflated).
+
+### C-ECHO
+
+Always answered with Success.
+
+### C-STORE
+
+- The received data set is stored byte for byte, behind a file meta group built from the
+  command (Affected SOP Class/Instance UID, the presentation context's transfer syntax,
+  calling AE title as Source Application Entity Title). No attribute is coerced.
+- Ingest, required attributes and duplicates are those of STOW-RS: an instance already
+  stored is discarded and answered with Success.
+
+| Status | Cause |
+|---|---|
+| `0000` | Stored, or already stored (duplicate). |
+| `A900` | Missing or invalid required UID, or series bound to another study. |
+| `C000` | The data set cannot be parsed. |
+| `A700` | The file cannot be written. |
+| `0110` | Index failure. |
+
+Failures carry an Error Comment (0000,0902). A data set larger than
+`dicomweb.max_instance_size_mib` aborts the association.
+
+### C-FIND
+
+- Levels: `PATIENT` (Patient Root only), `STUDY`, `SERIES`, `IMAGE`. Another level is answered
+  with `A900`.
+- Matching is that of QIDO-RS: single value, list of UIDs, wildcards `*` and `?`, DA/TM/DT
+  ranges, case-insensitive person names, on any attribute (indexed ones are matched in the
+  index, others against the stored metadata). Queries are relational: keys of any level can
+  be combined, and higher-level unique keys are not required. Sequence keys are return keys
+  only.
+- Each response contains Specific Character Set `ISO_IR 192` (UTF-8), Query/Retrieve Level,
+  and every requested key: with its value, or empty when the match has none. Retrieve AE
+  Title is `dimse.ae_title`. Computed keys: Modalities in Study, Number of Study Related
+  Series/Instances, Number of Series Related Instances, Number of Patient Related
+  Studies/Series/Instances.
+- The patient level groups the matching studies by Patient ID and Issuer of Patient ID.
+- At most `dimse.max_find_results` matches (default 10000, 0 for no limit) are returned;
+  beyond, the query ends with `A700` after them.
+- C-CANCEL is honored between responses (final status `FE00`).
+
+### C-MOVE
+
+- The identifier selects instances by unique keys: Patient ID (`PATIENT`), Study Instance
+  UID (`STUDY`), Series Instance UID (`SERIES`), SOP Instance UID (`IMAGE`), each possibly a
+  list. The key of the level is required (`A900` otherwise); keys of higher levels narrow the
+  selection.
+- The Move Destination must be one of `dimse.peers` (`A801` otherwise). One association is
+  opened to it per C-MOVE, with Fortitude's AE title as calling AE title.
+- Proposed presentation contexts: each stored (SOP class, transfer syntax) on its own, and
+  Explicit and Implicit VR Little Endian per SOP class (at most 128). Instances are sent as
+  stored when their transfer syntax is accepted, otherwise transcoded to the accepted
+  uncompressed syntax; an instance that cannot be decoded (e.g. JPEG-LS, see *Codecs*) fails.
+- Sub-operations carry Move Originator AE Title and Message ID. A pending response follows
+  each sub-operation; C-CANCEL is honored between them.
+
+| Final status | When |
+|---|---|
+| `0000` | Every sub-operation succeeded (or nothing matched). |
+| `B000` | Some sub-operations failed or completed with a warning; Failed SOP Instance UID List is returned. |
+| `FE00` | Cancelled. |
+| `A801` | Unknown move destination. |
+| `A702` | The destination cannot be reached or accepts no proposed context. |
+| `A900` | Invalid identifier. |

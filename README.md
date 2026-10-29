@@ -13,6 +13,7 @@ See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 | `crates/fortitude-core` | Identifiers, indexed attributes, QIDO query model and matching, DICOM JSON encoder |
 | `crates/fortitude-store` | File layout, ingest, SQLite index and its writer |
 | `crates/fortitude-dicomweb` | STOW-RS, WADO-RS, QIDO-RS, WADO-URI routes |
+| `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE |
 | `crates/fortitude` | Server binary: configuration, logging, wiring |
 | `bench/` | Load generator, Orthanc baselines, results |
 
@@ -48,6 +49,21 @@ stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
 max_instance_size_mib = 4096
 qido_max_results = 10000   # QIDO-RS results per request (0 = no limit); page with offset
 
+[dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE (SCP)
+# listen = "0.0.0.0:4242"  # unset: DIMSE disabled
+ae_title = "FORTITUDE"
+check_called_ae_title = false
+allow_unknown_peers = true # false: only the peers below may associate
+max_associations = 64
+max_pdu_length = 262144
+timeout_secs = 30
+max_find_results = 10000   # 0 = no limit
+extra_sop_classes = []     # e.g. private storage SOP classes
+[[dimse.peers]]            # C-MOVE destinations
+ae_title = "VIEWER"
+host = "10.0.0.5"
+port = 104
+
 [metrics]
 enabled = true             # Prometheus metrics on /metrics
 
@@ -79,7 +95,8 @@ readable only by the server, or inject them through the environment.
 | `GET /health` | Liveness (never authenticated) |
 | `GET /metrics` | Prometheus metrics (never authenticated) |
 
-The DICOMweb services are described in the [conformance statement](docs/conformance.md).
+The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
+DIMSE has no authentication beyond AE titles: restrict its port at the network level.
 
 ### Metrics
 
@@ -90,6 +107,11 @@ The DICOMweb services are described in the [conformance statement](docs/conforma
 | `fortitude_stow_instances_total` | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_index_batch_size` (histogram: instances per index transaction) | |
 | `fortitude_index_commit_seconds` (histogram) | |
+| `fortitude_dimse_associations_total` | |
+| `fortitude_dimse_requests_total` | `command`, `status`: `success`, `warning`, `failure`, `cancel` |
+| `fortitude_dimse_request_duration_seconds` (histogram) | `command` |
+| `fortitude_dimse_instances_total` (C-STORE) | `outcome`: `stored`, `duplicate`, `failed` |
+| `fortitude_dimse_moved_instances_total` (C-MOVE) | `outcome`: `sent`, `failed` |
 
 ## Benchmarks
 
@@ -116,6 +138,11 @@ python3 bench/diff_qido.py http://localhost:8043/dicom-web http://localhost:8045
 python3 bench/diff_metadata.py http://localhost:8043/dicom-web http://localhost:8045/dicom-web \
     bench/datasets/mixed/manifest.jsonl
 ```
+
+DIMSE: `bench/run-dimse.sh <label> <host:port> [ae]` (C-STORE, C-FIND, C-MOVE to a sink
+run by the tool, which servers must know as `SINK` on port 11120). The Orthanc baselines
+listen for DIMSE on 4243 and 4244, Fortitude (`serve-fortitude.sh`) on 4245. Interoperability
+checks with pynetdicom and Orthanc are in `tests/interop/`.
 
 Servers are pinned to CPUs 0-5 and the load generator to 6-11 (`SERVER_CPUS`, `CLIENT_CPUS`).
 

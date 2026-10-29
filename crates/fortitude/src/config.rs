@@ -15,6 +15,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub index: IndexConfig,
     pub dicomweb: DicomWebConfig,
+    pub dimse: DimseConfig,
     pub auth: AuthConfig,
     pub metrics: MetricsConfig,
     pub log: LogConfig,
@@ -93,6 +94,98 @@ impl Default for DicomWebConfig {
             max_instance_size_mib: 4096,
             qido_max_results: 10_000,
         }
+    }
+}
+
+/// DIMSE service (C-ECHO, C-STORE, C-FIND, C-MOVE as an SCP). It has no authentication
+/// beyond AE titles: restrict access to it at the network level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DimseConfig {
+    /// Address of the DIMSE service; the service is disabled when unset.
+    pub listen: Option<SocketAddr>,
+    pub ae_title: String,
+    /// Reject associations whose called AE title is not `ae_title`.
+    pub check_called_ae_title: bool,
+    /// Accept associations from AE titles that are not listed in `peers`.
+    pub allow_unknown_peers: bool,
+    /// Concurrent associations; more are rejected.
+    pub max_associations: usize,
+    /// Largest PDU accepted, in bytes.
+    pub max_pdu_length: u32,
+    /// Time allowed for each network read or write, and to connect to a C-MOVE destination.
+    pub timeout_secs: u64,
+    /// Maximum number of C-FIND matches (0 for no limit).
+    pub max_find_results: usize,
+    /// Storage SOP classes accepted besides the standard ones (e.g. private classes).
+    pub extra_sop_classes: Vec<String>,
+    /// Known application entities: C-MOVE destinations, and the only peers allowed to
+    /// associate when `allow_unknown_peers` is off.
+    pub peers: Vec<Peer>,
+}
+
+impl Default for DimseConfig {
+    fn default() -> Self {
+        let defaults = fortitude_dimse::Config::default();
+        Self {
+            listen: None,
+            ae_title: defaults.ae_title,
+            check_called_ae_title: defaults.check_called_ae_title,
+            allow_unknown_peers: defaults.allow_unknown_peers,
+            max_associations: defaults.max_associations,
+            max_pdu_length: defaults.max_pdu_length,
+            timeout_secs: defaults.timeout.as_secs(),
+            max_find_results: defaults.max_find_results,
+            extra_sop_classes: defaults.extra_sop_classes,
+            peers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Peer {
+    pub ae_title: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl DimseConfig {
+    /// Service configuration; `max_instance_size` bounds received data sets.
+    pub fn service(&self, max_instance_size: usize) -> Result<fortitude_dimse::Config, String> {
+        let valid_ae = |ae: &str| {
+            !ae.trim().is_empty()
+                && ae.len() <= 16
+                && ae.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+                && !ae.contains('\\')
+        };
+        for ae in std::iter::once(&self.ae_title).chain(self.peers.iter().map(|p| &p.ae_title)) {
+            if !valid_ae(ae) {
+                return Err(format!(
+                    "invalid AE title {ae:?} (1 to 16 ASCII characters)"
+                ));
+            }
+        }
+        Ok(fortitude_dimse::Config {
+            ae_title: self.ae_title.clone(),
+            check_called_ae_title: self.check_called_ae_title,
+            allow_unknown_peers: self.allow_unknown_peers,
+            peers: self
+                .peers
+                .iter()
+                .map(|p| fortitude_dimse::Peer {
+                    ae_title: p.ae_title.clone(),
+                    host: p.host.clone(),
+                    port: p.port,
+                })
+                .collect(),
+            max_associations: self.max_associations.max(1),
+            max_pdu_length: self.max_pdu_length,
+            timeout: std::time::Duration::from_secs(self.timeout_secs.max(1)),
+            max_find_results: self.max_find_results,
+            max_instance_size,
+            extra_sop_classes: self.extra_sop_classes.clone(),
+        })
     }
 }
 
@@ -222,6 +315,34 @@ mod tests {
             assert!(!config.auth.users[0].read_only);
             assert!(config.auth.tokens[0].read_only);
             assert!(config.metrics.enabled);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn dimse_peers() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "fortitude.toml",
+                r#"
+                [dimse]
+                listen = "0.0.0.0:4242"
+                [[dimse.peers]]
+                ae_title = "VIEWER"
+                host = "10.0.0.5"
+                port = 104
+                "#,
+            )?;
+            let config = Config::load(Some(Path::new("fortitude.toml"))).map_err(|e| *e)?;
+            assert_eq!(config.dimse.listen, Some("0.0.0.0:4242".parse().unwrap()));
+            let service = config.dimse.service(1 << 20).unwrap();
+            assert_eq!(service.ae_title, "FORTITUDE");
+            assert_eq!(service.peers[0].port, 104);
+
+            let mut invalid = config.dimse.clone();
+            invalid.ae_title = "A_VERY_LONG_AE_TITLE".into();
+            assert!(invalid.service(1 << 20).is_err());
+            assert_eq!(Config::default().dimse.listen, None);
             Ok(())
         });
     }

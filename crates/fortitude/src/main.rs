@@ -5,11 +5,13 @@ mod config;
 mod metrics;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use fortitude_store::{Store, StoreOptions};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, LogFormat};
@@ -50,7 +52,18 @@ async fn main() -> anyhow::Result<()> {
     if config.auth.users.is_empty() && config.auth.tokens.is_empty() {
         tracing::warn!("no credentials configured: authentication is disabled");
     }
-    let app = app::build(&config, store, metrics_handle);
+    let dimse = config
+        .dimse
+        .service(
+            config
+                .dicomweb
+                .max_instance_size_mib
+                .saturating_mul(1 << 20),
+        )
+        .map_err(anyhow::Error::msg)
+        .context("invalid DIMSE configuration")?;
+    let app = app::build(&config, store.clone(), metrics_handle);
+    let shutdown = CancellationToken::new();
 
     // Without TCP_NODELAY, the last segment of a streamed response can wait for the
     // client's delayed ACK (~40 ms).
@@ -62,11 +75,39 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(error = %e, "cannot set TCP_NODELAY");
             }
         });
+    let dimse = match config.dimse.listen {
+        Some(address) => {
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("cannot listen on {address} (DIMSE)"))?;
+            tracing::info!(listen = %address, ae_title = dimse.ae_title, "DIMSE service started");
+            let dimse = fortitude_dimse::Dimse {
+                store,
+                config: Arc::new(dimse),
+            };
+            Some(tokio::spawn(fortitude_dimse::serve(
+                listener,
+                dimse,
+                shutdown.clone().cancelled_owned(),
+            )))
+        }
+        None => None,
+    };
     tracing::info!(listen = %config.http.listen, "fortitude started");
 
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown_signal().await;
+            shutdown.cancel();
+        }
+    });
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
+    if let Some(dimse) = dimse {
+        dimse.await?;
+    }
     tracing::info!("fortitude stopped");
     Ok(())
 }

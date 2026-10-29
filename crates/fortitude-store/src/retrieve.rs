@@ -80,9 +80,28 @@ pub struct StoredInstance {
     pub study_uid: String,
     pub series_uid: String,
     pub sop_uid: String,
+    pub sop_class_uid: String,
     pub transfer_syntax: String,
     pub path: PathBuf,
     pub size: u64,
+}
+
+/// Instances selected by identifiers (C-MOVE): each criterion that is given must match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selection {
+    pub patient_id: Option<String>,
+    pub studies: Vec<String>,
+    pub series: Vec<String>,
+    pub instances: Vec<String>,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.patient_id.is_none()
+            && self.studies.is_empty()
+            && self.series.is_empty()
+            && self.instances.is_empty()
+    }
 }
 
 /// Where the pixel data of an instance lives.
@@ -111,21 +130,54 @@ impl Store {
         self.index()
             .readers()
             .run(move |conn| {
-                query(
-                    conn,
-                    &scope,
-                    "i.sop_uid, s.series_uid, i.transfer_syntax, i.path, i.size",
-                    |row| {
-                        Ok(StoredInstance {
-                            study_uid: scope.study.clone(),
-                            sop_uid: row.get(0)?,
-                            series_uid: row.get(1)?,
-                            transfer_syntax: row.get(2)?,
-                            path: root.join(row.get::<_, String>(3)?),
-                            size: row.get::<_, i64>(4)? as u64,
-                        })
-                    },
-                )
+                query(conn, &scope, STORED_COLUMNS, |row| {
+                    stored_instance(row, &root)
+                })
+            })
+            .await
+    }
+
+    /// Instances of a selection, in study, series and instance order; none for an empty
+    /// selection.
+    pub async fn select(
+        self: &Arc<Self>,
+        selection: Selection,
+    ) -> Result<Vec<StoredInstance>, IndexError> {
+        if selection.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = self.files().root().to_owned();
+        self.index()
+            .readers()
+            .run(move |conn| {
+                let mut conditions = Vec::new();
+                let mut params: Vec<&str> = Vec::new();
+                if let Some(patient_id) = &selection.patient_id {
+                    conditions.push("st.patient_id = ?".to_owned());
+                    params.push(patient_id);
+                }
+                for (column, values) in [
+                    ("st.study_uid", &selection.studies),
+                    ("s.series_uid", &selection.series),
+                    ("i.sop_uid", &selection.instances),
+                ] {
+                    if !values.is_empty() {
+                        let placeholders = vec!["?"; values.len()].join(", ");
+                        conditions.push(format!("{column} IN ({placeholders})"));
+                        params.extend(values.iter().map(String::as_str));
+                    }
+                }
+                let sql = format!(
+                    "SELECT {STORED_COLUMNS} FROM instances i JOIN series s ON s.pk = i.series_pk \
+                     JOIN studies st ON st.pk = i.study_pk WHERE {} \
+                     ORDER BY st.pk, s.series_number, s.pk, i.instance_number, i.pk",
+                    conditions.join(" AND ")
+                );
+                let mut statement = conn.prepare(&sql)?;
+                let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+                    stored_instance(row, &root)
+                })?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             })
             .await
     }
@@ -207,6 +259,21 @@ impl Store {
             .map_err(|e| IndexError::Sqlite(e.to_string()))?;
         Ok(bytes.map(BulkData::Bytes))
     }
+}
+
+const STORED_COLUMNS: &str =
+    "st.study_uid, s.series_uid, i.sop_uid, i.sop_class_uid, i.transfer_syntax, i.path, i.size";
+
+fn stored_instance(row: &Row<'_>, root: &std::path::Path) -> rusqlite::Result<StoredInstance> {
+    Ok(StoredInstance {
+        study_uid: row.get(0)?,
+        series_uid: row.get(1)?,
+        sop_uid: row.get(2)?,
+        sop_class_uid: row.get(3)?,
+        transfer_syntax: row.get(4)?,
+        path: root.join(row.get::<_, String>(5)?),
+        size: row.get::<_, i64>(6)? as u64,
+    })
 }
 
 fn query<T>(

@@ -15,6 +15,7 @@ publish = false
 fortitude-core = { path = "crates/fortitude-core" }
 fortitude-store = { path = "crates/fortitude-store" }
 fortitude-dicomweb = { path = "crates/fortitude-dicomweb" }
+fortitude-dimse = { path = "crates/fortitude-dimse" }
 fortitude-testkit = { path = "crates/fortitude-testkit" }
 
 anyhow = "1.0.104"
@@ -26,10 +27,12 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 dicom-core = "0.10.1"
 dicom-dictionary-std = "0.10.1"
 dicom-encoding = "0.10.1"
+dicom-json = "0.10.1"
 dicom-object = "0.10.1"
 dicom-parser = "0.10.1"
 dicom-pixeldata = { version = "0.10.1", default-features = false, features = ["image", "native", "openjp2", "rayon"] }
 dicom-transfer-syntax-registry = "0.10.1"
+dicom-ul = { version = "0.10.1", features = ["async"] }
 form_urlencoded = "1.2.2"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 futures = "0.3.34"

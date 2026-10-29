@@ -1,0 +1,24 @@
+# Orthanc peer for the DIMSE interoperability checks (tests/interop/orthanc.py).
+#
+#   docker compose -f tests/interop/orthanc-compose.yml up -d
+#
+# Host networking, so that Orthanc and a Fortitude started on the host reach each other on
+# 127.0.0.1: Orthanc listens on 8047 (HTTP) and 4247 (DICOM, AE title ORTHANC) and knows
+# Fortitude as modality "fortitude" (FORTITUDE@127.0.0.1:4250).
+
+name: fortitude-interop
+
+services:
+  orthanc:
+    image: orthancteam/orthanc:26.9.1
+    network_mode: host
+    environment:
+      ORTHANC__NAME: "orthanc-interop"
+      ORTHANC__HTTP_PORT: "8047"
+      ORTHANC__DICOM_PORT: "4247"
+      ORTHANC__DICOM_AET: "ORTHANC"
+      ORTHANC__AUTHENTICATION_ENABLED: "false"
+      ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
+      ORTHANC__STORAGE_COMPRESSION: "false"
+      ORTHANC__DICOM_MODALITIES: |
+        {"fortitude": ["FORTITUDE", "127.0.0.1", 4250]}

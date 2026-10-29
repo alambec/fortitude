@@ -548,6 +548,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dicom-json"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88621928409de14ad64e1cb7c91bf80c73f9fbc1af185c60d0c97666b362e60a"
+dependencies = [
+ "base64 0.23.1",
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
+ "num-traits",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "dicom-object"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -613,6 +629,22 @@ dependencies = [
  "jpeg2k",
  "jxl-oxide",
  "lazy_static",
+ "tracing",
+]
+
+[[package]]
+name = "dicom-ul"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "480cdc430dc66cdfc1d9c30f6302bbf462476cf3e863b580235ad7baa904c214"
+dependencies = [
+ "byteordered",
+ "bytes",
+ "cfg-if",
+ "dicom-encoding",
+ "dicom-transfer-syntax-registry",
+ "snafu",
+ "tokio",
  "tracing",
 ]
 
@@ -852,6 +884,7 @@ dependencies = [
  "clap",
  "figment",
  "fortitude-dicomweb",
+ "fortitude-dimse",
  "fortitude-store",
  "fortitude-testkit",
  "metrics",
@@ -861,6 +894,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -876,8 +910,10 @@ dependencies = [
  "clap",
  "dicom-core",
  "dicom-dictionary-std",
+ "dicom-encoding",
  "dicom-object",
  "dicom-transfer-syntax-registry",
+ "fortitude-dimse",
  "futures",
  "hdrhistogram",
  "humantime",
@@ -928,6 +964,30 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "fortitude-dimse"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-encoding",
+ "dicom-json",
+ "dicom-object",
+ "dicom-transfer-syntax-registry",
+ "dicom-ul",
+ "fortitude-core",
+ "fortitude-store",
+ "fortitude-testkit",
+ "futures",
+ "metrics",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2587,6 +2647,8 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash",
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
