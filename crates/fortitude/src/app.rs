@@ -43,9 +43,10 @@ pub fn build(
             &config.http.dicomweb_root,
             fortitude_dicomweb::router(dicomweb),
         )
-        .nest("/admin", admin::router(store));
+        .nest("/admin", admin::router(store.clone()));
     if config.http.ui {
         services = services.merge(ui::router(
+            store,
             &config.http.dicomweb_root,
             &config.http.wado_root,
         ));
@@ -130,10 +131,22 @@ mod tests {
         }
 
         async fn stow(&self, authorization: Option<&str>) -> StatusCode {
-            let instance = fortitude_testkit::Instance::new("1.2", "1.2.3", "1.2.3.4").to_bytes();
-            let mut body = b"--b\r\nContent-Type: application/dicom\r\n\r\n".to_vec();
-            body.extend(instance);
-            body.extend(b"\r\n--b--\r\n");
+            let instance = fortitude_testkit::Instance::new("1.2", "1.2.3", "1.2.3.4");
+            self.stow_instances(&[instance], authorization).await
+        }
+
+        async fn stow_instances(
+            &self,
+            instances: &[fortitude_testkit::Instance],
+            authorization: Option<&str>,
+        ) -> StatusCode {
+            let mut body = Vec::new();
+            for instance in instances {
+                body.extend(b"--b\r\nContent-Type: application/dicom\r\n\r\n");
+                body.extend(instance.to_bytes());
+                body.extend(b"\r\n");
+            }
+            body.extend(b"--b--\r\n");
             let mut request = Request::post("/dicom-web/studies").header(
                 header::CONTENT_TYPE,
                 "multipart/related; type=\"application/dicom\"; boundary=b",
@@ -272,6 +285,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archives() {
+        use dicom_core::VR;
+        use dicom_dictionary_std::tags;
+        use fortitude_testkit::Instance;
+
+        let h = harness(|_| {});
+        let instances = [
+            Instance::new("1.1", "1.1.1", "1.1.1.1"),
+            Instance::new("1.1", "1.1.1", "1.1.1.2").with(|i| i.instance_number = Some(2)),
+            Instance::new("1.1", "1.1.2", "1.1.2.1").with(|i| i.series_number = Some(2)),
+            Instance::new("1.2", "1.2.1", "1.2.1.1").element(
+                tags::ISSUER_OF_PATIENT_ID,
+                VR::LO,
+                "HOSP",
+            ),
+            Instance::new("2.1", "2.1.1", "2.1.1.1").with(|i| i.patient_id = "PAT/2".into()),
+            // Streamed rather than read at once.
+            Instance::new("3.1", "3.1.1", "3.1.1.1").with(|i| {
+                i.patient_id = "PAT-3".into();
+                (i.rows, i.columns) = (2048, 2100);
+            }),
+        ];
+        assert_eq!(h.stow_instances(&instances, None).await, StatusCode::OK);
+
+        let archive = |query: &str| {
+            let request = get(&format!("/ui/api/archive?{query}"), None);
+            let app = h.app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, body)
+            }
+        };
+        let entries = |body: &[u8]| -> Vec<String> {
+            crate::archive::tests::read(body)
+                .into_iter()
+                .map(|(name, data)| {
+                    let sop = name.rsplit('/').next().unwrap().trim_end_matches(".dcm");
+                    let instance = instances.iter().find(|i| i.sop_uid == sop).unwrap();
+                    assert_eq!(data, instance.to_bytes(), "{name}");
+                    name
+                })
+                .collect()
+        };
+
+        let (status, headers, body) = archive("study=1.1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/zip");
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"1.1.zip\""
+        );
+        assert_eq!(headers[header::CONTENT_LENGTH], body.len().to_string());
+        assert_eq!(
+            entries(&body),
+            [
+                "1.1/1.1.1/1.1.1.1.dcm",
+                "1.1/1.1.1/1.1.1.2.dcm",
+                "1.1/1.1.2/1.1.2.1.dcm"
+            ]
+        );
+
+        let (status, headers, body) = archive("study=1.1&series=1.1.2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"1.1.2.zip\""
+        );
+        assert_eq!(entries(&body), ["1.1/1.1.2/1.1.2.1.dcm"]);
+
+        let (status, _, body) = archive("patient=PAT-1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(entries(&body).len(), 4);
+        let (_, _, body) = archive("patient=PAT-1&issuer=HOSP").await;
+        assert_eq!(entries(&body), ["1.2/1.2.1/1.2.1.1.dcm"]);
+        let (status, headers, body) = archive("patient=PAT%2F2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"PAT_2.zip\""
+        );
+        assert_eq!(entries(&body), ["2.1/2.1.1/2.1.1.1.dcm"]);
+        let (status, headers, body) = archive("study=3.1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_LENGTH], body.len().to_string());
+        assert_eq!(entries(&body), ["3.1/3.1.1/3.1.1.1.dcm"]);
+
+        for query in [
+            "study=9",
+            "study=1.1&series=1.2.1",
+            "patient=PAT-1&issuer=X",
+        ] {
+            assert_eq!(archive(query).await.0, StatusCode::NOT_FOUND, "{query}");
+        }
+        for query in ["", "series=1.1.1", "patient=", "study=1.1&patient=PAT-1"] {
+            assert_eq!(archive(query).await.0, StatusCode::BAD_REQUEST, "{query}");
+        }
+    }
+
+    #[tokio::test]
     async fn web_explorer_requires_credentials() {
         let h = harness(|c| {
             c.auth.users = vec![User {
@@ -284,6 +401,10 @@ mod tests {
         assert_eq!(
             h.send(get("/ui/", Some(&basic("viewer", "look")))).await.0,
             StatusCode::OK
+        );
+        assert_eq!(
+            h.send(get("/ui/api/archive?study=1.2", None)).await.0,
+            StatusCode::UNAUTHORIZED
         );
     }
 

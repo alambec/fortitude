@@ -92,6 +92,8 @@ pub struct StoredInstance {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {
     pub patient_id: Option<String>,
+    /// Narrows the patient ID's matches; selects nothing by itself.
+    pub issuer_of_patient_id: Option<String>,
     pub studies: Vec<String>,
     pub series: Vec<String>,
     pub instances: Vec<String>,
@@ -152,6 +154,10 @@ impl Store {
                 if let Some(patient_id) = &selection.patient_id {
                     conditions.push("st.patient_id = ?".to_owned());
                     params.push(Value::Text(patient_id.clone()));
+                }
+                if let Some(issuer) = &selection.issuer_of_patient_id {
+                    conditions.push("st.issuer_of_patient_id = ?".to_owned());
+                    params.push(Value::Text(issuer.clone()));
                 }
                 for (column, values) in [
                     ("st.study_uid", &selection.studies),

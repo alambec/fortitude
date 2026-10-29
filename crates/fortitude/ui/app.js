@@ -675,12 +675,17 @@ const crumb = {
   ],
 };
 
-function titleCard(title, subtitle, entries) {
+function titleCard(title, subtitle, entries, actions = []) {
   return h("section", { class: "card title-card" },
     h("h1", {}, title),
     subtitle ? h("div", { class: "subtitle" }, subtitle) : null,
-    details(entries));
+    details(entries),
+    actions.length ? h("div", { class: "actions", style: "margin-top: 14px" }, actions) : null);
 }
+
+/** Link to the instances of a patient, study or series as a ZIP archive, named by the server. */
+const archiveLink = (params) =>
+  h("a", { class: "button small", href: `api/archive?${new URLSearchParams(params)}`, download: true }, "Download ZIP");
 
 /** Render `build()` into `view` once its data is loaded, or the error. */
 async function render(view, build) {
@@ -726,7 +731,7 @@ function patientView(view, state) {
         ["Birth date", formatDate(text(patient, "PatientBirthDate"))],
         ["Sex", text(patient, "PatientSex")],
         ["Studies", integer.format(items.length)],
-      ]),
+      ], id ? [archiveLink(issuer ? { patient: id, issuer } : { patient: id })] : []),
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Studies", h("span", { class: "count" }, items.length))),
         truncated ? notice("warn", "This patient has more studies than the server returns at once.") : null,
@@ -772,7 +777,7 @@ function studyView(view, state, study) {
         ["Series", integer.format(number(item, "NumberOfStudyRelatedSeries") ?? 0)],
         ["Instances", integer.format(number(item, "NumberOfStudyRelatedInstances") ?? 0)],
         ["Study Instance UID", study, { mono: true }],
-      ]),
+      ], [archiveLink({ study })]),
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Series", h("span", { class: "count" }, series.items.length))),
         table.el),
@@ -826,7 +831,7 @@ function seriesView(view, state, study, series) {
         ["Date", dateTime(item, "SeriesDate", "SeriesTime")],
         ["Instances", integer.format(number(item, "NumberOfSeriesRelatedInstances") ?? instances.items.length)],
         ["Series Instance UID", series, { mono: true }],
-      ]),
+      ], [archiveLink({ study, series })]),
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Instances", h("span", { class: "count" }, instances.items.length))),
         instances.truncated ? notice("warn", "This series has more instances than the server returns at once.") : null,

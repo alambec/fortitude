@@ -1,5 +1,6 @@
 mod admin;
 mod app;
+mod archive;
 mod auth;
 mod config;
 mod metrics;

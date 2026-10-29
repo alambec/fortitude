@@ -1067,9 +1067,12 @@ name = "fortitude"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "base64 0.23.1",
+ "bytes",
  "clap",
+ "crc32fast",
  "dicom-core",
  "dicom-dictionary-std",
  "figment",
@@ -1078,6 +1081,7 @@ dependencies = [
  "fortitude-dimse",
  "fortitude-store",
  "fortitude-testkit",
+ "futures",
  "metrics",
  "metrics-exporter-prometheus",
  "serde",

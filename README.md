@@ -116,14 +116,15 @@ uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 G
 |---|---|
 | `{dicomweb_root}/…` | DICOMweb: STOW-RS, WADO-RS, QIDO-RS, rendered resources, thumbnails; `DELETE` on studies, series and instances |
 | `{wado_root}` | WADO-URI |
-| `GET /ui/` (`/` redirects to it) | Web explorer: search, browse and upload |
+| `GET /ui/` (`/` redirects to it) | Web explorer: search, browse, download and upload |
 | `GET /admin/statistics` | Number of studies, series and instances, and stored size |
 | `GET /health` | Liveness (never authenticated) |
 | `GET /metrics` | Prometheus metrics (never authenticated) |
 
 The web explorer searches patients (grouped from matching studies), studies or series by
 patient ID, name, accession number, study description, study date and modality, and opens a
-study, series or instance by UID. Its upload page stores files or whole folders with
+study, series or instance by UID. Patients, studies and series download as ZIP archives
+(`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files. Its upload page stores files or whole folders with
 STOW-RS, one request per file, and reports each failure. Text fields match prefixes (IDs) or substrings (name,
 description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
 case-insensitively. With authentication, the browser asks for a Basic user: Bearer tokens
