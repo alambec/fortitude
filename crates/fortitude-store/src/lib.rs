@@ -1,5 +1,6 @@
-//! Persistence: on-disk layout of Part-10 files, ingest (header parsing, pixel data offsets,
-//! pre-encoded metadata) and the index (SQLite or PostgreSQL) with its group-committing writer.
+//! Persistence: Part-10 files (in a local directory or an S3 bucket), ingest (header parsing,
+//! pixel data offsets, pre-encoded metadata) and the index (SQLite or PostgreSQL) with its
+//! group-committing writer.
 
 pub mod files;
 pub mod imaging;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::files::FileStore;
+use crate::files::{FileBackend, FileStore};
 use crate::index::{Database, Index, IndexError, InsertOutcome};
 use crate::ingest::{Identifiers, IngestError, IngestOptions};
 
@@ -42,9 +43,11 @@ impl std::fmt::Debug for IndexBackend {
 
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
-    /// Directory holding `files/`, and `index.sqlite` with the SQLite backend.
+    /// Directory holding `files/` with the filesystem backend, and `index.sqlite` with the
+    /// SQLite backend.
     pub path: PathBuf,
-    /// Flush every file to disk before acknowledging it.
+    pub files: FileBackend,
+    /// Flush every file to disk before acknowledging it (filesystem backend).
     pub fsync: bool,
     pub index: IndexBackend,
     /// Number of read connections to the index.
@@ -57,6 +60,8 @@ pub struct StoreOptions {
 pub enum OpenError {
     #[error("cannot create storage directory: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid S3 configuration: {0}")]
+    S3(String),
     #[error(transparent)]
     Index(#[from] IndexError),
 }
@@ -116,7 +121,10 @@ pub struct Store {
 impl Store {
     pub fn open(options: StoreOptions) -> Result<Arc<Self>, OpenError> {
         std::fs::create_dir_all(&options.path)?;
-        let files = FileStore::new(options.path.join("files"), options.fsync)?;
+        let files = match &options.files {
+            FileBackend::Filesystem => FileStore::local(options.path.join("files"), options.fsync)?,
+            FileBackend::S3(s3) => FileStore::s3(s3).map_err(|e| OpenError::S3(e.to_string()))?,
+        };
         let database = match &options.index {
             IndexBackend::Sqlite => Database::Sqlite(options.path.join("index.sqlite")),
             IndexBackend::Postgres(url) => Database::Postgres(url.clone()),
@@ -191,11 +199,7 @@ impl Store {
             return Ok(Stored::Duplicate);
         }
         let path = FileStore::new_path();
-        let store = self.clone();
-        let written_path = path.clone();
-        tokio::task::spawn_blocking(move || store.files.write(&written_path, &bytes))
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))??;
+        self.files.write(&path, bytes).await?;
         record.path = path.clone();
 
         let outcome = self.index.insert(record.clone()).await;
@@ -207,7 +211,7 @@ impl Store {
             }
             Err(e) => Err(e.into()),
         };
-        if let Err(e) = self.files.remove(&path) {
+        if let Err(e) = self.files.remove(&path).await {
             tracing::warn!(%path, error = %e, "cannot remove discarded file");
         }
         stored
@@ -229,17 +233,8 @@ impl Store {
     pub async fn delete(self: &Arc<Self>, scope: retrieve::Scope) -> Result<usize, IndexError> {
         let paths = self.index.delete(scope).await?;
         let count = paths.len();
-        let store = self.clone();
-        let removed = tokio::task::spawn_blocking(move || {
-            for path in &paths {
-                if let Err(e) = store.files.remove(path) {
-                    tracing::warn!(%path, error = %e, "cannot remove deleted file");
-                }
-            }
-        })
-        .await;
-        if let Err(e) = removed {
-            tracing::warn!(error = %e, "file removal task failed");
+        for e in self.files.remove_all(paths).await {
+            tracing::warn!(error = %e, "cannot remove deleted file");
         }
         Ok(count)
     }

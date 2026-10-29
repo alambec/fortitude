@@ -1,17 +1,15 @@
 //! Read side of the store: locating instances, metadata, frames and bulk data.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use dicom_core::Tag;
 use dicom_core::value::Value as DicomValue;
-use dicom_dictionary_std::tags;
-use dicom_object::{InMemDicomObject, OpenFileOptions};
+use dicom_object::InMemDicomObject;
 use fortitude_core::json;
 
 use crate::Store;
 use crate::index::{Connection, IndexError, Row, Value};
-use crate::pixel::{PixelLayout, Range};
+use crate::pixel::PixelLayout;
 use crate::walker::PIXEL_TAGS;
 
 /// A study, a series of a study, or an instance of a series.
@@ -85,7 +83,8 @@ pub struct StoredInstance {
     pub sop_uid: String,
     pub sop_class_uid: String,
     pub transfer_syntax: String,
-    pub path: PathBuf,
+    /// Key of the file in the [file store](crate::files::FileStore).
+    pub path: String,
     pub size: u64,
 }
 
@@ -110,7 +109,8 @@ impl Selection {
 /// Where the pixel data of an instance lives.
 #[derive(Debug, Clone)]
 pub struct PixelSource {
-    pub path: PathBuf,
+    /// Key of the file in the [file store](crate::files::FileStore).
+    pub path: String,
     pub transfer_syntax: String,
     pub layout: Option<PixelLayout>,
 }
@@ -129,14 +129,9 @@ impl Store {
         self: &Arc<Self>,
         scope: Scope,
     ) -> Result<Vec<StoredInstance>, IndexError> {
-        let root = self.files().root().to_owned();
         self.index()
             .readers()
-            .run(move |conn| {
-                query(conn, &scope, STORED_COLUMNS, |row| {
-                    stored_instance(row, &root)
-                })
-            })
+            .run(move |conn| query(conn, &scope, STORED_COLUMNS, stored_instance))
             .await
     }
 
@@ -149,7 +144,6 @@ impl Store {
         if selection.is_empty() {
             return Ok(Vec::new());
         }
-        let root = self.files().root().to_owned();
         self.index()
             .readers()
             .run(move |conn| {
@@ -176,7 +170,7 @@ impl Store {
                      ORDER BY st.pk, s.series_number, s.pk, i.instance_number, i.pk",
                     conditions.join(" AND ")
                 );
-                conn.query(&sql, &params, |row| stored_instance(row, &root))
+                conn.query(&sql, &params, stored_instance)
             })
             .await
     }
@@ -213,14 +207,13 @@ impl Store {
 
     /// Pixel data location of an instance; `None` when the instance does not exist.
     pub async fn pixels(self: &Arc<Self>, scope: Scope) -> Result<Option<PixelSource>, IndexError> {
-        let root = self.files().root().to_owned();
         let found = self
             .index()
             .readers()
             .run(move |conn| {
                 query(conn, &scope, "i.path, i.transfer_syntax, i.pixel", |row| {
                     Ok(PixelSource {
-                        path: root.join(row.str(0)?),
+                        path: row.str(0)?.to_owned(),
                         transfer_syntax: row.str(1)?.to_owned(),
                         layout: row.opt_bytes(2)?.and_then(PixelLayout::decode),
                     })
@@ -248,24 +241,27 @@ impl Store {
         {
             return Ok(source.layout.is_some().then_some(BulkData::Pixels(source)));
         }
-        let bytes = tokio::task::spawn_blocking(move || read_element(&source.path, &steps))
-            .await
-            .map_err(|e| IndexError::Database(e.to_string()))?;
-        Ok(bytes.map(BulkData::Bytes))
+        let header_length = source.layout.as_ref().and_then(PixelLayout::header_length);
+        let header = self.files().header(&source.path, header_length).await;
+        // Like a missing attribute, an unreadable file yields no bulk data.
+        Ok(header
+            .ok()
+            .and_then(|header| read_element(&header, &steps))
+            .map(BulkData::Bytes))
     }
 }
 
 const STORED_COLUMNS: &str =
     "st.study_uid, s.series_uid, i.sop_uid, i.sop_class_uid, i.transfer_syntax, i.path, i.size";
 
-fn stored_instance(row: &Row<'_>, root: &std::path::Path) -> Result<StoredInstance, IndexError> {
+fn stored_instance(row: &Row<'_>) -> Result<StoredInstance, IndexError> {
     Ok(StoredInstance {
         study_uid: row.str(0)?.to_owned(),
         series_uid: row.str(1)?.to_owned(),
         sop_uid: row.str(2)?.to_owned(),
         sop_class_uid: row.str(3)?.to_owned(),
         transfer_syntax: row.str(4)?.to_owned(),
-        path: root.join(row.str(5)?),
+        path: row.str(5)?.to_owned(),
         size: row.i64(6)? as u64,
     })
 }
@@ -306,13 +302,9 @@ fn parse_path(path: &str) -> Option<Vec<Step>> {
     matches!(steps.last(), Some(Step::Tag(_))).then_some(steps)
 }
 
-/// Read the value of the element at `steps` from a stored file (header part only).
-fn read_element(path: &std::path::Path, steps: &[Step]) -> Option<Vec<u8>> {
-    let obj = OpenFileOptions::new()
-        .read_until(tags::FLOAT_PIXEL_DATA)
-        .open_file(path)
-        .ok()?;
-    let mut current: &InMemDicomObject = &obj;
+/// The value of the element at `steps` of a data set.
+fn read_element(obj: &InMemDicomObject, steps: &[Step]) -> Option<Vec<u8>> {
+    let mut current = obj;
     let mut iter = steps.iter().peekable();
     while let Some(step) = iter.next() {
         let Step::Tag(tag) = step else { return None };
@@ -328,23 +320,10 @@ fn read_element(path: &std::path::Path, steps: &[Step]) -> Option<Vec<u8>> {
     None
 }
 
-/// Read byte ranges of a file.
-pub fn read_ranges(path: &std::path::Path, ranges: &[Range]) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
-    let file = std::fs::File::open(path)?;
-    let total: u64 = ranges.iter().map(|r| r.length).sum();
-    let mut out = vec![0; total as usize];
-    let mut position = 0;
-    for range in ranges {
-        let end = position + range.length as usize;
-        file.read_exact_at(&mut out[position..end], range.offset)?;
-        position = end;
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
+    use dicom_dictionary_std::tags;
+
     use super::*;
 
     #[test]

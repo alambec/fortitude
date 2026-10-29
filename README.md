@@ -37,9 +37,20 @@ wado_root = "/wado"        # WADO-URI
 # public_url = "https://pacs.example.org"   # default: from Host / X-Forwarded-* headers
 
 [storage]
-path = "./data"            # files/, and index.sqlite with the SQLite index
-fsync = false              # flush each file before acknowledging it
+path = "./data"            # files/ (filesystem backend), and index.sqlite with the SQLite index
+backend = "filesystem"     # where DICOM files go: "filesystem" or "s3"
+fsync = false              # flush each file before acknowledging it (filesystem)
 inline_binary_max = 1024   # larger binary attributes are served as BulkDataURI
+
+[storage.s3]               # with backend = "s3"
+# bucket = "dicom"         # required
+# prefix = "fortitude/"    # key prefix of the files in the bucket
+# region = "eu-west-3"     # default: AWS_REGION, else us-east-1
+# endpoint = "http://minio:9000"   # S3-compatible service; default: AWS
+# access_key_id = "…"      # default: AWS_* variables, web identity, instance metadata
+# secret_access_key = "…"
+virtual_hosted_style = false   # https://bucket.endpoint instead of https://endpoint/bucket
+bulk_delete = true         # DeleteObjects requests; false for services lacking them
 
 [index]
 backend = "sqlite"         # or "postgres"
@@ -91,8 +102,14 @@ readable only by the server, or inject them through the environment.
 
 With `backend = "postgres"`, the index lives in the database of `postgres_url`, which must
 exist; Fortitude creates its tables on first start (in the connection's `search_path`
-schema, `public` by default). DICOM files stay under `storage.path`. Connections are not
-encrypted yet: keep the database on a trusted network.
+schema, `public` by default). Connections are not encrypted yet: keep the database on a
+trusted network.
+
+With `storage.backend = "s3"`, DICOM files are stored as objects of the bucket, under
+`prefix` (`<prefix>/ab/cd/<uuid>.dcm`); the bucket must exist, and the server checks that it
+can list it on startup. The service must support ranged `GetObject` (frames, rendering and
+headers are read by range), as AWS S3 and the usual compatible stores do. Instances are
+uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 GiB limit).
 
 | Endpoint | Purpose |
 |---|---|
@@ -129,6 +146,17 @@ database instead (schemas are left behind; use a disposable database):
 ```sh
 docker run -d --rm --name fortitude-test-pg -e POSTGRES_PASSWORD=test -p 127.0.0.1:5499:5432 postgres:17
 TEST_POSTGRES_URL='host=127.0.0.1 port=5499 user=postgres password=test' cargo test --workspace
+```
+
+Likewise, with `TEST_S3_URL` set to `http://access_key:secret_key@host:port/bucket`, test
+stores keep their files under a new prefix of that bucket (`TEST_S3_BULK_DELETE=false` for
+services without `DeleteObjects`):
+
+```sh
+docker run -d --rm --name fortitude-test-s3 -p 127.0.0.1:7070:7070 -e ROOT_ACCESS_KEY=test \
+    -e ROOT_SECRET_KEY=test-secret --tmpfs /data versity/versitygw:v1.10.0 posix /data
+curl --aws-sigv4 aws:amz:us-east-1:s3 --user test:test-secret -X PUT http://127.0.0.1:7070/fortitude
+TEST_S3_URL=http://test:test-secret@127.0.0.1:7070/fortitude cargo test --workspace
 ```
 
 ## Benchmarks

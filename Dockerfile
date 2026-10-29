@@ -10,6 +10,10 @@ RUN cargo build --release --locked -p fortitude \
     && cp target/release/fortitude /usr/local/bin/fortitude
 
 FROM debian:bookworm-slim
+# CA certificates: HTTPS to S3.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --home-dir /var/lib/fortitude fortitude \
     && mkdir -p /var/lib/fortitude \
     && chown fortitude /var/lib/fortitude

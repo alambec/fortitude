@@ -24,6 +24,9 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
+/// Largest object of a single S3 PutObject request.
+const S3_MAX_OBJECT_MIB: usize = 5 * 1024;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -36,8 +39,22 @@ async fn main() -> anyhow::Result<()> {
         .backend()
         .map_err(anyhow::Error::msg)
         .context("invalid index configuration")?;
+    let files = config
+        .storage
+        .files()
+        .map_err(anyhow::Error::msg)
+        .context("invalid storage configuration")?;
+    if matches!(files, fortitude_store::files::FileBackend::S3(_))
+        && config.dicomweb.max_instance_size_mib > S3_MAX_OBJECT_MIB
+    {
+        anyhow::bail!(
+            "with the s3 storage backend, dicomweb.max_instance_size_mib cannot exceed \
+             {S3_MAX_OBJECT_MIB} (the PutObject limit)"
+        );
+    }
     let store = Store::open(StoreOptions {
         path: config.storage.path.clone(),
+        files,
         fsync: config.storage.fsync,
         index,
         index_readers: match config.index.readers {
@@ -47,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
         inline_binary_max: config.storage.inline_binary_max,
     })
     .with_context(|| format!("cannot open storage at {}", config.storage.path.display()))?;
+    store
+        .files()
+        .check()
+        .await
+        .with_context(|| format!("cannot reach the file storage {:?}", store.files()))?;
+    tracing::info!(files = ?store.files(), "storage opened");
     let metrics_handle = if config.metrics.enabled {
         let recorder = metrics::recorder();
         let handle = recorder.handle();

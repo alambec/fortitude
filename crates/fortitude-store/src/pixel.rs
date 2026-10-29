@@ -148,6 +148,17 @@ impl PixelLayout {
         matches!(self, PixelLayout::Encapsulated { .. })
     }
 
+    /// Length of the file before the pixel data value: the header of the pixel data element
+    /// is in it. `None` when encapsulated fragments could not be attributed to frames.
+    pub fn header_length(&self) -> Option<u64> {
+        match self {
+            PixelLayout::Native { offset, .. } => Some(*offset),
+            PixelLayout::Encapsulated { frames } => {
+                frames.iter().flatten().map(|range| range.offset).min()
+            }
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {

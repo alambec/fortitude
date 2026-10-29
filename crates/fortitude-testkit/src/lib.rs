@@ -4,7 +4,8 @@
 //! tests can check the exact bytes served for each frame.
 //!
 //! With `TEST_POSTGRES_URL` set to a connection string, stores opened by tests index
-//! into PostgreSQL instead of SQLite (see [`postgres_index`]).
+//! into PostgreSQL instead of SQLite (see [`postgres_index`]). With `TEST_S3_URL` set, they
+//! store files in an S3 bucket instead of a directory (see [`file_backend`]).
 
 use dicom_core::value::{PixelFragmentSequence, Value};
 use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
@@ -248,5 +249,33 @@ pub fn postgres_index() -> Option<String> {
         format!("{base}{separator}options=-c%20search_path%3D{schema}")
     } else {
         format!("{base} options='-c search_path={schema}'")
+    })
+}
+
+/// The file backend of stores opened by tests: a new, empty prefix of the bucket named by
+/// `TEST_S3_URL` (`http://access_key:secret_key@host:port/bucket`), or the filesystem when
+/// it is unset. `TEST_S3_BULK_DELETE=false` is for services without `DeleteObjects`.
+pub fn file_backend() -> fortitude_store::files::FileBackend {
+    use fortitude_store::files::{FileBackend, S3Options};
+    let Some(url) = std::env::var("TEST_S3_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return FileBackend::Filesystem;
+    };
+    let invalid = || panic!("invalid TEST_S3_URL {url:?}");
+    let (scheme, rest) = url.split_once("://").unwrap_or_else(invalid);
+    let (credentials, rest) = rest.rsplit_once('@').unwrap_or_else(invalid);
+    let (access_key, secret_key) = credentials.split_once(':').unwrap_or_else(invalid);
+    let (host, bucket) = rest.split_once('/').unwrap_or_else(invalid);
+    FileBackend::S3(S3Options {
+        bucket: bucket.trim_end_matches('/').to_owned(),
+        prefix: format!("test-{}", uuid::Uuid::new_v4().simple()),
+        region: Some("us-east-1".to_owned()),
+        endpoint: Some(format!("{scheme}://{host}")),
+        access_key_id: Some(access_key.to_owned()),
+        secret_access_key: Some(secret_key.to_owned()),
+        virtual_hosted_style: false,
+        bulk_delete: std::env::var("TEST_S3_BULK_DELETE").as_deref() != Ok("false"),
     })
 }

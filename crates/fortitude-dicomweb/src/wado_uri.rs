@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use axum::extract::{RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use fortitude_store::Store;
 use fortitude_store::imaging::{ImageFormat, RenderOptions, can_transcode_to};
 use fortitude_store::retrieve::Scope;
 
@@ -84,7 +83,7 @@ pub async fn retrieve(State(s): State<DicomWeb>, RawQuery(query): RawQuery) -> R
                     if !can_transcode_to(ts) {
                         return not_acceptable();
                     }
-                    match Store::transcoded(&instance.path, ts).await {
+                    match s.store.transcoded(&instance.path, ts).await {
                         Ok(bytes) => {
                             ([(header::CONTENT_TYPE, "application/dicom")], bytes).into_response()
                         }
@@ -92,7 +91,7 @@ pub async fn retrieve(State(s): State<DicomWeb>, RawQuery(query): RawQuery) -> R
                     }
                 }
                 _ => {
-                    let mut response = single_instance(&instance).await;
+                    let mut response = single_instance(&s.store, &instance).await;
                     response
                         .headers_mut()
                         .insert(header::CONTENT_TYPE, header_value("application/dicom"));

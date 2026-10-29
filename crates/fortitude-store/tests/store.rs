@@ -12,6 +12,7 @@ fn open() -> (tempfile::TempDir, Arc<Store>) {
     let store = Store::open(StoreOptions {
         path: dir.path().to_owned(),
         fsync: false,
+        files: fortitude_testkit::file_backend(),
         index: fortitude_testkit::postgres_index().map_or(
             fortitude_store::IndexBackend::Sqlite,
             fortitude_store::IndexBackend::Postgres,
@@ -64,7 +65,7 @@ async fn row(store: &Arc<Store>, sop_uid: &str) -> Row {
 /// Read every frame back from the stored file through the recorded layout.
 async fn stored_frames(store: &Arc<Store>, sop_uid: &str) -> Vec<Vec<u8>> {
     let row = row(store, sop_uid).await;
-    let file = std::fs::read(store.files().path(&row.path)).unwrap();
+    let file = store.files().read(&row.path).await.unwrap();
     let layout = PixelLayout::decode(&row.pixel.expect("pixel layout")).unwrap();
     (0..layout.frame_count())
         .map(|i| {
@@ -156,12 +157,12 @@ async fn metadata_is_pre_encoded_with_bulk_data_uris() {
 
 #[tokio::test]
 async fn duplicates_are_discarded() {
-    let (dir, s) = open();
+    let (_dir, s) = open();
     let instance = Instance::new("1.2.3", "1.2.3.4", "1.2.3.4.5");
     assert_eq!(store(&s, &instance).await.unwrap(), Stored::New);
     assert_eq!(store(&s, &instance).await.unwrap(), Stored::Duplicate);
-    let files = walkdir_count(&dir.path().join("files"));
-    assert_eq!(files, 1);
+    let files = s.files().keys().await.unwrap();
+    assert_eq!(files, [row(&s, "1.2.3.4.5").await.path]);
 }
 
 #[tokio::test]
@@ -241,24 +242,10 @@ async fn concurrent_stores_keep_counts_consistent() {
     assert_eq!(modalities, ["CT", "SR"]);
 }
 
-fn walkdir_count(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .map(|e| {
-            let e = e.unwrap();
-            if e.file_type().unwrap().is_dir() {
-                walkdir_count(&e.path())
-            } else {
-                1
-            }
-        })
-        .sum()
-}
-
 #[tokio::test]
 async fn deletion_keeps_counts_consistent() {
     use fortitude_store::retrieve::Scope;
-    let (dir, s) = open();
+    let (_dir, s) = open();
     for (series, modality, count) in [("1.8.1", "CT", 3), ("1.8.2", "SR", 1)] {
         for i in 0..count {
             let instance = Instance::new("1.8", series, &format!("{series}.{i}"))
@@ -307,7 +294,7 @@ async fn deletion_keeps_counts_consistent() {
         (stats.studies, stats.series, stats.instances, stats.size),
         (0, 0, 0, 0)
     );
-    assert_eq!(walkdir_count(&dir.path().join("files")), 0);
+    assert_eq!(s.files().keys().await.unwrap(), Vec::<String>::new());
 
     // The study can be stored again.
     store(&s, &Instance::new("1.8", "1.8.1", "1.8.1.0"))

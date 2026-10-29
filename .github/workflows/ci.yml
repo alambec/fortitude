@@ -34,6 +34,16 @@ jobs:
         run: cargo test --workspace
         env:
           TEST_POSTGRES_URL: host=localhost user=postgres password=test dbname=fortitude
+      # A service container cannot be given the gateway's arguments.
+      - name: Tests with S3 file storage
+        run: |
+          docker run -d --name s3 -p 7070:7070 -e ROOT_ACCESS_KEY=test -e ROOT_SECRET_KEY=test-secret \
+            --tmpfs /data versity/versitygw:v1.10.0 posix /data
+          until curl -sf --aws-sigv4 aws:amz:us-east-1:s3 --user test:test-secret \
+            -X PUT http://localhost:7070/fortitude -o /dev/null; do sleep 1; done
+          cargo test --workspace
+        env:
+          TEST_S3_URL: http://test:test-secret@localhost:7070/fortitude
 
   docker:
     runs-on: ubuntu-latest

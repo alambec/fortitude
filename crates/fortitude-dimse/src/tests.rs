@@ -28,6 +28,7 @@ async fn harness(configure: impl FnOnce(&mut Config)) -> Harness {
     let store = Store::open(StoreOptions {
         path: dir.path().to_owned(),
         fsync: false,
+        files: fortitude_testkit::file_backend(),
         index: fortitude_testkit::postgres_index().map_or(
             fortitude_store::IndexBackend::Sqlite,
             fortitude_store::IndexBackend::Postgres,

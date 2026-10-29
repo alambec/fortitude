@@ -50,6 +50,10 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 7. **PostgreSQL index** — `index.backend = "postgres"`: same schema (text in the `C`
    collation, so that indexes serve prefix `LIKE` and ranges compare bytewise like SQLite),
    same group-committing writer and reader pool. The test suite runs against both. *(done)*
+8. **S3 file storage** — `storage.backend = "s3"`: files as objects of a bucket (AWS or
+   compatible), through `object_store`. Frames and headers are read with ranged GETs
+   (close ranges coalesced into one request), files are streamed, scope deletions use
+   `DeleteObjects`. The test suite runs against both backends. *(done)*
 
 ## Next
 

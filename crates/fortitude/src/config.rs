@@ -48,22 +48,102 @@ impl Default for HttpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
-    /// Directory holding the DICOM files and the index database.
+    /// Directory holding the DICOM files (`filesystem` backend) and the SQLite index.
     pub path: PathBuf,
+    /// Where the DICOM files are stored.
+    pub backend: FileBackend,
     /// Flush every received file to disk before acknowledging it. Safer on power loss,
-    /// much slower on most disks.
+    /// much slower on most disks. Only for the `filesystem` backend.
     pub fsync: bool,
     /// Binary attributes up to this size (bytes) are inlined in metadata responses; larger
     /// ones are referenced with a BulkDataURI.
     pub inline_binary_max: usize,
+    /// Bucket of the `s3` backend.
+    pub s3: S3Config,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from("./data"),
+            backend: FileBackend::Filesystem,
             fsync: false,
             inline_binary_max: 1024,
+            s3: S3Config::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileBackend {
+    /// `files/` in the storage directory.
+    #[default]
+    Filesystem,
+    /// An S3 bucket (AWS or a compatible service).
+    S3,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Config {
+    /// Required by the `s3` backend.
+    pub bucket: String,
+    /// Prefix of the keys of the files (e.g. `fortitude/`).
+    pub prefix: String,
+    /// `AWS_REGION`, or `us-east-1`, when unset.
+    pub region: Option<String>,
+    /// Endpoint of an S3-compatible service (e.g. `http://minio:9000`); AWS when unset.
+    pub endpoint: Option<String>,
+    /// Credentials; when unset, those of the environment are used (`AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY`, web identity, instance metadata).
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    /// Address the bucket as `https://bucket.endpoint` instead of `https://endpoint/bucket`.
+    pub virtual_hosted_style: bool,
+    /// Delete files with `DeleteObjects` requests (up to 1000 files each); turn off for
+    /// services that do not implement it.
+    pub bulk_delete: bool,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            prefix: String::new(),
+            region: None,
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+            virtual_hosted_style: false,
+            bulk_delete: true,
+        }
+    }
+}
+
+impl StorageConfig {
+    pub fn files(&self) -> Result<fortitude_store::files::FileBackend, String> {
+        match self.backend {
+            FileBackend::Filesystem => Ok(fortitude_store::files::FileBackend::Filesystem),
+            FileBackend::S3 if self.s3.bucket.trim().is_empty() => {
+                Err("the s3 storage backend requires storage.s3.bucket".into())
+            }
+            FileBackend::S3 => {
+                let s3 = &self.s3;
+                let set = |value: &Option<String>| value.clone().filter(|v| !v.trim().is_empty());
+                Ok(fortitude_store::files::FileBackend::S3(
+                    fortitude_store::files::S3Options {
+                        bucket: s3.bucket.trim().to_owned(),
+                        prefix: s3.prefix.clone(),
+                        region: set(&s3.region),
+                        endpoint: set(&s3.endpoint),
+                        access_key_id: set(&s3.access_key_id),
+                        secret_access_key: set(&s3.secret_access_key),
+                        virtual_hosted_style: s3.virtual_hosted_style,
+                        bulk_delete: s3.bulk_delete,
+                    },
+                ))
+            }
         }
     }
 }
@@ -393,6 +473,42 @@ mod tests {
             assert_eq!(
                 Config::default().index.backend(),
                 Ok(fortitude_store::IndexBackend::Sqlite)
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn s3_storage() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "fortitude.toml",
+                r#"
+                [storage]
+                backend = "s3"
+                [storage.s3]
+                prefix = "pacs/"
+                endpoint = "http://localhost:9000"
+                "#,
+            )?;
+            let file = Some(Path::new("fortitude.toml"));
+            assert!(Config::load(file).map_err(|e| *e)?.storage.files().is_err());
+
+            jail.set_env("FORTITUDE_STORAGE__S3__BUCKET", "dicom");
+            jail.set_env("FORTITUDE_STORAGE__S3__SECRET_ACCESS_KEY", "secret");
+            let Ok(fortitude_store::files::FileBackend::S3(s3)) =
+                Config::load(file).map_err(|e| *e)?.storage.files()
+            else {
+                panic!("not an S3 backend");
+            };
+            assert_eq!((s3.bucket.as_str(), s3.prefix.as_str()), ("dicom", "pacs/"));
+            assert_eq!(s3.endpoint.as_deref(), Some("http://localhost:9000"));
+            assert_eq!(s3.secret_access_key.as_deref(), Some("secret"));
+            assert_eq!((s3.access_key_id, s3.region), (None, None));
+            assert!(s3.bulk_delete);
+            assert_eq!(
+                Config::default().storage.files(),
+                Ok(fortitude_store::files::FileBackend::Filesystem)
             );
             Ok(())
         });

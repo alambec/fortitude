@@ -6,8 +6,10 @@
 //! per SOP class. Files go out as stored whenever the destination accepts their transfer
 //! syntax; otherwise they are transcoded.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::tags;
 use dicom_encoding::TransferSyntaxIndex;
@@ -192,7 +194,7 @@ pub(crate) async fn handle(
         .map(|instance| (instance.clone(), destination.plan(instance)))
         .collect();
     let mut loads = futures::stream::iter(plans)
-        .map(prepare)
+        .map(|plan| prepare(&dimse.store, plan))
         .buffered(READ_AHEAD);
 
     let mut failed_uids = Vec::new();
@@ -308,10 +310,11 @@ type Plan = Option<(u8, Option<String>)>;
 
 /// An instance with its plan and data set, ready to be sent.
 async fn prepare(
+    store: &Arc<Store>,
     (instance, plan): (StoredInstance, Plan),
-) -> (StoredInstance, Plan, Result<(Vec<u8>, usize), String>) {
+) -> (StoredInstance, Plan, Result<(Bytes, usize), String>) {
     let loaded = match &plan {
-        Some((_, transcode)) => load(&instance, transcode.as_deref()).await,
+        Some((_, transcode)) => load(store, &instance, transcode.as_deref()).await,
         None => Err("no accepted presentation context".to_owned()),
     };
     (instance, plan, loaded)
@@ -320,15 +323,20 @@ async fn prepare(
 /// The data set of a stored instance, in `transcode` or as stored: the file bytes and the
 /// offset of the data set in them.
 async fn load(
+    store: &Arc<Store>,
     instance: &StoredInstance,
     transcode: Option<&str>,
-) -> Result<(Vec<u8>, usize), String> {
+) -> Result<(Bytes, usize), String> {
     let bytes = match transcode {
-        None => tokio::fs::read(&instance.path)
+        None => store
+            .files()
+            .read(&instance.path)
             .await
             .map_err(|e| format!("cannot read file: {e}"))?,
-        Some(ts) => Store::transcoded(&instance.path, ts)
+        Some(ts) => store
+            .transcoded(&instance.path, ts)
             .await
+            .map(Bytes::from)
             .map_err(|e| format!("cannot transcode to {ts}: {e}"))?,
     };
     let offset = part10::data_set_offset(&bytes).ok_or("stored file is not Part-10")?;

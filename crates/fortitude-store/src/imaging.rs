@@ -3,17 +3,17 @@
 //!
 //! A frame is decoded from a one-frame object built from the stored header and that frame's
 //! bytes, read at the offsets recorded at ingest; only when frames cannot be located
-//! (deflated data sets, unattributable fragments) is the whole file parsed.
+//! (deflated data sets, unattributable fragments) is the whole file read. Files are read
+//! asynchronously from the file store, then decoded on the blocking thread pool.
 
 use std::io::Cursor;
-use std::path::Path;
 use std::sync::Arc;
 
 use dicom_core::value::{PixelFragmentSequence, Value};
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::tags;
 use dicom_encoding::TransferSyntaxIndex;
-use dicom_object::{DefaultDicomObject, OpenFileOptions};
+use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{
     BitDepthOption, ConvertOptions, PixelDecoder, Transcode, VoiLutOption, WindowLevel,
 };
@@ -24,7 +24,7 @@ use image::imageops::FilterType;
 use crate::Store;
 use crate::index::IndexError;
 use crate::pixel::{PixelLayout, Sample};
-use crate::retrieve::{PixelSource, Scope, read_ranges};
+use crate::retrieve::{PixelSource, Scope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -76,7 +76,11 @@ impl Store {
         options: RenderOptions,
     ) -> Result<Vec<u8>, ImagingError> {
         let source = self.pixels(scope).await?.ok_or(ImagingError::NotFound)?;
-        blocking(move || render(&source, options)).await
+        let (obj, frame) = self
+            .frame_objects(&source, &[options.frame])
+            .await?
+            .swap_remove(0);
+        blocking(move || render(&obj, frame, options)).await
     }
 
     /// Frames (0-based) decoded to native little endian pixels.
@@ -86,19 +90,112 @@ impl Store {
         frames: Vec<usize>,
     ) -> Result<Vec<Vec<u8>>, ImagingError> {
         let source = self.pixels(scope).await?.ok_or(ImagingError::NotFound)?;
+        let objects = self.frame_objects(&source, &frames).await?;
         blocking(move || {
-            frames
-                .into_iter()
-                .map(|frame| decode_frame(&source, frame))
+            objects
+                .iter()
+                .map(|(obj, frame)| decode_frame(obj, *frame))
                 .collect()
         })
         .await
     }
 
     /// The stored file at `path` in another transfer syntax, as a Part-10 stream.
-    pub async fn transcoded(path: &Path, transfer_syntax: &str) -> Result<Vec<u8>, ImagingError> {
-        let (path, transfer_syntax) = (path.to_owned(), transfer_syntax.to_owned());
-        blocking(move || transcode(&path, &transfer_syntax)).await
+    pub async fn transcoded(
+        self: &Arc<Self>,
+        path: &str,
+        transfer_syntax: &str,
+    ) -> Result<Vec<u8>, ImagingError> {
+        let ts = TransferSyntaxRegistry.get(transfer_syntax).ok_or_else(|| {
+            ImagingError::Unsupported(format!("unknown transfer syntax {transfer_syntax}"))
+        })?;
+        let obj = self.files().object(path).await.map_err(failed)?;
+        blocking(move || transcode(obj, ts)).await
+    }
+
+    /// For each of `frames`, an object holding only that frame, as frame 0, or the whole
+    /// object when frames cannot be located; with the index of the frame to decode in it.
+    async fn frame_objects(
+        &self,
+        source: &PixelSource,
+        frames: &[usize],
+    ) -> Result<Vec<(Arc<DefaultDicomObject>, u32)>, ImagingError> {
+        let layout = source.layout.as_ref().ok_or(ImagingError::NoPixelData)?;
+        if let PixelLayout::Native {
+            sample: Sample::Float | Sample::Double,
+            ..
+        } = layout
+        {
+            return Err(ImagingError::Unsupported(
+                "float pixel data cannot be rendered".into(),
+            ));
+        }
+        let mut header = self
+            .files()
+            .header(&source.path, layout.header_length())
+            .await
+            .map_err(failed)?;
+        // Native YBR_FULL_422 frames are subsampled, which a one-frame object cannot describe.
+        let subsampled = !layout.is_encapsulated()
+            && header
+                .element_opt(tags::PHOTOMETRIC_INTERPRETATION)
+                .ok()
+                .flatten()
+                .and_then(|e| e.to_str().ok())
+                .is_some_and(|p| p.trim() == "YBR_FULL_422");
+        if layout.frame_count() == 0 || subsampled {
+            if let Some(&frame) = frames
+                .iter()
+                .find(|&&f| layout.frame_count() > 0 && f >= layout.frame_count())
+            {
+                return Err(ImagingError::NoFrame(frame));
+            }
+            let obj = Arc::new(self.files().object(&source.path).await.map_err(failed)?);
+            return Ok(frames.iter().map(|&f| (obj.clone(), f as u32)).collect());
+        }
+        header.put_str(tags::NUMBER_OF_FRAMES, VR::IS, "1");
+        // The offset tables describe all frames, not the one kept.
+        header.remove_element(tags::EXTENDED_OFFSET_TABLE);
+        header.remove_element(tags::EXTENDED_OFFSET_TABLE_LENGTHS);
+        let wide = header
+            .element_opt(tags::BITS_ALLOCATED)
+            .ok()
+            .flatten()
+            .and_then(|e| e.to_int::<u16>().ok())
+            > Some(8);
+        let ranges = frames
+            .iter()
+            .map(|&frame| layout.frame(frame).ok_or(ImagingError::NoFrame(frame)))
+            .collect::<Result<_, _>>()?;
+        let data = self
+            .files()
+            .read_parts(&source.path, ranges)
+            .await
+            .map_err(failed)?;
+        Ok(data
+            .into_iter()
+            .map(|bytes| {
+                let element = if layout.is_encapsulated() {
+                    DataElement::new(
+                        tags::PIXEL_DATA,
+                        VR::OB,
+                        Value::PixelSequence(PixelFragmentSequence::new(
+                            Vec::<u32>::new(),
+                            vec![bytes],
+                        )),
+                    )
+                } else {
+                    DataElement::new(
+                        tags::PIXEL_DATA,
+                        if wide { VR::OW } else { VR::OB },
+                        PrimitiveValue::from(bytes),
+                    )
+                };
+                let mut obj = header.clone();
+                obj.put(element);
+                (Arc::new(obj), 0)
+            })
+            .collect())
     }
 
     /// The instance representing a scope in thumbnails: the middle instance of the series, or
@@ -148,74 +245,15 @@ fn unsupported(e: impl std::fmt::Display) -> ImagingError {
     ImagingError::Unsupported(e.to_string())
 }
 
-/// An object holding only frame `frame` of `source`, as frame 0, or the whole object when
-/// frames cannot be located; with the index of the frame to decode in it.
-fn frame_object(
-    source: &PixelSource,
-    frame: usize,
-) -> Result<(DefaultDicomObject, u32), ImagingError> {
-    let layout = source.layout.as_ref().ok_or(ImagingError::NoPixelData)?;
-    if let PixelLayout::Native {
-        sample: Sample::Float | Sample::Double,
-        ..
-    } = layout
-    {
-        return Err(ImagingError::Unsupported(
-            "float pixel data cannot be rendered".into(),
-        ));
-    }
-    let mut obj = OpenFileOptions::new()
-        .read_until(tags::FLOAT_PIXEL_DATA)
-        .open_file(&source.path)
-        .map_err(|e| ImagingError::Failed(e.to_string()))?;
-    // Native YBR_FULL_422 frames are subsampled, which a one-frame object cannot describe.
-    let subsampled = !layout.is_encapsulated()
-        && obj
-            .element_opt(tags::PHOTOMETRIC_INTERPRETATION)
-            .ok()
-            .flatten()
-            .and_then(|e| e.to_str().ok())
-            .is_some_and(|p| p.trim() == "YBR_FULL_422");
-    if layout.frame_count() == 0 || subsampled {
-        if layout.frame_count() > 0 && frame >= layout.frame_count() {
-            return Err(ImagingError::NoFrame(frame));
-        }
-        let obj = dicom_object::open_file(&source.path)
-            .map_err(|e| ImagingError::Failed(e.to_string()))?;
-        return Ok((obj, frame as u32));
-    }
-    let ranges = layout.frame(frame).ok_or(ImagingError::NoFrame(frame))?;
-    let bytes =
-        read_ranges(&source.path, &ranges).map_err(|e| ImagingError::Failed(e.to_string()))?;
-    obj.put_str(tags::NUMBER_OF_FRAMES, VR::IS, "1");
-    // The offset tables describe all frames, not the one kept.
-    obj.remove_element(tags::EXTENDED_OFFSET_TABLE);
-    obj.remove_element(tags::EXTENDED_OFFSET_TABLE_LENGTHS);
-    let element = if layout.is_encapsulated() {
-        DataElement::new(
-            tags::PIXEL_DATA,
-            VR::OB,
-            Value::PixelSequence(PixelFragmentSequence::new(Vec::<u32>::new(), vec![bytes])),
-        )
-    } else {
-        let wide = obj
-            .element_opt(tags::BITS_ALLOCATED)
-            .ok()
-            .flatten()
-            .and_then(|e| e.to_int::<u16>().ok())
-            > Some(8);
-        DataElement::new(
-            tags::PIXEL_DATA,
-            if wide { VR::OW } else { VR::OB },
-            PrimitiveValue::from(bytes),
-        )
-    };
-    obj.put(element);
-    Ok((obj, 0))
+fn failed(e: std::io::Error) -> ImagingError {
+    ImagingError::Failed(e.to_string())
 }
 
-fn render(source: &PixelSource, options: RenderOptions) -> Result<Vec<u8>, ImagingError> {
-    let (obj, frame) = frame_object(source, options.frame)?;
+fn render(
+    obj: &DefaultDicomObject,
+    frame: u32,
+    options: RenderOptions,
+) -> Result<Vec<u8>, ImagingError> {
     let decoded = obj.decode_pixel_data_frame(frame).map_err(unsupported)?;
     let mut convert = ConvertOptions::new().with_bit_depth(BitDepthOption::Force8Bit);
     if let Some((center, width)) = options.window {
@@ -290,17 +328,15 @@ fn jpeg(
         .map_err(unsupported)
 }
 
-fn decode_frame(source: &PixelSource, frame: usize) -> Result<Vec<u8>, ImagingError> {
-    let (obj, index) = frame_object(source, frame)?;
-    let decoded = obj.decode_pixel_data_frame(index).map_err(unsupported)?;
+fn decode_frame(obj: &DefaultDicomObject, frame: u32) -> Result<Vec<u8>, ImagingError> {
+    let decoded = obj.decode_pixel_data_frame(frame).map_err(unsupported)?;
     Ok(decoded.frame_data(0).map_err(unsupported)?.to_vec())
 }
 
-fn transcode(path: &Path, transfer_syntax: &str) -> Result<Vec<u8>, ImagingError> {
-    let ts = TransferSyntaxRegistry.get(transfer_syntax).ok_or_else(|| {
-        ImagingError::Unsupported(format!("unknown transfer syntax {transfer_syntax}"))
-    })?;
-    let mut obj = dicom_object::open_file(path).map_err(|e| ImagingError::Failed(e.to_string()))?;
+fn transcode(
+    mut obj: DefaultDicomObject,
+    ts: &dicom_encoding::TransferSyntax,
+) -> Result<Vec<u8>, ImagingError> {
     obj.transcode(ts).map_err(unsupported)?;
     let mut out = Vec::new();
     obj.write_all(&mut out).map_err(unsupported)?;
