@@ -4,14 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dicom_core::Tag;
-use dicom_core::value::Value;
+use dicom_core::value::Value as DicomValue;
 use dicom_dictionary_std::tags;
 use dicom_object::{InMemDicomObject, OpenFileOptions};
 use fortitude_core::json;
-use rusqlite::{Connection, Row};
 
 use crate::Store;
-use crate::index::IndexError;
+use crate::index::{Connection, IndexError, Row, Value};
 use crate::pixel::{PixelLayout, Range};
 use crate::walker::PIXEL_TAGS;
 
@@ -50,7 +49,7 @@ impl Scope {
 
     /// `FROM … WHERE …` clause selecting the instances of the scope, with its parameters.
     /// Instances are ordered by series number and instance number.
-    pub(crate) fn select(&self, columns: &str) -> (String, Vec<String>) {
+    pub(crate) fn select(&self, columns: &str) -> (String, Vec<Value>) {
         let from = "FROM instances i JOIN series s ON s.pk = i.series_pk JOIN studies st ON st.pk = i.study_pk";
         let order = "ORDER BY s.series_number, s.pk, i.instance_number, i.pk";
         match (&self.series, &self.instance) {
@@ -58,17 +57,21 @@ impl Scope {
                 format!(
                     "SELECT {columns} {from} WHERE i.sop_uid = ?1 AND s.series_uid = ?2 AND st.study_uid = ?3"
                 ),
-                vec![instance.clone(), series.clone(), self.study.clone()],
+                vec![
+                    Value::Text(instance.clone()),
+                    Value::Text(series.clone()),
+                    Value::Text(self.study.clone()),
+                ],
             ),
             (Some(series), None) => (
                 format!(
                     "SELECT {columns} {from} WHERE s.series_uid = ?1 AND st.study_uid = ?2 {order}"
                 ),
-                vec![series.clone(), self.study.clone()],
+                vec![Value::Text(series.clone()), Value::Text(self.study.clone())],
             ),
             _ => (
                 format!("SELECT {columns} {from} WHERE st.study_uid = ?1 {order}"),
-                vec![self.study.clone()],
+                vec![Value::Text(self.study.clone())],
             ),
         }
     }
@@ -151,10 +154,10 @@ impl Store {
             .readers()
             .run(move |conn| {
                 let mut conditions = Vec::new();
-                let mut params: Vec<&str> = Vec::new();
+                let mut params = Vec::new();
                 if let Some(patient_id) = &selection.patient_id {
                     conditions.push("st.patient_id = ?".to_owned());
-                    params.push(patient_id);
+                    params.push(Value::Text(patient_id.clone()));
                 }
                 for (column, values) in [
                     ("st.study_uid", &selection.studies),
@@ -164,7 +167,7 @@ impl Store {
                     if !values.is_empty() {
                         let placeholders = vec!["?"; values.len()].join(", ");
                         conditions.push(format!("{column} IN ({placeholders})"));
-                        params.extend(values.iter().map(String::as_str));
+                        params.extend(values.iter().cloned().map(Value::Text));
                     }
                 }
                 let sql = format!(
@@ -173,11 +176,7 @@ impl Store {
                      ORDER BY st.pk, s.series_number, s.pk, i.instance_number, i.pk",
                     conditions.join(" AND ")
                 );
-                let mut statement = conn.prepare(&sql)?;
-                let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
-                    stored_instance(row, &root)
-                })?;
-                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                conn.query(&sql, &params, |row| stored_instance(row, &root))
             })
             .await
     }
@@ -193,21 +192,19 @@ impl Store {
             .readers()
             .run(move |conn| {
                 let (sql, params) = scope.select("i.metadata");
-                let mut statement = conn.prepare_cached(&sql)?;
-                let mut rows = statement.query(rusqlite::params_from_iter(params))?;
                 let mut out = Vec::with_capacity(64 * 1024);
                 out.push(b'[');
                 let mut count = 0;
-                while let Some(row) = rows.next()? {
-                    let metadata = row.get_ref(0)?.as_blob()?;
+                conn.for_each(&sql, &params, |row| {
                     if count > 0 {
                         out.push(b',');
                     }
                     out.push(b'{');
-                    json::render(metadata, &base, &mut out);
+                    json::render(row.bytes(0)?, &base, &mut out);
                     out.push(b'}');
                     count += 1;
-                }
+                    Ok(true)
+                })?;
                 out.push(b']');
                 Ok((count > 0).then_some(out))
             })
@@ -223,12 +220,9 @@ impl Store {
             .run(move |conn| {
                 query(conn, &scope, "i.path, i.transfer_syntax, i.pixel", |row| {
                     Ok(PixelSource {
-                        path: root.join(row.get::<_, String>(0)?),
-                        transfer_syntax: row.get(1)?,
-                        layout: row
-                            .get::<_, Option<Vec<u8>>>(2)?
-                            .as_deref()
-                            .and_then(PixelLayout::decode),
+                        path: root.join(row.str(0)?),
+                        transfer_syntax: row.str(1)?.to_owned(),
+                        layout: row.opt_bytes(2)?.and_then(PixelLayout::decode),
                     })
                 })
             })
@@ -256,7 +250,7 @@ impl Store {
         }
         let bytes = tokio::task::spawn_blocking(move || read_element(&source.path, &steps))
             .await
-            .map_err(|e| IndexError::Sqlite(e.to_string()))?;
+            .map_err(|e| IndexError::Database(e.to_string()))?;
         Ok(bytes.map(BulkData::Bytes))
     }
 }
@@ -264,28 +258,26 @@ impl Store {
 const STORED_COLUMNS: &str =
     "st.study_uid, s.series_uid, i.sop_uid, i.sop_class_uid, i.transfer_syntax, i.path, i.size";
 
-fn stored_instance(row: &Row<'_>, root: &std::path::Path) -> rusqlite::Result<StoredInstance> {
+fn stored_instance(row: &Row<'_>, root: &std::path::Path) -> Result<StoredInstance, IndexError> {
     Ok(StoredInstance {
-        study_uid: row.get(0)?,
-        series_uid: row.get(1)?,
-        sop_uid: row.get(2)?,
-        sop_class_uid: row.get(3)?,
-        transfer_syntax: row.get(4)?,
-        path: root.join(row.get::<_, String>(5)?),
-        size: row.get::<_, i64>(6)? as u64,
+        study_uid: row.str(0)?.to_owned(),
+        series_uid: row.str(1)?.to_owned(),
+        sop_uid: row.str(2)?.to_owned(),
+        sop_class_uid: row.str(3)?.to_owned(),
+        transfer_syntax: row.str(4)?.to_owned(),
+        path: root.join(row.str(5)?),
+        size: row.i64(6)? as u64,
     })
 }
 
 fn query<T>(
-    conn: &Connection,
+    conn: &mut Connection,
     scope: &Scope,
     columns: &str,
-    map: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    map: impl FnMut(&Row<'_>) -> Result<T, IndexError>,
 ) -> Result<Vec<T>, IndexError> {
     let (sql, params) = scope.select(columns);
-    let mut statement = conn.prepare_cached(&sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(params), map)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    conn.query(&sql, &params, map)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,8 +318,8 @@ fn read_element(path: &std::path::Path, steps: &[Step]) -> Option<Vec<u8>> {
         let Step::Tag(tag) = step else { return None };
         let element = current.element_opt(*tag).ok().flatten()?;
         match (element.value(), iter.next()) {
-            (Value::Primitive(value), None) => return Some(value.to_bytes().into_owned()),
-            (Value::Sequence(sequence), Some(Step::Item(index))) => {
+            (DicomValue::Primitive(value), None) => return Some(value.to_bytes().into_owned()),
+            (DicomValue::Sequence(sequence), Some(Step::Item(index))) => {
                 current = sequence.items().get(*index)?
             }
             _ => return None,

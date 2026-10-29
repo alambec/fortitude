@@ -7,7 +7,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 
 | Topic | Decision |
 |---|---|
-| Deployment | Single node: SQLite index (WAL) + local filesystem. The index sits behind a narrow trait so that a PostgreSQL backend can be added later. |
+| Deployment | Single node: local filesystem, and an index in SQLite (WAL, the default) or PostgreSQL. Both run the same SQL through a thin connection layer, with the same writer and reader pool. |
 | Protocols | DICOMweb first (STOW-RS, WADO-RS, QIDO-RS, WADO-URI), then DIMSE as SCP (C-ECHO, C-STORE, C-FIND, C-MOVE), with `dicom-ul` for PDU encoding. |
 | Duplicates | An instance whose SOP Instance UID is already stored is **discarded**. The STOW-RS response still lists it in ReferencedSOPSequence (it is retrievable at its RetrieveURL) with the implementation-specific Warning Reason **`0xB111` "Duplicate SOP Instance, discarded"** (PS3.18 §I.2.1 allows additional warning codes; must appear in the conformance statement), so the response status is 202. |
 | Out of scope | Lua, plugin SDK, jobs engine, built-in web UI (use OHIF), Orthanc REST API compatibility. |
@@ -47,13 +47,15 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 6. **DIMSE** — C-ECHO, C-STORE (same ingest as STOW-RS), C-FIND (same search as QIDO-RS,
    Patient and Study Root), C-MOVE to configured peers, sending stored files as they are.
    *(done)*
+7. **PostgreSQL index** — `index.backend = "postgres"`: same schema (text in the `C`
+   collation, so that indexes serve prefix `LIKE` and ranges compare bytewise like SQLite),
+   same group-committing writer and reader pool. The test suite runs against both. *(done)*
 
 ## Next
 
 - **JPEG-LS** decoding (CharLS build on RHEL-family systems), and a faster JPEG 2000
   decoder.
 - **DIMSE**: C-GET, storage commitment, TLS.
-- **PostgreSQL index** behind the same writer/reader interface.
 - **Retention and integrity**: periodic check of files against the index, orphan file
   cleanup after crashes.
 

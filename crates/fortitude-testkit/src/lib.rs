@@ -2,6 +2,9 @@
 //!
 //! Instances are small but complete Part-10 files, with deterministic pixel data so that
 //! tests can check the exact bytes served for each frame.
+//!
+//! With `TEST_POSTGRES_URL` set to a connection string, stores opened by tests index
+//! into PostgreSQL instead of SQLite (see [`postgres_index`]).
 
 use dicom_core::value::{PixelFragmentSequence, Value};
 use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
@@ -218,4 +221,32 @@ pub fn series(study_uid: &str, series_uid: &str, count: u32) -> Vec<Instance> {
                 .with(|inst| inst.instance_number = Some(i as i32))
         })
         .collect()
+}
+
+/// A connection string to a new, empty schema of the PostgreSQL database named by
+/// `TEST_POSTGRES_URL` (URL or key-value pairs); `None` when it is unset.
+pub fn postgres_index() -> Option<String> {
+    let base = std::env::var("TEST_POSTGRES_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+    // The client blocks on a runtime of its own: not within an asynchronous test.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut client = base
+                .parse::<postgres::Config>()
+                .expect("invalid TEST_POSTGRES_URL")
+                .connect(postgres::NoTls)
+                .expect("cannot connect to TEST_POSTGRES_URL");
+            client
+                .batch_execute(&format!("CREATE SCHEMA {schema}"))
+                .expect("cannot create a test schema");
+        });
+    });
+    Some(if base.contains("://") {
+        let separator = if base.contains('?') { '&' } else { '?' };
+        format!("{base}{separator}options=-c%20search_path%3D{schema}")
+    } else {
+        format!("{base} options='-c search_path={schema}'")
+    })
 }

@@ -31,9 +31,15 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(&config);
 
     let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let index = config
+        .index
+        .backend()
+        .map_err(anyhow::Error::msg)
+        .context("invalid index configuration")?;
     let store = Store::open(StoreOptions {
         path: config.storage.path.clone(),
         fsync: config.storage.fsync,
+        index,
         index_readers: match config.index.readers {
             0 => cpus,
             n => n,

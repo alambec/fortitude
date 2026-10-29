@@ -11,7 +11,7 @@ See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 | Path | Content |
 |---|---|
 | `crates/fortitude-core` | Identifiers, indexed attributes, QIDO query model and matching, DICOM JSON encoder |
-| `crates/fortitude-store` | File layout, ingest, SQLite index and its writer |
+| `crates/fortitude-store` | File layout, ingest, index (SQLite or PostgreSQL) and its writer |
 | `crates/fortitude-dicomweb` | STOW-RS, WADO-RS, QIDO-RS, WADO-URI routes |
 | `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE |
 | `crates/fortitude` | Server binary: configuration, logging, wiring |
@@ -37,12 +37,14 @@ wado_root = "/wado"        # WADO-URI
 # public_url = "https://pacs.example.org"   # default: from Host / X-Forwarded-* headers
 
 [storage]
-path = "./data"            # files/ and index.sqlite
+path = "./data"            # files/, and index.sqlite with the SQLite index
 fsync = false              # flush each file before acknowledging it
 inline_binary_max = 1024   # larger binary attributes are served as BulkDataURI
 
 [index]
+backend = "sqlite"         # or "postgres"
 readers = 0                # read connections; 0 = one per CPU
+# postgres_url = "postgres://fortitude:secret@db:5432/fortitude"   # or "host=db user=… dbname=…"
 
 [dicomweb]
 stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
@@ -87,6 +89,11 @@ Environment variables take precedence over the file, e.g.
 `FORTITUDE_AUTH__TOKENS='[{token="…"}]'`. Credentials are plain text: keep the file
 readable only by the server, or inject them through the environment.
 
+With `backend = "postgres"`, the index lives in the database of `postgres_url`, which must
+exist; Fortitude creates its tables on first start (in the connection's `search_path`
+schema, `public` by default). DICOM files stay under `storage.path`. Connections are not
+encrypted yet: keep the database on a trusted network.
+
 | Endpoint | Purpose |
 |---|---|
 | `{dicomweb_root}/…` | DICOMweb: STOW-RS, WADO-RS, QIDO-RS, rendered resources, thumbnails; `DELETE` on studies, series and instances |
@@ -113,6 +120,17 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_dimse_instances_total` (C-STORE) | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_dimse_moved_instances_total` (C-MOVE) | `outcome`: `sent`, `failed` |
 
+## Tests
+
+`cargo test --workspace` runs everything against SQLite. With `TEST_POSTGRES_URL` set to
+a PostgreSQL connection string, every test store indexes into its own new schema of that
+database instead (schemas are left behind; use a disposable database):
+
+```sh
+docker run -d --rm --name fortitude-test-pg -e POSTGRES_PASSWORD=test -p 127.0.0.1:5499:5432 postgres:17
+TEST_POSTGRES_URL='host=127.0.0.1 port=5499 user=postgres password=test' cargo test --workspace
+```
+
 ## Benchmarks
 
 ```sh
@@ -130,6 +148,9 @@ docker compose -f bench/orthanc/docker-compose.yml up -d
 bench/run.sh orthanc-pg http://localhost:8043/dicom-web
 bench/serve-fortitude.sh &        # empty store on :8045, pinned to SERVER_CPUS
 bench/run.sh fortitude http://localhost:8045/dicom-web
+# PostgreSQL index, on the baselines' PostgreSQL server:
+INDEX=postgres bench/serve-fortitude.sh &
+bench/run.sh fortitude-postgres http://localhost:8045/dicom-web
 python3 bench/summarize.py bench/results/*.jsonl
 
 # 4. Check that both servers agree (search results and metadata).

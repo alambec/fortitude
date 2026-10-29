@@ -1,6 +1,7 @@
 //! The single index writer.
 //!
-//! SQLite allows one writer at a time, so all writes go through one thread. Commands that
+//! SQLite allows one writer at a time, so all writes go through one thread (PostgreSQL could
+//! take more, but one keeps both backends alike and conflict-free). Commands that
 //! queue up while a transaction commits are applied together in the next transaction (group
 //! commit): under concurrent STOW-RS, the cost of a commit is shared by many instances. Each
 //! command runs in its own savepoint, so one failing instance does not affect the others.
@@ -9,11 +10,10 @@ use std::collections::BTreeSet;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fortitude_core::attrs::{self, INDEXED, Kind, Level};
-use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::{mpsc, oneshot};
 
 use super::IndexError;
+use super::db::{Connection, Dialect, Value};
 use super::schema;
 use crate::ingest::InstanceRecord;
 use crate::retrieve::Scope;
@@ -42,23 +42,28 @@ pub(crate) enum Command {
 }
 
 enum Applied {
-    Insert(rusqlite::Result<InsertOutcome>),
-    Delete(rusqlite::Result<Vec<String>>),
+    Insert(Result<InsertOutcome, IndexError>),
+    Delete(Result<Vec<String>, IndexError>),
 }
 
-pub(crate) fn spawn(conn: Connection) -> std::io::Result<mpsc::Sender<Command>> {
+type Opener = dyn Fn() -> Result<Connection, IndexError> + Send;
+
+pub(crate) fn spawn(
+    conn: Connection,
+    reopen: impl Fn() -> Result<Connection, IndexError> + Send + 'static,
+) -> std::io::Result<mpsc::Sender<Command>> {
     let (tx, rx) = mpsc::channel(MAX_BATCH * 4);
     std::thread::Builder::new()
         .name("index-writer".into())
-        .spawn(move || run(conn, rx))?;
+        .spawn(move || run(conn, Box::new(reopen), rx))?;
     Ok(tx)
 }
 
-fn run(mut conn: Connection, mut rx: mpsc::Receiver<Command>) {
-    let statements = Statements::new();
+fn run(mut conn: Connection, reopen: Box<Opener>, mut rx: mpsc::Receiver<Command>) {
+    let statements = Statements::new(conn.dialect());
     let mut batch = Vec::with_capacity(MAX_BATCH);
     // Without statistics, SQLite cannot tell a selective index from one that is not.
-    optimize(&conn);
+    optimize(&mut conn);
     let mut since_analyze = 0;
     while let Some(first) = rx.blocking_recv() {
         batch.push(first);
@@ -68,19 +73,47 @@ fn run(mut conn: Connection, mut rx: mpsc::Receiver<Command>) {
                 Err(_) => break,
             }
         }
+        if !conn.is_usable() {
+            match reopen() {
+                Ok(new) => conn = new,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot reconnect to the index");
+                    fail(&mut batch, &e);
+                    continue;
+                }
+            }
+        }
         since_analyze += batch.len();
         apply(&mut conn, &statements, &mut batch);
         if since_analyze >= ANALYZE_EVERY {
-            optimize(&conn);
+            optimize(&mut conn);
             since_analyze = 0;
         }
     }
 }
 
-fn optimize(conn: &Connection) {
-    // 0x10002: analyze every table whose statistics may be stale, without size limit.
-    if let Err(e) = conn.execute_batch("PRAGMA optimize = 0x10002;") {
+fn optimize(conn: &mut Connection) {
+    let sql = match conn.dialect() {
+        // 0x10002: analyze every table whose statistics may be stale, without size limit.
+        Dialect::Sqlite => "PRAGMA optimize = 0x10002;",
+        Dialect::Postgres => "ANALYZE studies, series, instances;",
+    };
+    if let Err(e) = conn.batch(sql) {
         tracing::warn!(error = %e, "cannot refresh index statistics");
+    }
+}
+
+/// Reply to every command of `batch` with `error`.
+fn fail(batch: &mut Vec<Command>, error: &IndexError) {
+    for command in batch.drain(..) {
+        match command {
+            Command::Insert(_, reply) => {
+                let _ = reply.send(Err(error.clone()));
+            }
+            Command::Delete(_, reply) => {
+                let _ = reply.send(Err(error.clone()));
+            }
+        }
     }
 }
 
@@ -90,29 +123,34 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
         .map_or(0, |d| d.as_millis() as i64);
     let started = Instant::now();
     let mut results = Vec::with_capacity(batch.len());
-    let committed = (|| -> rusqlite::Result<()> {
-        let mut tx = conn.transaction()?;
+    let committed = (|| -> Result<(), IndexError> {
+        conn.batch("BEGIN")?;
         for command in batch.iter() {
-            let sp = tx.savepoint()?;
+            conn.batch("SAVEPOINT command")?;
             let (applied, keep) = match command {
                 Command::Insert(record, _) => {
-                    let result = insert(&sp, statements, record, now);
+                    let result = insert(conn, statements, record, now);
                     let keep = matches!(result, Ok(InsertOutcome::Inserted));
                     (Applied::Insert(result), keep)
                 }
                 Command::Delete(scope, _) => {
-                    let result = delete(&sp, scope);
+                    let result = delete(conn, statements.dialect, scope);
                     let keep = result.as_ref().is_ok_and(|paths| !paths.is_empty());
                     (Applied::Delete(result), keep)
                 }
             };
-            if keep {
-                sp.commit()?;
-            }
+            conn.batch(if keep {
+                "RELEASE SAVEPOINT command"
+            } else {
+                "ROLLBACK TO SAVEPOINT command; RELEASE SAVEPOINT command"
+            })?;
             results.push(applied);
         }
-        tx.commit()
+        conn.batch("COMMIT")
     })();
+    if committed.is_err() {
+        let _ = conn.batch("ROLLBACK");
+    }
     metrics::histogram!("fortitude_index_batch_size").record(batch.len() as f64);
     metrics::histogram!("fortitude_index_commit_seconds").record(started.elapsed().as_secs_f64());
 
@@ -120,15 +158,15 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
     for command in batch.drain(..) {
         let applied = results.next();
         let failure = || match &committed {
-            Err(e) => IndexError::Sqlite(e.to_string()),
-            Ok(()) => IndexError::Sqlite("transaction aborted".into()),
+            Err(e) => e.clone(),
+            Ok(()) => IndexError::Database("transaction aborted".into()),
         };
         match (command, applied) {
             (Command::Insert(_, reply), Some(Applied::Insert(result))) if committed.is_ok() => {
-                let _ = reply.send(result.map_err(IndexError::from));
+                let _ = reply.send(result);
             }
             (Command::Delete(_, reply), Some(Applied::Delete(result))) if committed.is_ok() => {
-                let _ = reply.send(result.map_err(IndexError::from));
+                let _ = reply.send(result);
             }
             (Command::Insert(_, reply), _) => {
                 let _ = reply.send(Err(failure()));
@@ -142,65 +180,72 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
 
 /// Delete the instances of `scope`, then the series and studies left empty, and refresh
 /// the counters, representative instances and modalities of the others.
-fn delete(conn: &Connection, scope: &Scope) -> rusqlite::Result<Vec<String>> {
+fn delete(
+    conn: &mut Connection,
+    dialect: Dialect,
+    scope: &Scope,
+) -> Result<Vec<String>, IndexError> {
     let (sql, params) = scope.select("i.pk, i.path, i.series_pk, i.study_pk");
-    let rows: Vec<(i64, String, i64, i64)> = conn
-        .prepare(&sql)?
-        .query_map(rusqlite::params_from_iter(params), |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let rows: Vec<(i64, String, i64, i64)> = conn.query(&sql, &params, |r| {
+        Ok((r.i64(0)?, r.str(1)?.to_owned(), r.i64(2)?, r.i64(3)?))
+    })?;
     let mut series = BTreeSet::new();
     let mut studies = BTreeSet::new();
     for (pk, _, series_pk, study_pk) in &rows {
-        conn.prepare_cached("DELETE FROM instances WHERE pk = ?")?
-            .execute([pk])?;
+        conn.execute("DELETE FROM instances WHERE pk = ?", &[Value::Integer(*pk)])?;
         series.insert(*series_pk);
         studies.insert(*study_pk);
     }
     for pk in series {
-        conn.prepare_cached(
+        let pk = [Value::Integer(pk)];
+        conn.execute(
             "DELETE FROM series WHERE pk = ?1 AND NOT EXISTS (SELECT 1 FROM instances WHERE series_pk = ?1)",
-        )?
-        .execute([pk])?;
-        conn.prepare_cached(
+            &pk,
+        )?;
+        conn.execute(
             "UPDATE series SET
                 num_instances = (SELECT count(*) FROM instances WHERE series_pk = ?1),
                 rep_instance = (SELECT min(pk) FROM instances WHERE series_pk = ?1)
              WHERE pk = ?1",
-        )?
-        .execute([pk])?;
+            &pk,
+        )?;
     }
     for pk in studies {
-        conn.prepare_cached(
+        let pk = [Value::Integer(pk)];
+        conn.execute(
             "DELETE FROM studies WHERE pk = ?1 AND NOT EXISTS (SELECT 1 FROM series WHERE study_pk = ?1)",
-        )?
-        .execute([pk])?;
-        conn.prepare_cached(
-            "UPDATE studies SET
-                num_series = (SELECT count(*) FROM series WHERE study_pk = ?1),
-                num_instances = (SELECT count(*) FROM instances WHERE study_pk = ?1),
-                rep_instance = (SELECT min(pk) FROM instances WHERE study_pk = ?1),
-                modalities = coalesce((SELECT group_concat(m, '\\') FROM (
-                    SELECT DISTINCT modality AS m FROM series
-                    WHERE study_pk = ?1 AND coalesce(modality, '') != ''
-                )), '')
-             WHERE pk = ?1",
-        )?
-        .execute([pk])?;
+            &pk,
+        )?;
+        conn.execute(
+            &format!(
+                "UPDATE studies SET
+                    num_series = (SELECT count(*) FROM series WHERE study_pk = ?1),
+                    num_instances = (SELECT count(*) FROM instances WHERE study_pk = ?1),
+                    rep_instance = (SELECT min(pk) FROM instances WHERE study_pk = ?1),
+                    modalities = coalesce((SELECT {} FROM (
+                        SELECT DISTINCT modality AS m FROM series
+                        WHERE study_pk = ?1 AND coalesce(modality, '') != ''
+                    ) AS d), '')
+                 WHERE pk = ?1",
+                dialect.concat("m", "'\\'")
+            ),
+            &pk,
+        )?;
     }
     Ok(rows.into_iter().map(|(_, path, _, _)| path).collect())
 }
 
 /// SQL statements built once from the indexed attributes.
 struct Statements {
+    dialect: Dialect,
     insert_study: String,
     insert_series: String,
     insert_instance: String,
+    add_series: String,
 }
 
 impl Statements {
-    fn new() -> Self {
+    fn new(dialect: Dialect) -> Self {
         let insert = |level: Level, fixed: &[&str]| {
             let columns: Vec<String> = fixed
                 .iter()
@@ -209,12 +254,22 @@ impl Statements {
                 .collect();
             let placeholders = vec!["?"; columns.len()].join(", ");
             format!(
-                "INSERT INTO {} ({}) VALUES ({placeholders})",
+                "INSERT INTO {} ({}) VALUES ({placeholders}) RETURNING pk",
                 level.table(),
                 columns.join(", ")
             )
         };
+        let has_modality = dialect.contains("'\\' || modalities || '\\'", "'\\' || ?2 || '\\'");
         Self {
+            dialect,
+            add_series: format!(
+                "UPDATE studies SET num_series = num_series + 1,
+                    modalities = CASE
+                        WHEN ?2 = '' OR {has_modality} THEN modalities
+                        WHEN modalities = '' THEN ?2
+                        ELSE modalities || '\\' || ?2 END
+                 WHERE pk = ?1"
+            ),
             insert_study: insert(Level::Study, &["attrs", "created_at"]),
             insert_series: insert(Level::Series, &["study_pk", "attrs", "created_at"]),
             insert_instance: insert(
@@ -271,24 +326,27 @@ pub fn person_name_key(name: &str) -> String {
 }
 
 fn insert(
-    conn: &Connection,
+    conn: &mut Connection,
     statements: &Statements,
     record: &InstanceRecord,
     now: i64,
-) -> rusqlite::Result<InsertOutcome> {
-    let exists = conn
-        .prepare_cached("SELECT 1 FROM instances WHERE sop_uid = ?")?
-        .query_row([&record.sop_uid], |_| Ok(()))
-        .optional()?;
+) -> Result<InsertOutcome, IndexError> {
+    let pk = |r: &super::Row<'_>| r.i64(0);
+    let exists = conn.query_row(
+        "SELECT 1 FROM instances WHERE sop_uid = ?",
+        &[Value::Text(record.sop_uid.clone())],
+        |_| Ok(()),
+    )?;
     if exists.is_some() {
         return Ok(InsertOutcome::Duplicate);
     }
 
-    let study_pk: i64 = match conn
-        .prepare_cached("SELECT pk FROM studies WHERE study_uid = ?")?
-        .query_row([&record.study_uid], |r| r.get(0))
-        .optional()?
-    {
+    let existing_study = conn.query_row(
+        "SELECT pk FROM studies WHERE study_uid = ?",
+        &[Value::Text(record.study_uid.clone())],
+        pk,
+    )?;
+    let study_pk = match existing_study {
         Some(pk) => pk,
         None => {
             let mut values = vec![
@@ -296,16 +354,15 @@ fn insert(
                 Value::Integer(now),
             ];
             values.extend(indexed_values(record, Level::Study));
-            conn.prepare_cached(&statements.insert_study)?
-                .execute(rusqlite::params_from_iter(values))?;
-            conn.last_insert_rowid()
+            inserted(conn.query_row(&statements.insert_study, &values, pk)?)?
         }
     };
 
-    let existing_series: Option<(i64, i64)> = conn
-        .prepare_cached("SELECT pk, study_pk FROM series WHERE series_uid = ?")?
-        .query_row([&record.series_uid], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
+    let existing_series = conn.query_row(
+        "SELECT pk, study_pk FROM series WHERE series_uid = ?",
+        &[Value::Text(record.series_uid.clone())],
+        |r| Ok((r.i64(0)?, r.i64(1)?)),
+    )?;
     let series_pk = match existing_series {
         Some((_, owner)) if owner != study_pk => return Ok(InsertOutcome::SeriesConflict),
         Some((pk, _)) => pk,
@@ -316,22 +373,15 @@ fn insert(
                 Value::Integer(now),
             ];
             values.extend(indexed_values(record, Level::Series));
-            conn.prepare_cached(&statements.insert_series)?
-                .execute(rusqlite::params_from_iter(values))?;
-            let pk = conn.last_insert_rowid();
+            let series_pk = inserted(conn.query_row(&statements.insert_series, &values, pk)?)?;
             let modality = attrs::find_indexed(dicom_dictionary_std::tags::MODALITY)
                 .and_then(|a| record.value(a))
                 .unwrap_or_default();
-            conn.prepare_cached(
-                "UPDATE studies SET num_series = num_series + 1,
-                    modalities = CASE
-                        WHEN ?2 = '' OR instr('\\' || modalities || '\\', '\\' || ?2 || '\\') > 0 THEN modalities
-                        WHEN modalities = '' THEN ?2
-                        ELSE modalities || '\\' || ?2 END
-                 WHERE pk = ?1",
-            )?
-            .execute(params![study_pk, modality])?;
-            pk
+            conn.execute(
+                &statements.add_series,
+                &[Value::Integer(study_pk), Value::Text(modality.to_owned())],
+            )?;
+            series_pk
         }
     };
 
@@ -351,17 +401,22 @@ fn insert(
         Value::Integer(now),
     ];
     values.extend(indexed_values(record, Level::Instance));
-    conn.prepare_cached(&statements.insert_instance)?
-        .execute(rusqlite::params_from_iter(values))?;
-    let instance_pk = conn.last_insert_rowid();
+    let instance_pk = inserted(conn.query_row(&statements.insert_instance, &values, pk)?)?;
 
-    conn.prepare_cached(
+    let pks = [Value::Integer(series_pk), Value::Integer(instance_pk)];
+    conn.execute(
         "UPDATE series SET num_instances = num_instances + 1, rep_instance = coalesce(rep_instance, ?2) WHERE pk = ?1",
-    )?
-    .execute(params![series_pk, instance_pk])?;
-    conn.prepare_cached(
+        &pks,
+    )?;
+    let pks = [Value::Integer(study_pk), Value::Integer(instance_pk)];
+    conn.execute(
         "UPDATE studies SET num_instances = num_instances + 1, rep_instance = coalesce(rep_instance, ?2) WHERE pk = ?1",
-    )?
-    .execute(params![study_pk, instance_pk])?;
+        &pks,
+    )?;
     Ok(InsertOutcome::Inserted)
+}
+
+/// Key of a row returned by `INSERT … RETURNING pk`.
+fn inserted(pk: Option<i64>) -> Result<i64, IndexError> {
+    pk.ok_or_else(|| IndexError::Database("insert returned no key".into()))
 }

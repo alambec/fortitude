@@ -100,6 +100,10 @@ mod tests {
         let store = Store::open(fortitude_store::StoreOptions {
             path: config.storage.path.clone(),
             fsync: false,
+            index: fortitude_testkit::postgres_index().map_or(
+                fortitude_store::IndexBackend::Sqlite,
+                fortitude_store::IndexBackend::Postgres,
+            ),
             index_readers: 2,
             inline_binary_max: 64,
         })

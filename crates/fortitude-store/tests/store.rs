@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fortitude_core::json;
+use fortitude_store::index::Value;
 use fortitude_store::pixel::PixelLayout;
 use fortitude_store::{Store, StoreFailure, StoreOptions, Stored};
 use fortitude_testkit::{IMPLICIT_VR_LE, Instance, JPEG_BASELINE, Pixels};
@@ -11,6 +12,10 @@ fn open() -> (tempfile::TempDir, Arc<Store>) {
     let store = Store::open(StoreOptions {
         path: dir.path().to_owned(),
         fsync: false,
+        index: fortitude_testkit::postgres_index().map_or(
+            fortitude_store::IndexBackend::Sqlite,
+            fortitude_store::IndexBackend::Postgres,
+        ),
         index_readers: 2,
         inline_binary_max: 64,
     })
@@ -33,26 +38,27 @@ struct Row {
 }
 
 async fn row(store: &Arc<Store>, sop_uid: &str) -> Row {
-    let sop_uid = sop_uid.to_owned();
+    let sop_uid = Value::Text(sop_uid.to_owned());
     store
         .index()
         .readers()
         .run(move |conn| {
-            Ok(conn.query_row(
+            conn.query_row(
                 "SELECT path, frames, pixel, metadata FROM instances WHERE sop_uid = ?",
-                [sop_uid],
+                &[sop_uid],
                 |r| {
                     Ok(Row {
-                        path: r.get(0)?,
-                        frames: r.get(1)?,
-                        pixel: r.get(2)?,
-                        metadata: r.get(3)?,
+                        path: r.str(0)?.to_owned(),
+                        frames: r.i64(1)?,
+                        pixel: r.opt_bytes(2)?.map(<[u8]>::to_vec),
+                        metadata: r.bytes(3)?.to_vec(),
                     })
                 },
-            )?)
+            )
         })
         .await
         .unwrap()
+        .expect("no such instance")
 }
 
 /// Read every frame back from the stored file through the recorded layout.
@@ -220,13 +226,14 @@ async fn concurrent_stores_keep_counts_consistent() {
         .index()
         .readers()
         .run(|conn| {
-            Ok(conn.query_row(
+            conn.query_row(
                 "SELECT num_series, num_instances, modalities FROM studies WHERE study_uid = '1.7'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?)
+                &[],
+                |r| Ok((r.i64(0)?, r.i64(1)?, r.str(2)?.to_owned())),
+            )
         })
         .await
+        .unwrap()
         .unwrap();
     assert_eq!((series, instances), (4, 200));
     let mut modalities: Vec<&str> = modalities.split('\\').collect();
@@ -263,13 +270,21 @@ async fn deletion_keeps_counts_consistent() {
         s.index()
             .readers()
             .run(|conn| {
-                Ok(conn.query_row(
-                    "SELECT num_series, num_instances, modalities, rep_instance IS NOT NULL FROM studies",
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?)),
-                )?)
+                conn.query_row(
+                    "SELECT num_series, num_instances, modalities, rep_instance FROM studies",
+                    &[],
+                    |r| {
+                        Ok((
+                            r.i64(0)?,
+                            r.i64(1)?,
+                            r.str(2)?.to_owned(),
+                            r.opt_i64(3)?.is_some(),
+                        ))
+                    },
+                )
             })
             .await
+            .unwrap()
             .unwrap()
     };
     assert_eq!(s.statistics().await.unwrap().instances, 4);

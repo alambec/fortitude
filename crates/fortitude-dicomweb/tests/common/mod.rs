@@ -27,6 +27,10 @@ pub fn app() -> App {
     let store = Store::open(StoreOptions {
         path: dir.path().to_owned(),
         fsync: false,
+        index: fortitude_testkit::postgres_index().map_or(
+            fortitude_store::IndexBackend::Sqlite,
+            fortitude_store::IndexBackend::Postgres,
+        ),
         index_readers: 2,
         inline_binary_max: 64,
     })

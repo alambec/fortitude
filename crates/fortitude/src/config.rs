@@ -71,8 +71,37 @@ impl Default for StorageConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
+    /// Database holding the index.
+    pub backend: IndexBackend,
     /// Read connections to the index; 0 means one per CPU.
     pub readers: usize,
+    /// Connection string of the PostgreSQL database, as a URL
+    /// (`postgres://user:password@host:5432/database`) or key-value pairs
+    /// (`host=… user=… password=… dbname=…`). Required by the `postgres` backend.
+    pub postgres_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexBackend {
+    /// `index.sqlite` in the storage directory.
+    #[default]
+    Sqlite,
+    Postgres,
+}
+
+impl IndexConfig {
+    pub fn backend(&self) -> Result<fortitude_store::IndexBackend, String> {
+        match (self.backend, &self.postgres_url) {
+            (IndexBackend::Sqlite, _) => Ok(fortitude_store::IndexBackend::Sqlite),
+            (IndexBackend::Postgres, Some(url)) if !url.trim().is_empty() => {
+                Ok(fortitude_store::IndexBackend::Postgres(url.clone()))
+            }
+            (IndexBackend::Postgres, _) => {
+                Err("the postgres index backend requires index.postgres_url".into())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +372,28 @@ mod tests {
             invalid.ae_title = "A_VERY_LONG_AE_TITLE".into();
             assert!(invalid.service(1 << 20).is_err());
             assert_eq!(Config::default().dimse.listen, None);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn postgres_index() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("FORTITUDE_INDEX__BACKEND", "postgres");
+            let config = Config::load(None).map_err(|e| *e)?;
+            assert!(config.index.backend().is_err());
+
+            let url = "host=db user=fortitude password='s3 cret' dbname=pacs";
+            jail.set_env("FORTITUDE_INDEX__POSTGRES_URL", url);
+            let config = Config::load(None).map_err(|e| *e)?;
+            assert_eq!(
+                config.index.backend(),
+                Ok(fortitude_store::IndexBackend::Postgres(url.into()))
+            );
+            assert_eq!(
+                Config::default().index.backend(),
+                Ok(fortitude_store::IndexBackend::Sqlite)
+            );
             Ok(())
         });
     }

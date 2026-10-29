@@ -2,6 +2,8 @@
 #
 #   orthanc-pg      http://localhost:8043   DICOM localhost:4243   PostgreSQL index, filesystem storage
 #   orthanc-sqlite  http://localhost:8044   DICOM localhost:4244   built-in SQLite index (same engine as Fortitude)
+#   postgres        localhost:5433 (loopback only), also used by Fortitude's PostgreSQL index
+#                   benchmarks in database "fortitude" (bench/serve-fortitude.sh)
 #
 # Both answer C-FIND and C-MOVE from any AE title and know the benchmark tool's sink storage
 # SCP as move destination "SINK" (host port 11120). DICOM threads are raised like the HTTP ones.
@@ -53,6 +55,7 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
     command: postgres -c shared_buffers=1GB -c max_connections=200
+    ports: ["127.0.0.1:5433:5432"]
     volumes:
       - ../var/postgres:/var/lib/postgresql/data:Z
     healthcheck:

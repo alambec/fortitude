@@ -1,5 +1,5 @@
 //! Persistence: on-disk layout of Part-10 files, ingest (header parsing, pixel data offsets,
-//! pre-encoded metadata) and the SQLite index with its group-committing writer.
+//! pre-encoded metadata) and the index (SQLite or PostgreSQL) with its group-committing writer.
 
 pub mod files;
 pub mod imaging;
@@ -16,15 +16,37 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::files::FileStore;
-use crate::index::{Index, IndexError, InsertOutcome};
+use crate::index::{Database, Index, IndexError, InsertOutcome};
 use crate::ingest::{Identifiers, IngestError, IngestOptions};
+
+/// Database of the index.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum IndexBackend {
+    /// `index.sqlite` in the storage directory.
+    #[default]
+    Sqlite,
+    /// A PostgreSQL database, by connection string: a URL
+    /// (`postgres://user:password@host/database`) or key-value pairs (`host=… dbname=…`).
+    Postgres(String),
+}
+
+impl std::fmt::Debug for IndexBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndexBackend::Sqlite => f.write_str("Sqlite"),
+            // The connection string may hold a password.
+            IndexBackend::Postgres(_) => f.write_str("Postgres(..)"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
-    /// Directory holding `files/` and `index.sqlite`.
+    /// Directory holding `files/`, and `index.sqlite` with the SQLite backend.
     pub path: PathBuf,
     /// Flush every file to disk before acknowledging it.
     pub fsync: bool,
+    pub index: IndexBackend,
     /// Number of read connections to the index.
     pub index_readers: usize,
     /// Binary values up to this size are inlined in metadata.
@@ -95,7 +117,11 @@ impl Store {
     pub fn open(options: StoreOptions) -> Result<Arc<Self>, OpenError> {
         std::fs::create_dir_all(&options.path)?;
         let files = FileStore::new(options.path.join("files"), options.fsync)?;
-        let index = Index::open(&options.path.join("index.sqlite"), options.index_readers)?;
+        let database = match &options.index {
+            IndexBackend::Sqlite => Database::Sqlite(options.path.join("index.sqlite")),
+            IndexBackend::Postgres(url) => Database::Postgres(url.clone()),
+        };
+        let index = Index::open(&database, options.index_readers)?;
         Ok(Arc::new(Self {
             files,
             index,
@@ -222,22 +248,20 @@ impl Store {
         self.index
             .readers()
             .run(|conn| {
-                let count = |table: &str| -> rusqlite::Result<u64> {
-                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
-                        r.get::<_, i64>(0)
-                    })
-                    .map(|n| n as u64)
-                };
-                Ok(Statistics {
-                    studies: count("studies")?,
-                    series: count("series")?,
-                    instances: count("instances")?,
-                    size: conn.query_row(
-                        "SELECT coalesce(sum(size), 0) FROM instances",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )? as u64,
-                })
+                let counts = conn.query_row(
+                    "SELECT (SELECT count(*) FROM studies), (SELECT count(*) FROM series),
+                        count(*), CAST(coalesce(sum(size), 0) AS BIGINT) FROM instances",
+                    &[],
+                    |r| {
+                        Ok(Statistics {
+                            studies: r.i64(0)? as u64,
+                            series: r.i64(1)? as u64,
+                            instances: r.i64(2)? as u64,
+                            size: r.i64(3)? as u64,
+                        })
+                    },
+                )?;
+                counts.ok_or_else(|| IndexError::Database("no statistics".into()))
             })
             .await
     }

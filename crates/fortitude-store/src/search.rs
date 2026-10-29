@@ -15,10 +15,9 @@ use dicom_dictionary_std::tags;
 use fortitude_core::attrs::{self, Kind, Level};
 use fortitude_core::json;
 use fortitude_core::qido::{self, Filter, MODALITIES_IN_STUDY, Pattern, Query};
-use rusqlite::types::Value;
 
 use crate::Store;
-use crate::index::{IndexError, person_name_key};
+use crate::index::{Connection, Dialect, IndexError, Row, Value, person_name_key};
 
 #[derive(Debug, Clone)]
 pub struct Search {
@@ -49,29 +48,18 @@ pub enum SearchError {
     Invalid(String),
 }
 
-impl From<rusqlite::Error> for SearchError {
-    fn from(e: rusqlite::Error) -> Self {
-        SearchError::Index(e.into())
-    }
-}
-
-impl From<rusqlite::types::FromSqlError> for SearchError {
-    fn from(e: rusqlite::types::FromSqlError) -> Self {
-        SearchError::Index(e.into())
-    }
-}
-
 impl Store {
     pub async fn search(
         self: &Arc<Self>,
         search: Search,
         base: String,
     ) -> Result<SearchResult, SearchError> {
-        let plan = Plan::new(&search)?;
-        self.index()
+        let plan = Plan::new(&search, self.index().dialect())?;
+        Ok(self
+            .index()
             .readers()
-            .run(move |conn| Ok(plan.execute(conn, &search, &base)))
-            .await?
+            .run(move |conn| plan.execute(conn, &search, &base))
+            .await?)
     }
 }
 
@@ -95,7 +83,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(search: &Search) -> Result<Self, SearchError> {
+    fn new(search: &Search, dialect: Dialect) -> Result<Self, SearchError> {
         let level = search.level;
         let query = &search.query;
         let mut conditions = Vec::new();
@@ -117,7 +105,7 @@ impl Plan {
             if filter.path.len() > 1 {
                 residual.push(filter.clone());
             } else if tag == MODALITIES_IN_STUDY {
-                conditions.push(modalities_condition(&filter.pattern, &mut params)?);
+                conditions.push(modalities_condition(dialect, &filter.pattern, &mut params)?);
             } else if let Some(attribute) = attrs::find_indexed(tag) {
                 let column = match attribute.kind {
                     Kind::PersonName => format!("{}_key", attribute.column),
@@ -126,6 +114,7 @@ impl Plan {
                 if attribute.level <= level {
                     let column = format!("{}.{column}", alias(attribute.level));
                     conditions.push(condition(
+                        dialect,
                         &column,
                         attribute.kind,
                         &filter.pattern,
@@ -140,6 +129,7 @@ impl Plan {
                         _ => ("s.pk", "instances", "series_pk"),
                     };
                     let condition = condition(
+                        dialect,
                         &format!("x.{column}"),
                         attribute.kind,
                         &filter.pattern,
@@ -230,39 +220,38 @@ impl Plan {
 
     fn execute(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &mut Connection,
         search: &Search,
         base: &str,
-    ) -> Result<SearchResult, SearchError> {
+    ) -> Result<SearchResult, IndexError> {
         let query = &search.query;
-        let mut statement = conn.prepare_cached(&self.sql)?;
-        let mut rows = statement.query(rusqlite::params_from_iter(&self.params))?;
         let mut body = Vec::with_capacity(16 * 1024);
         body.push(b'[');
         let mut count = 0;
         let mut skipped = 0;
         let mut truncated = false;
-        while let Some(row) = rows.next()? {
-            let metadata = row.get_ref(9)?.as_blob_or_null()?;
+        conn.for_each(&self.sql, &self.params, |row| {
+            let metadata = row.opt_bytes(9)?;
             if !self.residual.is_empty() {
                 if !residual_matches(&self.residual, metadata, query.fuzzy) {
-                    continue;
+                    return Ok(true);
                 }
                 if skipped < query.offset {
                     skipped += 1;
-                    continue;
+                    return Ok(true);
                 }
             }
             if count == self.limit {
                 truncated = self.server_limited;
-                break;
+                return Ok(false);
             }
             if count > 0 {
                 body.push(b',');
             }
             render_row(row, search, &self.include, metadata, base, &mut body)?;
             count += 1;
-        }
+            Ok(true)
+        })?;
         body.push(b']');
         Ok(SearchResult {
             body,
@@ -294,6 +283,7 @@ fn returned_by_default(search: &Search, tag: Tag) -> bool {
 
 /// SQL condition for one matching key on `column`.
 fn condition(
+    dialect: Dialect,
     column: &str,
     kind: Kind,
     pattern: &Pattern,
@@ -313,7 +303,7 @@ fn condition(
     };
     let placeholders = |n: usize| vec!["?"; n].join(", ");
     Ok(match (kind, pattern) {
-        (_, Pattern::Universal) => "1".to_owned(),
+        (_, Pattern::Universal) => "TRUE".to_owned(),
         (Kind::Integer, Pattern::Exact(value)) => {
             params.push(integer(value)?);
             format!("{column} = ?")
@@ -330,11 +320,16 @@ fn condition(
             ));
         }
         (Kind::PersonName, Pattern::Exact(value) | Pattern::Wildcard(value)) if fuzzy => {
-            let prefix = glob(&text(value.trim_end_matches('*')));
-            params.push(Value::Text(format!("{prefix}*")));
-            params.push(Value::Text(format!("*^{prefix}*")));
-            params.push(Value::Text(format!("* {prefix}*")));
-            format!("({column} GLOB ? OR {column} GLOB ? OR {column} GLOB ?)")
+            let prefix = text(value.trim_end_matches('*'));
+            for pattern in [
+                format!("{prefix}*"),
+                format!("*^{prefix}*"),
+                format!("* {prefix}*"),
+            ] {
+                params.push(Value::Text(dialect.pattern(&pattern)));
+            }
+            let op = dialect.pattern_operator();
+            format!("({column} {op} ? OR {column} {op} ? OR {column} {op} ?)")
         }
         (Kind::Uid, Pattern::Wildcard(_)) => {
             return Err(SearchError::Invalid("UIDs do not support wildcards".into()));
@@ -344,8 +339,8 @@ fn condition(
             format!("{column} = ?")
         }
         (_, Pattern::Wildcard(value)) => {
-            params.push(Value::Text(glob(&text(value))));
-            format!("{column} GLOB ?")
+            params.push(Value::Text(dialect.pattern(&text(value))));
+            format!("{column} {} ?", dialect.pattern_operator())
         }
         (_, Pattern::List(values)) => {
             params.extend(values.iter().map(|v| Value::Text(text(v))));
@@ -363,7 +358,7 @@ fn condition(
                 params.push(Value::Text(format!("{high}\u{10FFFF}")));
             }
             if parts.is_empty() {
-                "1".to_owned()
+                "TRUE".to_owned()
             } else {
                 parts.join(" AND ")
             }
@@ -378,39 +373,30 @@ fn condition(
 
 /// ModalitiesInStudy: exact values are looked up in the study's denormalized list of
 /// modalities, wildcards in its series.
-fn modalities_condition(pattern: &Pattern, params: &mut Vec<Value>) -> Result<String, SearchError> {
+fn modalities_condition(
+    dialect: Dialect,
+    pattern: &Pattern,
+    params: &mut Vec<Value>,
+) -> Result<String, SearchError> {
     let values = match pattern {
         Pattern::Exact(value) => vec![value.clone()],
         Pattern::List(values) => values.clone(),
         _ => {
-            let condition = condition("x.modality", Kind::Text, pattern, false, params)?;
+            let condition = condition(dialect, "x.modality", Kind::Text, pattern, false, params)?;
             return Ok(format!(
                 "st.pk IN (SELECT x.study_pk FROM series x WHERE {condition})"
             ));
         }
     };
+    let check = dialect.contains("'\\' || st.modalities || '\\'", "?");
     let checks: Vec<&str> = values
         .iter()
         .map(|value| {
             params.push(Value::Text(format!("\\{value}\\")));
-            "instr('\\' || st.modalities || '\\', ?) > 0"
+            check.as_str()
         })
         .collect();
     Ok(format!("({})", checks.join(" OR ")))
-}
-
-/// DICOM wildcard pattern as a SQLite GLOB pattern: `*` and `?` are the same, `[` and `]`
-/// are escaped.
-fn glob(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    for c in pattern.chars() {
-        match c {
-            '[' => out.push_str("[[]"),
-            ']' => out.push_str("[]]"),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn residual_matches(filters: &[Filter], metadata: Option<&[u8]>, fuzzy: bool) -> bool {
@@ -435,19 +421,19 @@ fn is_bulk(member: &[u8]) -> bool {
 
 /// Render one result row as a JSON object.
 fn render_row(
-    row: &rusqlite::Row<'_>,
+    row: &Row<'_>,
     search: &Search,
     include: &[Tag],
     metadata: Option<&[u8]>,
     base: &str,
     out: &mut Vec<u8>,
-) -> rusqlite::Result<()> {
-    let study_uid: String = row.get(0)?;
-    let series_uid: Option<String> = row.get(1)?;
-    let sop_uid: Option<String> = row.get(2)?;
-    let own = row.get_ref(3)?.as_blob()?;
-    let series_attrs = row.get_ref(4)?.as_blob_or_null()?;
-    let study_attrs = row.get_ref(5)?.as_blob_or_null()?;
+) -> Result<(), IndexError> {
+    let study_uid = row.str(0)?;
+    let series_uid = row.opt_str(1)?;
+    let sop_uid = row.opt_str(2)?;
+    let own = row.bytes(3)?;
+    let series_attrs = row.opt_bytes(4)?;
+    let study_attrs = row.opt_bytes(5)?;
 
     let mut computed = vec![json::string_member(
         tags::INSTANCE_AVAILABILITY,
@@ -457,7 +443,7 @@ fn render_row(
     let mut url = format!("{base}/studies/{study_uid}");
     match search.level {
         Level::Study => {
-            let modalities: String = row.get(6)?;
+            let modalities = row.str(6)?;
             let mut modalities: Vec<&str> =
                 modalities.split('\\').filter(|m| !m.is_empty()).collect();
             modalities.sort_unstable();
@@ -469,27 +455,27 @@ fn render_row(
             computed.push(json::integer_member(
                 tags::NUMBER_OF_STUDY_RELATED_SERIES,
                 VR::IS,
-                row.get(7)?,
+                row.i64(7)?,
             ));
             computed.push(json::integer_member(
                 tags::NUMBER_OF_STUDY_RELATED_INSTANCES,
                 VR::IS,
-                row.get(8)?,
+                row.i64(8)?,
             ));
         }
         Level::Series => {
-            url = format!("{url}/series/{}", series_uid.as_deref().unwrap_or_default());
+            url = format!("{url}/series/{}", series_uid.unwrap_or_default());
             computed.push(json::integer_member(
                 tags::NUMBER_OF_SERIES_RELATED_INSTANCES,
                 VR::IS,
-                row.get(8)?,
+                row.i64(8)?,
             ));
         }
         Level::Instance => {
             url = format!(
                 "{url}/series/{}/instances/{}",
-                series_uid.as_deref().unwrap_or_default(),
-                sop_uid.as_deref().unwrap_or_default()
+                series_uid.unwrap_or_default(),
+                sop_uid.unwrap_or_default()
             );
         }
     }
@@ -525,21 +511,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glob_escapes_brackets() {
-        assert_eq!(glob("A[1]*"), "A[[]1[]]*");
-    }
-
-    #[test]
     fn conditions() {
         let mut params = Vec::new();
         let range = Pattern::Range(Some("2020".into()), None);
         assert_eq!(
-            condition("c", Kind::Date, &range, false, &mut params).unwrap(),
+            condition(Dialect::Sqlite, "c", Kind::Date, &range, false, &mut params).unwrap(),
             "c >= ?"
         );
-        assert!(condition("c", Kind::Text, &range, false, &mut params).is_err());
+        assert!(condition(Dialect::Sqlite, "c", Kind::Text, &range, false, &mut params).is_err());
         assert!(
             condition(
+                Dialect::Sqlite,
                 "c",
                 Kind::Integer,
                 &Pattern::Exact("x".into()),
@@ -549,6 +531,7 @@ mod tests {
             .is_err()
         );
         let pn = condition(
+            Dialect::Sqlite,
             "c",
             Kind::PersonName,
             &Pattern::Exact("doe".into()),
@@ -558,5 +541,17 @@ mod tests {
         .unwrap();
         assert_eq!(pn, "(c GLOB ? OR c GLOB ? OR c GLOB ?)");
         assert_eq!(params.last(), Some(&Value::Text("* DOE*".into())));
+
+        let wildcard = condition(
+            Dialect::Postgres,
+            "c",
+            Kind::Text,
+            &Pattern::Wildcard("A_B*".into()),
+            false,
+            &mut params,
+        )
+        .unwrap();
+        assert_eq!(wildcard, "c LIKE ?");
+        assert_eq!(params.last(), Some(&Value::Text("A\\_B%".into())));
     }
 }
