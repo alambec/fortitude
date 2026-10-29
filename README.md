@@ -14,7 +14,7 @@ See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 | `crates/fortitude-store` | File layout, ingest, index (SQLite or PostgreSQL) and its writer |
 | `crates/fortitude-dicomweb` | STOW-RS, WADO-RS, QIDO-RS, WADO-URI routes |
 | `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE |
-| `crates/fortitude` | Server binary: configuration, logging, wiring |
+| `crates/fortitude` | Server binary: configuration, logging, wiring, web explorer (`ui/`) |
 | `bench/` | Load generator, Orthanc baselines, results |
 
 ## Running
@@ -35,6 +35,7 @@ listen = "0.0.0.0:8042"
 dicomweb_root = "/dicom-web"
 wado_root = "/wado"        # WADO-URI
 # public_url = "https://pacs.example.org"   # default: from Host / X-Forwarded-* headers
+ui = true                  # web explorer at /ui/
 
 [storage]
 path = "./data"            # files/ (filesystem backend), and index.sqlite with the SQLite index
@@ -115,9 +116,18 @@ uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 G
 |---|---|
 | `{dicomweb_root}/…` | DICOMweb: STOW-RS, WADO-RS, QIDO-RS, rendered resources, thumbnails; `DELETE` on studies, series and instances |
 | `{wado_root}` | WADO-URI |
+| `GET /ui/` (`/` redirects to it) | Web explorer: search, browse and upload |
 | `GET /admin/statistics` | Number of studies, series and instances, and stored size |
 | `GET /health` | Liveness (never authenticated) |
 | `GET /metrics` | Prometheus metrics (never authenticated) |
+
+The web explorer searches patients (grouped from matching studies), studies or series by
+patient ID, name, accession number, study description, study date and modality, and opens a
+study, series or instance by UID. Its upload page stores files or whole folders with
+STOW-RS, one request per file, and reports each failure. Text fields match prefixes (IDs) or substrings (name,
+description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
+case-insensitively. With authentication, the browser asks for a Basic user: Bearer tokens
+alone cannot log a browser in.
 
 The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
 DIMSE has no authentication beyond AE titles: restrict its port at the network level.

@@ -11,10 +11,10 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, Auth};
 use crate::config::Config;
-use crate::{admin, metrics};
+use crate::{admin, metrics, ui};
 
-/// The application: DICOMweb, WADO-URI and administration services, behind authentication
-/// when configured; `/health` and `/metrics` stay public.
+/// The application: DICOMweb, WADO-URI and administration services and the web explorer,
+/// behind authentication when configured; `/health` and `/metrics` stay public.
 pub fn build(
     config: &Config,
     store: Arc<Store>,
@@ -44,6 +44,12 @@ pub fn build(
             fortitude_dicomweb::router(dicomweb),
         )
         .nest("/admin", admin::router(store));
+    if config.http.ui {
+        services = services.merge(ui::router(
+            &config.http.dicomweb_root,
+            &config.http.wado_root,
+        ));
+    }
     if let Some(auth) = Auth::new(&config.auth) {
         services = services.layer(middleware::from_fn_with_state(auth, auth::require));
     }
@@ -224,6 +230,59 @@ mod tests {
             h.send(get("/admin/statistics", Some("Bearer t0ken")))
                 .await
                 .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn web_explorer() {
+        let h = harness(|c| c.http.dicomweb_root = "/dw".into());
+        let response = h.app.clone().oneshot(get("/", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], "/ui/");
+        let (status, body) = h.send(get("/ui/", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(r#"<meta name="dicomweb-root" content="/dw">"#),
+            "{body}"
+        );
+        assert!(body.contains(r#"<meta name="wado-root" content="/wado">"#));
+        for asset in ["/ui/app.js", "/ui/style.css"] {
+            assert_eq!(h.send(get(asset, None)).await.0, StatusCode::OK);
+        }
+
+        let (status, body) = h
+            .send(get(
+                "/ui/api/names?tags=00100010,7FE00010,00091010,zz&uids=1.2.840.10008.5.1.4.1.1.2,1.2.3",
+                None,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let names: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            names,
+            serde_json::json!({
+                "tags": { "00100010": "PatientName", "7FE00010": "PixelData" },
+                "uids": { "1.2.840.10008.5.1.4.1.1.2": "CT Image Storage" },
+            })
+        );
+
+        let h = harness(|c| c.http.ui = false);
+        assert_eq!(h.send(get("/ui/", None)).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn web_explorer_requires_credentials() {
+        let h = harness(|c| {
+            c.auth.users = vec![User {
+                name: "viewer".into(),
+                password: "look".into(),
+                read_only: true,
+            }];
+        });
+        assert_eq!(h.send(get("/ui/", None)).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            h.send(get("/ui/", Some(&basic("viewer", "look")))).await.0,
             StatusCode::OK
         );
     }

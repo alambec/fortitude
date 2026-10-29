@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="dicomweb-root" content="{{DICOMWEB_ROOT}}">
+  <meta name="wado-root" content="{{WADO_ROOT}}">
+  <title>Fortitude Explorer</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6fde'/%3E%3Cpath d='M10 8h13v4h-9v4h8v4h-8v6h-4z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">
+      <span class="logo" aria-hidden="true">F</span>
+      <span>Fortitude <span class="muted">Explorer</span></span>
+    </a>
+    <nav class="topnav">
+      <a href="#/">Search</a>
+      <a href="#/upload">Upload</a>
+    </nav>
+    <div id="stats" class="stats" aria-live="polite"></div>
+  </header>
+  <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+  <main id="view"></main>
+  <script src="app.js"></script>
+</body>
+</html>

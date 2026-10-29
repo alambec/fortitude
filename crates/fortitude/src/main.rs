@@ -3,6 +3,7 @@ mod app;
 mod auth;
 mod config;
 mod metrics;
+mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -32,6 +32,8 @@ pub struct HttpConfig {
     /// Public origin used in returned URLs (e.g. `https://pacs.example.org`); derived from
     /// the `Host` and `X-Forwarded-*` request headers when unset.
     pub public_url: Option<String>,
+    /// Serve the web explorer at `/ui/`.
+    pub ui: bool,
 }
 
 impl Default for HttpConfig {
@@ -41,6 +43,7 @@ impl Default for HttpConfig {
             dicomweb_root: "/dicom-web".to_owned(),
             wado_root: "/wado".to_owned(),
             public_url: None,
+            ui: true,
         }
     }
 }

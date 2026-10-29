@@ -16,7 +16,10 @@ anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
+dicom-core.workspace = true
+dicom-dictionary-std = { workspace = true, features = ["sop-class"] }
 figment.workspace = true
+form_urlencoded.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 serde.workspace = true
