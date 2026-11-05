@@ -7,7 +7,9 @@
 # `python3 bench/summarize.py bench/results/*.jsonl`.
 #
 # Environment: CLIENT_CPUS (default 6-11), DURATION (default 20s), WARMUP (default 3s),
-# CONCURRENCY (space separated, default "1 16"), SCENARIOS (default: all).
+# CONCURRENCY (space separated, default "1 16"), SCENARIOS (default: all), WADO_URL (WADO-URI
+# endpoint, default /wado at the root of the DICOMweb URL's origin), SKIP_STOW (reads only, on a
+# server already loaded).
 set -euo pipefail
 
 label=${1:?label}
@@ -21,13 +23,13 @@ scenarios=${SCENARIOS:-qido-patient qido-name-wildcard qido-date-modality qido-s
 
 cargo build --quiet --release -p fortitude-bench
 
-"${bench[@]}" stow --url "$url" --dataset "$dataset" --concurrency 8 --batch 20 \
+[ -n "${SKIP_STOW:-}" ] || "${bench[@]}" stow --url "$url" --dataset "$dataset" --concurrency 8 --batch 20 \
     --label "$label" --out "$out"
 
 for scenario in $scenarios; do
     for concurrency in ${CONCURRENCY:-1 16}; do
         "${bench[@]}" read --url "$url" --dataset "$dataset" --scenario "$scenario" \
             --concurrency "$concurrency" --duration "${DURATION:-20s}" --warmup "${WARMUP:-3s}" \
-            --label "$label" --out "$out"
+            ${WADO_URL:+--wado-url "$WADO_URL"} --label "$label" --out "$out"
     done
 done

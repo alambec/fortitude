@@ -4,6 +4,10 @@
 #   docker run -p 8042:8042 -v fortitude-data:/var/lib/fortitude fortitude
 
 FROM rust:1.92-bookworm AS build
+# CMake: CharLS, the JPEG-LS codec, is built from source.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p fortitude \

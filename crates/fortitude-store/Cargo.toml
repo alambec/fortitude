@@ -11,6 +11,7 @@ publish.workspace = true
 fortitude-core.workspace = true
 
 bytes.workspace = true
+charls.workspace = true
 dicom-core.workspace = true
 dicom-dictionary-std.workspace = true
 dicom-encoding.workspace = true

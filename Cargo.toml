@@ -23,6 +23,8 @@ async-stream = "0.3.6"
 axum = "0.8.9"
 base64 = "0.23.1"
 bytes = "1.12.1"
+# JPEG-LS codec of dicom-pixeldata, linked statically (CharLS is built from source with CMake).
+charls = { version = "0.4.2", features = ["static"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crc32fast = "1.5.3"
 dicom-core = "0.10.1"
@@ -31,7 +33,7 @@ dicom-encoding = "0.10.1"
 dicom-json = "0.10.1"
 dicom-object = "0.10.1"
 dicom-parser = "0.10.1"
-dicom-pixeldata = { version = "0.10.1", default-features = false, features = ["image", "native", "openjp2", "rayon"] }
+dicom-pixeldata = { version = "0.10.1", default-features = false, features = ["charls", "image", "native", "openjp2", "rayon"] }
 dicom-transfer-syntax-registry = "0.10.1"
 dicom-ul = { version = "0.10.1", features = ["async"] }
 form_urlencoded = "1.2.2"

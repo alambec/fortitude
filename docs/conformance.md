@@ -23,6 +23,9 @@ DIMSE services (PS3.4, PS3.7, PS3.8, [below](#dimse)). It grows with each phase 
 - Instances are stored byte for byte as received; no attribute is coerced.
 - Required attributes: SOP Class UID, SOP Instance UID, Study Instance UID and Series
   Instance UID, all syntactically valid UIDs.
+- Standard top-level attributes encoded with VR UN (as some converters write them) are read
+  with their dictionary VR, for the required UIDs, the index and the metadata; the stored
+  file keeps them as received.
 - A series is bound to the study of its first instance. An instance claiming the same series
   under another study is rejected (`A900`).
 
@@ -92,6 +95,10 @@ without decoding:
   cannot be attributed to frames answer `404` for frame requests.
 - Float and Double Float Pixel Data frames are supported. Native YBR_FULL_422 frames account
   for chroma subsampling.
+- Decoded frames of Explicit VR Big Endian instances are byte-swapped to little endian (by
+  sample, or by 16-bit word for 8-bit OW data).
+- Frames of Deflated Explicit VR Little Endian instances are only available decoded (the file
+  is inflated): `transfer-syntax=*` answers `404`.
 
 **Bulk data** paths are those of the `BulkDataURI`s in metadata: `GGGGEEEE`, or
 `GGGGEEEE/item/GGGGEEEE…` within sequences. Pixel data is returned as one part (native)
@@ -102,8 +109,10 @@ default) or PNG, 8 bits per sample:
 - Query parameters: `window=center,width[,function]` (linear window; the function is
   ignored), `viewport=width,height` (the image is scaled down to fit, keeping its aspect
   ratio; never scaled up), `quality=1..100`. `annotation` and `charset` are ignored.
-- Without `window`, the instance's VOI LUT or first window is applied, or the values are
-  min-max normalized.
+- Without `window`, the instance's VOI LUT or first window is applied, or the range of the
+  frame's values (after the modality rescale) is used as window.
+- Monochrome samples of up to 32 bits, Float and Double Float Pixel Data, and RGB samples of
+  up to 32 bits are rendered. Native YBR_FULL and YBR_FULL_422 frames are converted to RGB.
 - A rendered instance is its first frame.
 - Thumbnails fit in 128×128 pixels unless a viewport is given. The thumbnail of a series is
   its middle instance (by instance number); that of a study is the thumbnail of its first
@@ -134,21 +143,22 @@ Missing `requestType=WADO` or UIDs answer `400`; unknown objects `404`.
 
 ## Codecs
 
-Pixel data is decoded (for rendering, uncompressed frames, and transcoding) with dicom-rs:
+Pixel data is decoded (for rendering, uncompressed frames, and transcoding) with dicom-rs, and
+CharLS for JPEG-LS:
 
 | Transfer syntax | Decoding |
 |---|---|
-| Implicit and Explicit VR Little Endian, Deflated Explicit VR Little Endian | yes |
+| Implicit and Explicit VR Little Endian, Explicit VR Big Endian, Deflated Explicit VR Little Endian | yes |
 | JPEG Baseline (Process 1), JPEG Lossless (Process 14, SV1) | yes |
 | JPEG Extended (Process 2 & 4), 8-bit | yes; 12-bit is not supported |
 | JPEG 2000 (lossless and lossy) | yes |
-| RLE Lossless | yes |
-| JPEG-LS | not supported |
-| Video (MPEG-2, MPEG-4, HEVC), JPEG XL, HTJ2K | not supported |
+| RLE Lossless | yes (8, 16 and 32 bits per sample) |
+| JPEG-LS (lossless and near-lossless) | yes |
+| HTJ2K (lossless and lossy) | yes |
+| Video (MPEG-2, MPEG-4, HEVC), JPEG XL | not supported |
 
 Pixel data that cannot be decoded is still stored and served as is (`transfer-syntax=*`).
-Float and Double Float Pixel Data cannot be rendered. Transcoding targets are the
-uncompressed transfer syntaxes; compressed targets are attempted with the encoders of
+Transcoding targets are the uncompressed transfer syntaxes; compressed targets are attempted with the encoders of
 dicom-rs (JPEG Baseline), and answer `406` when no encoder is available.
 
 ## QIDO-RS — Search (PS3.18 §10.6)

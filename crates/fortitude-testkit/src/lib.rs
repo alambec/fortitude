@@ -29,6 +29,8 @@ pub enum Pixels {
     },
     /// Real JPEG baseline frames (one fragment each) of the native pattern, decodable.
     Jpeg,
+    /// This pixel data element; image attributes other than 8-bit monochrome go in `extra`.
+    Element(InMemElement),
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +98,7 @@ impl Instance {
     pub fn frame(&self, index: u32) -> Vec<u8> {
         match self.pixels {
             Pixels::Native | Pixels::None => self.pixels(index),
+            Pixels::Element(_) => unimplemented!("frames of a given pixel data element"),
             Pixels::Jpeg => {
                 let mut out = Vec::new();
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95)
@@ -154,8 +157,11 @@ impl Instance {
         for element in &self.extra {
             obj.put(element.clone());
         }
-        match self.pixels {
+        match &self.pixels {
             Pixels::None => {}
+            Pixels::Element(element) => {
+                obj.put(element.clone());
+            }
             Pixels::Native => {
                 let data: Vec<u8> = (0..self.frames).flat_map(|i| self.frame(i)).collect();
                 obj.put(DataElement::new(
@@ -188,7 +194,7 @@ impl Instance {
                     let frame = self.frame(i);
                     let size = frame
                         .len()
-                        .div_ceil(fragments_per_frame)
+                        .div_ceil(*fragments_per_frame)
                         .next_multiple_of(2);
                     fragments.extend(frame.chunks(size).map(<[u8]>::to_vec));
                 }

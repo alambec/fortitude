@@ -2,6 +2,7 @@
 //! pixel data offsets, pre-encoded metadata) and the index (SQLite or PostgreSQL) with its
 //! group-committing writer.
 
+pub mod convert;
 pub mod files;
 pub mod imaging;
 pub mod index;

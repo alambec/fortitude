@@ -1,0 +1,52 @@
+# dcm4chee-arc-light baseline for the Fortitude benchmarks.
+#
+#   dcm4chee   http://localhost:8046/dcm4chee-arc/aets/DCM4CHEE/rs     DICOMweb
+#              http://localhost:8046/dcm4chee-arc/aets/DCM4CHEE/wado   WADO-URI
+#              DICOM localhost:4246, AE title DCM4CHEE
+#
+# Official dcm4che images (LDAP configuration, PostgreSQL index, filesystem storage) as in
+# https://github.com/dcm4che/dcm4chee-arc-light/wiki/Run-minimum-set-of-archive-services-on-a-single-host,
+# with the same PostgreSQL settings as the Orthanc baseline and a larger Java heap than the
+# image default (512 MiB). All services are pinned to SERVER_CPUS (default 0-5).
+#
+#   bench/run.sh dcm4chee http://localhost:8046/dcm4chee-arc/aets/DCM4CHEE/rs
+#   (WADO_URL=http://localhost:8046/dcm4chee-arc/aets/DCM4CHEE/wado)
+
+name: fortitude-bench-dcm4chee
+
+services:
+  ldap:
+    image: dcm4che/slapd-dcm4chee:2.6.14-35.2
+    cpuset: "${SERVER_CPUS:-0-5}"
+    volumes:
+      - ../var/dcm4chee/ldap:/var/lib/openldap/openldap-data:Z
+      - ../var/dcm4chee/slapd.d:/etc/openldap/slapd.d:Z
+
+  db:
+    image: dcm4che/postgres-dcm4chee:17.11-35
+    cpuset: "${SERVER_CPUS:-0-5}"
+    command: postgres -c shared_buffers=1GB -c max_connections=200
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+    volumes:
+      - ../var/dcm4chee/db:/var/lib/postgresql/data:Z
+
+  arc:
+    image: dcm4che/dcm4chee-arc-psql:5.35.2
+    cpuset: "${SERVER_CPUS:-0-5}"
+    depends_on: [ldap, db]
+    ports: ["8046:8080", "4246:11112"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+      WILDFLY_CHOWN: /storage
+      WILDFLY_WAIT_FOR: ldap:389 db:5432
+      JAVA_OPTS: >-
+        -Xms4g -Xmx4g -XX:MetaspaceSize=96M -XX:MaxMetaspaceSize=512m
+        -Djava.net.preferIPv4Stack=true
+    volumes:
+      - ../var/dcm4chee/storage:/storage:Z

@@ -6,6 +6,7 @@ use crate::media::MediaType;
 
 pub const EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
 const IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
+pub const DEFLATED_EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1.99";
 
 /// A representation the client accepts.
 #[derive(Debug, Clone, PartialEq)]

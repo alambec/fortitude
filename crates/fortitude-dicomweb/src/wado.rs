@@ -14,7 +14,7 @@ use fortitude_store::imaging::ImagingError;
 use fortitude_store::retrieve::{BulkData, PixelSource, Scope, StoredInstance};
 use futures::{StreamExt, stream};
 
-use crate::negotiate::{self, InstanceFormat, PixelPlan, Representation};
+use crate::negotiate::{self, DEFLATED_EXPLICIT_VR_LE, InstanceFormat, PixelPlan, Representation};
 use crate::{BaseUrl, DICOM_JSON, DicomWeb, error, media};
 
 /// Instance files up to this size are read in one operation, larger ones are streamed.
@@ -322,6 +322,13 @@ pub async fn frames(
         }
     } else {
         let Some(layout) = &source.layout else {
+            // Pixel data of deflated data sets is not located at ingest: only decoded frames.
+            if source.transfer_syntax == DEFLATED_EXPLICIT_VR_LE {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "frames of this instance cannot be located",
+                );
+            }
             return imaging_error(ImagingError::NoPixelData);
         };
         let mut ranges = Vec::with_capacity(indexes.len());

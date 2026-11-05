@@ -1,0 +1,2 @@
+[env]
+CMAKE_TOOLCHAIN_FILE = { value = "build/cmake-libdir.cmake", relative = true }

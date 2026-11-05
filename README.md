@@ -26,6 +26,8 @@ docker build -t fortitude .
 docker run -p 8042:8042 -v fortitude-data:/var/lib/fortitude fortitude
 ```
 
+Building needs CMake and a C++ compiler: CharLS, the JPEG-LS codec, is built from source.
+
 Configuration is layered: defaults, then the TOML file, then `FORTITUDE_*` environment
 variables with `__` between sections.
 
@@ -191,6 +193,10 @@ bench/run.sh fortitude http://localhost:8045/dicom-web
 # PostgreSQL index, on the baselines' PostgreSQL server:
 INDEX=postgres bench/serve-fortitude.sh &
 bench/run.sh fortitude-postgres http://localhost:8045/dicom-web
+# dcm4chee-arc-light (LDAP + PostgreSQL + WildFly) on :8046:
+docker compose -f bench/dcm4chee/docker-compose.yml up -d
+WADO_URL=http://localhost:8046/dcm4chee-arc/aets/DCM4CHEE/wado \
+    bench/run.sh dcm4chee http://localhost:8046/dcm4chee-arc/aets/DCM4CHEE/rs
 python3 bench/summarize.py bench/results/*.jsonl
 
 # 4. Check that both servers agree (search results and metadata).

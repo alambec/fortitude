@@ -40,8 +40,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
    *(done)*
 4. **WADO-URI + rendering** — `application/dicom`, then JPEG/PNG rendering with windowing
    (shared with WADO-RS `/rendered` and `/thumbnail`); decompression to Explicit VR Little Endian.
-   JPEG 2000 / JPEG-LS codecs behind cargo features. *(done; JPEG-LS not available yet, see
-   the conformance statement)*
+   JPEG 2000 and JPEG-LS codecs, always built in. *(done)*
 5. **Operations** — admin API (delete, statistics), authentication, Prometheus metrics, Docker
    image. *(done)*
 6. **DIMSE** — C-ECHO, C-STORE (same ingest as STOW-RS), C-FIND (same search as QIDO-RS,
@@ -62,8 +61,8 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 
 ## Next
 
-- **JPEG-LS** decoding (CharLS build on RHEL-family systems), and a faster JPEG 2000
-  decoder.
+- **12-bit JPEG Extended** decoding (jpeg-decoder supports 8-bit DCT only), and a faster
+  JPEG 2000 decoder.
 - **DIMSE**: C-GET, storage commitment, TLS.
 - **Retention and integrity**: periodic check of files against the index, orphan file
   cleanup after crashes.
