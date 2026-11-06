@@ -1,5 +1,6 @@
 //! End-to-end tests: a DIMSE server on an empty store, driven by a `dicom-ul` SCU, with a
-//! storage SCP of the same kind as C-MOVE destination.
+//! storage SCP of the same kind as C-MOVE destination. The SCU receives C-GET
+//! sub-operations itself.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -557,10 +558,7 @@ async fn access_control() {
         "KNOWN",
         &[
             (uids::VERIFICATION, UNCOMPRESSED),
-            (
-                uids::STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
-                UNCOMPRESSED,
-            ),
+            (uids::MODALITY_WORKLIST_INFORMATION_MODEL_FIND, UNCOMPRESSED),
         ],
     )
     .await
@@ -568,7 +566,7 @@ async fn access_control() {
     assert!(scu.0.context(uids::VERIFICATION, None).is_some());
     assert!(
         scu.0
-            .context(uids::STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET, None)
+            .context(uids::MODALITY_WORKLIST_INFORMATION_MODEL_FIND, None)
             .is_none()
     );
 }
@@ -584,4 +582,226 @@ async fn association_limit() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let again = Client::connect(h.address, echo).await;
     again.release().await;
+}
+
+/// Instances received by a C-GET SCU: SOP Instance UID, transfer syntax and data set bytes.
+type Retrieved = Vec<(String, String, Vec<u8>)>;
+
+/// Associate as a C-GET SCU: both GET models, and `storage` contexts (SOP class, transfer
+/// syntaxes) proposing the SCP role.
+async fn get_client(address: SocketAddr, storage: &[(&str, &[&str])]) -> Client {
+    let mut contexts: Vec<(String, Vec<String>)> = [PATIENT_ROOT_GET, STUDY_ROOT_GET]
+        .iter()
+        .map(|a| (a.to_string(), vec![EXPLICIT_VR_LE.to_owned()]))
+        .collect();
+    let mut scp_role = Vec::new();
+    for (sop_class, transfer_syntaxes) in storage {
+        contexts.push((
+            sop_class.to_string(),
+            transfer_syntaxes.iter().map(|t| t.to_string()).collect(),
+        ));
+        if !scp_role.iter().any(|c| c == sop_class) {
+            scp_role.push(sop_class.to_string());
+        }
+    }
+    let scu =
+        scu::Scu::connect_with_scp_role(address, "SCU", "FORTITUDE", &contexts, &scp_role, TIMEOUT)
+            .await
+            .unwrap();
+    Client(scu)
+}
+
+impl Client {
+    async fn get(
+        &mut self,
+        model: &str,
+        identifier: InMemDicomObject,
+    ) -> (Vec<Response>, Retrieved) {
+        let data = self.encode(model, &identifier);
+        let (pc, ts) = self.context(model);
+        let command = Command::default()
+            .with_u16(tags::COMMAND_FIELD, field::C_GET_RQ)
+            .with_uid(tags::AFFECTED_SOP_CLASS_UID, model)
+            .with_u16(tags::PRIORITY, 0);
+        let mut retrieved = Retrieved::new();
+        let responses = self
+            .0
+            .request_with(pc, command, Some(&data), |request, ts, data| {
+                assert!(
+                    request
+                        .string(tags::MOVE_ORIGINATOR_APPLICATION_ENTITY_TITLE)
+                        .is_none()
+                );
+                retrieved.push((
+                    request.string(tags::AFFECTED_SOP_INSTANCE_UID).unwrap(),
+                    ts.to_owned(),
+                    data,
+                ));
+                status::SUCCESS
+            })
+            .await
+            .unwrap();
+        let ts = TransferSyntaxRegistry.get(&ts).unwrap();
+        let responses = responses
+            .into_iter()
+            .map(|r| {
+                let data = r
+                    .data
+                    .map(|d| InMemDicomObject::read_dataset_with_ts(&d[..], ts).unwrap());
+                (r.command, data)
+            })
+            .collect();
+        (responses, retrieved)
+    }
+}
+
+#[tokio::test]
+async fn get_sends_over_the_same_association() {
+    let h = harness(|_| {}).await;
+    let instances = stored(&h).await;
+    let mut scu = get_client(
+        h.address,
+        &[
+            (uids::CT_IMAGE_STORAGE, UNCOMPRESSED),
+            (uids::MR_IMAGE_STORAGE, &[JPEG_BASELINE]),
+            (uids::MR_IMAGE_STORAGE, UNCOMPRESSED),
+        ],
+    )
+    .await;
+    assert!(scu.0.scp_role(uids::CT_IMAGE_STORAGE));
+    // The model itself has no SCP role to give.
+    assert!(!scu.0.scp_role(STUDY_ROOT_GET));
+
+    let (responses, retrieved) = scu
+        .get(
+            PATIENT_ROOT_GET,
+            identifier("PATIENT", &[(tags::PATIENT_ID, VR::LO, "PAT-1")]),
+        )
+        .await;
+    let (last, pending) = responses.split_last().unwrap();
+    assert_eq!(last.0.field(), Some(field::C_GET_RQ | field::RESPONSE));
+    assert_eq!(last.0.status(), Some(status::SUCCESS));
+    assert_eq!(last.0.u16(tags::NUMBER_OF_COMPLETED_SUBOPERATIONS), Some(4));
+    assert_eq!(last.0.u16(tags::NUMBER_OF_FAILED_SUBOPERATIONS), Some(0));
+    assert_eq!(pending.len(), 3);
+    assert_eq!(pending[0].0.status(), Some(status::PENDING));
+    assert_eq!(
+        pending[0].0.u16(tags::NUMBER_OF_REMAINING_SUBOPERATIONS),
+        Some(3)
+    );
+
+    assert_eq!(retrieved.len(), 4);
+    for instance in &instances {
+        let (_, ts, data) = retrieved
+            .iter()
+            .find(|(uid, _, _)| *uid == instance.sop_uid)
+            .expect("instance retrieved");
+        let file = instance.to_bytes();
+        assert_eq!(*ts, instance.transfer_syntax);
+        assert_eq!(data[..], file[part10::data_set_offset(&file).unwrap()..]);
+    }
+
+    // The association remains usable.
+    let (responses, retrieved) = scu
+        .get(
+            STUDY_ROOT_GET,
+            identifier("SERIES", &[(tags::SERIES_INSTANCE_UID, VR::UI, "1.2.1.1")]),
+        )
+        .await;
+    assert_eq!(responses.last().unwrap().0.status(), Some(status::SUCCESS));
+    assert_eq!(retrieved.len(), 3);
+    scu.release().await;
+}
+
+#[tokio::test]
+async fn get_transcodes_when_needed() {
+    let h = harness(|_| {}).await;
+    stored(&h).await;
+    // One context with both syntaxes: the native one is chosen, any instance can be sent.
+    let mut scu = get_client(
+        h.address,
+        &[(uids::MR_IMAGE_STORAGE, &[JPEG_BASELINE, IMPLICIT_VR_LE])],
+    )
+    .await;
+    assert_eq!(scu.context(uids::MR_IMAGE_STORAGE).1, IMPLICIT_VR_LE);
+    let (responses, retrieved) = scu
+        .get(
+            STUDY_ROOT_GET,
+            identifier("STUDY", &[(tags::STUDY_INSTANCE_UID, VR::UI, "1.2.2")]),
+        )
+        .await;
+    assert_eq!(responses.last().unwrap().0.status(), Some(status::SUCCESS));
+    assert_eq!(retrieved.len(), 1);
+    assert_eq!(retrieved[0].1, IMPLICIT_VR_LE);
+    let object = InMemDicomObject::read_dataset_with_ts(
+        &retrieved[0].2[..],
+        TransferSyntaxRegistry.get(IMPLICIT_VR_LE).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(text(&object, tags::SOP_INSTANCE_UID), "1.2.2.1.1");
+    assert!(object.get(tags::PIXEL_DATA).is_some());
+    scu.release().await;
+}
+
+#[tokio::test]
+async fn get_failures() {
+    let h = harness(|_| {}).await;
+    stored(&h).await;
+    // MR is proposed without the SCP role: its instances cannot be sent.
+    let contexts: Vec<(String, Vec<String>)> = [
+        (STUDY_ROOT_GET, EXPLICIT_VR_LE),
+        (uids::CT_IMAGE_STORAGE, EXPLICIT_VR_LE),
+        (uids::MR_IMAGE_STORAGE, EXPLICIT_VR_LE),
+    ]
+    .iter()
+    .map(|(a, t)| (a.to_string(), vec![t.to_string()]))
+    .collect();
+    let mut scu = Client(
+        scu::Scu::connect_with_scp_role(
+            h.address,
+            "SCU",
+            "FORTITUDE",
+            &contexts,
+            &[uids::CT_IMAGE_STORAGE.to_owned()],
+            TIMEOUT,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(!scu.0.scp_role(uids::MR_IMAGE_STORAGE));
+
+    let (responses, retrieved) = scu
+        .get(
+            STUDY_ROOT_GET,
+            identifier(
+                "STUDY",
+                &[(tags::STUDY_INSTANCE_UID, VR::UI, "1.2.1\\1.2.2")],
+            ),
+        )
+        .await;
+    let (last, _) = responses.split_last().unwrap();
+    assert_eq!(last.0.status(), Some(status::SUBOPERATIONS_WARNING));
+    assert_eq!(last.0.u16(tags::NUMBER_OF_COMPLETED_SUBOPERATIONS), Some(3));
+    assert_eq!(last.0.u16(tags::NUMBER_OF_FAILED_SUBOPERATIONS), Some(1));
+    let failed = last.1.as_ref().expect("Failed SOP Instance UID List");
+    assert_eq!(
+        text(failed, tags::FAILED_SOP_INSTANCE_UID_LIST),
+        "1.2.2.1.1"
+    );
+    assert_eq!(retrieved.len(), 3);
+
+    let (responses, _) = scu.get(STUDY_ROOT_GET, identifier("SERIES", &[])).await;
+    assert_eq!(responses[0].0.status(), Some(status::IDENTIFIER_MISMATCH));
+
+    // Nothing matches: success without sub-operations.
+    let (responses, retrieved) = scu
+        .get(
+            STUDY_ROOT_GET,
+            identifier("STUDY", &[(tags::STUDY_INSTANCE_UID, VR::UI, "9.9")]),
+        )
+        .await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0.status(), Some(status::SUCCESS));
+    assert!(retrieved.is_empty());
+    scu.release().await;
 }

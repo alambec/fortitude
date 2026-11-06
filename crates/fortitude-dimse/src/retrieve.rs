@@ -1,10 +1,13 @@
-//! Retrieve service (PS3.4 Annex C): C-MOVE on the Patient Root and Study Root models.
+//! Retrieve service (PS3.4 Annex C): C-MOVE and C-GET on the Patient Root and Study Root
+//! models.
 //!
-//! The identifier selects instances by their unique keys; they are sent with C-STORE over
-//! one association to the move destination, a configured peer. Each stored transfer syntax
-//! is proposed on a presentation context of its own, plus Explicit/Implicit VR Little Endian
-//! per SOP class. Files go out as stored whenever the destination accepts their transfer
-//! syntax; otherwise they are transcoded.
+//! The identifier selects instances by their unique keys; they are sent with C-STORE
+//! sub-operations. For C-MOVE, over one association to the move destination, a configured
+//! peer: each stored transfer syntax is proposed on a presentation context of its own, plus
+//! Explicit/Implicit VR Little Endian per SOP class. For C-GET, back over the requestor's
+//! association, on the storage contexts for which it took the SCP role. Files go out as
+//! stored whenever the receiver accepts their transfer syntax; otherwise they are
+//! transcoded.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,8 +41,8 @@ const MAX_CONTEXTS: usize = 128;
 /// Instances read (or transcoded) ahead of the one being sent.
 const READ_AHEAD: usize = 4;
 
-/// The instances designated by the unique keys of a C-MOVE identifier, at and above its
-/// level; the key of the level itself is required.
+/// The instances designated by the unique keys of a C-MOVE or C-GET identifier, at and
+/// above its level; the key of the level itself is required.
 fn selection(identifier: &InMemDicomObject, level: QueryLevel) -> Result<Selection, String> {
     let uids = |tag| {
         string(identifier, tag)
@@ -118,7 +121,10 @@ pub(crate) async fn handle(
             .with_text(tags::ERROR_COMMENT, truncate(comment, 64))
     };
 
-    let patient_root = abstract_syntax == crate::PATIENT_ROOT_MOVE;
+    let get = command.field() == Some(field::C_GET_RQ);
+    let name = if get { "C-GET" } else { "C-MOVE" };
+    let patient_root =
+        abstract_syntax == crate::PATIENT_ROOT_MOVE || abstract_syntax == crate::PATIENT_ROOT_GET;
     let selection = identifier(data.as_deref(), &transfer_syntax, patient_root)
         .and_then(|(identifier, level)| selection(&identifier, level));
     let selection = match selection {
@@ -130,22 +136,27 @@ pub(crate) async fn handle(
             return Ok(status::IDENTIFIER_MISMATCH);
         }
     };
-    let destination = command.string(tags::MOVE_DESTINATION).unwrap_or_default();
-    let Some(peer) = dimse.config.peer(&destination).cloned() else {
-        let comment = format!("unknown move destination {destination:?}");
-        connection
-            .send(
-                context,
-                &fail(status::MOVE_DESTINATION_UNKNOWN, &comment),
-                None,
-            )
-            .await?;
-        return Ok(status::MOVE_DESTINATION_UNKNOWN);
+    let peer = if get {
+        None
+    } else {
+        let destination = command.string(tags::MOVE_DESTINATION).unwrap_or_default();
+        let Some(peer) = dimse.config.peer(&destination).cloned() else {
+            let comment = format!("unknown move destination {destination:?}");
+            connection
+                .send(
+                    context,
+                    &fail(status::MOVE_DESTINATION_UNKNOWN, &comment),
+                    None,
+                )
+                .await?;
+            return Ok(status::MOVE_DESTINATION_UNKNOWN);
+        };
+        Some(peer)
     };
     let instances = match dimse.store.select(selection).await {
         Ok(instances) => instances,
         Err(e) => {
-            tracing::warn!(error = %e, "C-MOVE failed");
+            tracing::warn!(error = %e, "{name} failed");
             connection
                 .send(
                     context,
@@ -166,32 +177,43 @@ pub(crate) async fn handle(
         return Ok(status::SUCCESS);
     }
 
-    let mut destination = match Destination::open(&dimse.config, &peer, &instances).await {
-        Ok(destination) => destination,
-        Err(e) => {
-            tracing::warn!(destination = peer.ae_title, error = %e, "C-MOVE: cannot reach the destination");
-            counts.failed = counts.remaining;
-            let response = counts.apply(
-                fail(
-                    status::SUBOPERATIONS_REFUSED,
-                    &format!("cannot reach {}: {e}", peer.ae_title),
-                ),
-                false,
-            );
-            connection.send(context, &response, None).await?;
-            return Ok(status::SUBOPERATIONS_REFUSED);
-        }
+    let mut destination = match peer {
+        None => None,
+        Some(peer) => match Destination::open(&dimse.config, &peer, &instances).await {
+            Ok(destination) => Some(destination),
+            Err(e) => {
+                tracing::warn!(destination = peer.ae_title, error = %e, "C-MOVE: cannot reach the destination");
+                counts.failed = counts.remaining;
+                let response = counts.apply(
+                    fail(
+                        status::SUBOPERATIONS_REFUSED,
+                        &format!("cannot reach {}: {e}", peer.ae_title),
+                    ),
+                    false,
+                );
+                connection.send(context, &response, None).await?;
+                return Ok(status::SUBOPERATIONS_REFUSED);
+            }
+        },
     };
     tracing::debug!(
-        destination = peer.ae_title,
+        destination = destination
+            .as_ref()
+            .map_or(connection.peer_ae_title(), |d| &d.ae_title),
         instances = instances.len(),
-        "C-MOVE started"
+        "{name} started"
     );
 
     let originator = connection.peer_ae_title().to_owned();
     let plans: Vec<_> = instances
         .iter()
-        .map(|instance| (instance.clone(), destination.plan(instance)))
+        .map(|instance| {
+            let plan = match &destination {
+                Some(destination) => destination.plan(instance),
+                None => plan(connection.retrieve_contexts(), instance),
+            };
+            (instance.clone(), plan)
+        })
         .collect();
     let mut loads = futures::stream::iter(plans)
         .map(|plan| prepare(&dimse.store, plan))
@@ -212,16 +234,27 @@ pub(crate) async fn handle(
             (Some((pc, _)), Ok((bytes, offset))) => {
                 let request = Command::default()
                     .with_u16(tags::COMMAND_FIELD, field::C_STORE_RQ)
-                    .with_u16(tags::MESSAGE_ID, processed as u16)
+                    // Distinct from the request's own ID, on the same association for C-GET.
+                    .with_u16(tags::MESSAGE_ID, message_id.wrapping_add(processed as u16))
                     .with_u16(tags::PRIORITY, 0)
                     .with_uid(tags::AFFECTED_SOP_CLASS_UID, &instance.sop_class_uid)
                     .with_uid(tags::AFFECTED_SOP_INSTANCE_UID, &instance.sop_uid)
-                    .with_text(tags::MOVE_ORIGINATOR_APPLICATION_ENTITY_TITLE, &originator)
-                    .with_u16(tags::MOVE_ORIGINATOR_MESSAGE_ID, message_id)
                     .with_data_set(true);
-                let sent = destination.store(pc, &request, &bytes[offset..]).await;
-                broken = sent.is_err();
-                sent
+                let data = &bytes[offset..];
+                match &mut destination {
+                    Some(destination) => {
+                        let request = request
+                            .with_text(tags::MOVE_ORIGINATOR_APPLICATION_ENTITY_TITLE, &originator)
+                            .with_u16(tags::MOVE_ORIGINATOR_MESSAGE_ID, message_id);
+                        let sent = destination.store(pc, &request, data).await;
+                        broken = sent.is_err();
+                        sent
+                    }
+                    // A failure here breaks the requestor's own association: it is aborted.
+                    None => Ok(connection
+                        .sub_operation(pc, &request, data, message_id)
+                        .await?),
+                }
             }
             (_, Err(e)) => Err(e),
             (None, Ok(_)) => Err("no accepted presentation context".to_owned()),
@@ -243,15 +276,20 @@ pub(crate) async fn handle(
                 tracing::info!(
                     sop_uid = instance.sop_uid,
                     reason,
-                    "C-MOVE: sub-operation failed"
+                    "{name}: sub-operation failed"
                 );
                 counts.failed += 1;
                 failed_uids.push(instance.sop_uid.clone());
                 "failed"
             }
         };
-        metrics::counter!("fortitude_dimse_moved_instances_total", "outcome" => outcome)
-            .increment(1);
+        if get {
+            metrics::counter!("fortitude_dimse_get_instances_total", "outcome" => outcome)
+                .increment(1);
+        } else {
+            metrics::counter!("fortitude_dimse_moved_instances_total", "outcome" => outcome)
+                .increment(1);
+        }
         if broken {
             break;
         }
@@ -261,14 +299,16 @@ pub(crate) async fn handle(
         }
     }
     drop(loads);
-    if broken {
-        destination.abort().await;
-        // The instances not sent yet fail with the association.
-        failed_uids.extend(instances[processed..].iter().map(|i| i.sop_uid.clone()));
-        counts.failed += counts.remaining;
-        counts.remaining = 0;
-    } else {
-        destination.release().await;
+    if let Some(destination) = destination {
+        if broken {
+            destination.abort().await;
+            // The instances not sent yet fail with the association.
+            failed_uids.extend(instances[processed..].iter().map(|i| i.sop_uid.clone()));
+            counts.failed += counts.remaining;
+            counts.remaining = 0;
+        } else {
+            destination.release().await;
+        }
     }
 
     let final_status = if cancelled {
@@ -290,7 +330,7 @@ pub(crate) async fn handle(
     Ok(final_status)
 }
 
-/// Identifier of a final C-MOVE response: Failed SOP Instance UID List.
+/// Identifier of a final C-MOVE or C-GET response: Failed SOP Instance UID List.
 fn failed_identifier(uids: &[String], transfer_syntax: &str) -> Vec<u8> {
     let object = InMemDicomObject::from_element_iter([DataElement::new(
         tags::FAILED_SOP_INSTANCE_UID_LIST,
@@ -343,9 +383,32 @@ async fn load(
     Ok((bytes, offset))
 }
 
+/// The presentation context to send `instance` on, among the accepted `contexts` (ID, SOP
+/// class, transfer syntax), and the transfer syntax to transcode it to when none accepts the
+/// stored one.
+fn plan<'a>(
+    contexts: impl Iterator<Item = (u8, &'a str, &'a str)>,
+    instance: &StoredInstance,
+) -> Plan {
+    let accepted: Vec<_> = contexts
+        .filter(|(_, sop_class, _)| *sop_class == instance.sop_class_uid)
+        .collect();
+    if let Some((id, _, _)) = accepted
+        .iter()
+        .find(|(_, _, ts)| *ts == instance.transfer_syntax)
+    {
+        return Some((*id, None));
+    }
+    accepted
+        .iter()
+        .find(|(_, _, ts)| is_uncompressed_le(ts))
+        .map(|(id, _, ts)| (*id, Some((*ts).to_owned())))
+}
+
 /// The association to a move destination.
 struct Destination {
     association: AsyncClientAssociation<TcpStream>,
+    ae_title: String,
     timeout: Duration,
 }
 
@@ -378,6 +441,7 @@ impl Destination {
         }
         Ok(Self {
             association,
+            ae_title: peer.ae_title.clone(),
             timeout: config.timeout,
         })
     }
@@ -385,25 +449,19 @@ impl Destination {
     /// The presentation context to send `instance` on, and the transfer syntax to transcode
     /// it to when the destination does not accept the stored one.
     fn plan(&self, instance: &StoredInstance) -> Plan {
-        let accepted: Vec<_> = self
+        let accepted = self
             .association
             .presentation_contexts()
             .iter()
-            .filter(|pc| {
-                pc.reason == PresentationContextResultReason::Acceptance
-                    && pc.abstract_syntax == instance.sop_class_uid
-            })
-            .collect();
-        if let Some(pc) = accepted
-            .iter()
-            .find(|pc| pc.transfer_syntax == instance.transfer_syntax)
-        {
-            return Some((pc.id, None));
-        }
-        accepted
-            .iter()
-            .find(|pc| is_uncompressed_le(&pc.transfer_syntax))
-            .map(|pc| (pc.id, Some(pc.transfer_syntax.clone())))
+            .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
+            .map(|pc| {
+                (
+                    pc.id,
+                    pc.abstract_syntax.as_str(),
+                    pc.transfer_syntax.as_str(),
+                )
+            });
+        plan(accepted, instance)
     }
 
     /// Send one C-STORE request; returns the response status. An error leaves the

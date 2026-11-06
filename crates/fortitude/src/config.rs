@@ -212,7 +212,7 @@ impl Default for DicomWebConfig {
     }
 }
 
-/// DIMSE service (C-ECHO, C-STORE, C-FIND, C-MOVE as an SCP). It has no authentication
+/// DIMSE service (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET as an SCP). It has no authentication
 /// beyond AE titles: restrict access to it at the network level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

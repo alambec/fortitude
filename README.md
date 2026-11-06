@@ -13,7 +13,7 @@ See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 | `crates/fortitude-core` | Identifiers, indexed attributes, QIDO query model and matching, DICOM JSON encoder |
 | `crates/fortitude-store` | File layout, ingest, index (SQLite or PostgreSQL) and its writer |
 | `crates/fortitude-dicomweb` | STOW-RS, WADO-RS, QIDO-RS, WADO-URI routes |
-| `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE |
+| `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET |
 | `crates/fortitude` | Server binary: configuration, logging, wiring, web explorer (`ui/`) |
 | `bench/` | Load generator, Orthanc baselines, results |
 
@@ -65,7 +65,7 @@ stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
 max_instance_size_mib = 4096
 qido_max_results = 10000   # QIDO-RS results per request (0 = no limit); page with offset
 
-[dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE (SCP)
+[dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET (SCP)
 # listen = "0.0.0.0:4242"  # unset: DIMSE disabled
 ae_title = "FORTITUDE"
 check_called_ae_title = false
@@ -244,6 +244,7 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_dimse_request_duration_seconds` (histogram) | `command` |
 | `fortitude_dimse_instances_total` (C-STORE) | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_dimse_moved_instances_total` (C-MOVE) | `outcome`: `sent`, `failed` |
+| `fortitude_dimse_get_instances_total` (C-GET) | `outcome`: `sent`, `failed` |
 | `fortitude_integrity_orphans`, `_missing`, `_size_mismatches`, `_errors` (gauges: last check) | |
 | `fortitude_integrity_checksum_mismatches` (gauge: last check that verified checksums) | |
 | `fortitude_integrity_orphans_removed_total` | |

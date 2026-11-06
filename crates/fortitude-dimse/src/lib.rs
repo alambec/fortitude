@@ -1,9 +1,10 @@
 //! DIMSE services (PS3.7) as an SCP: Verification (C-ECHO), Storage (C-STORE), and the
-//! Patient Root and Study Root Query/Retrieve models (C-FIND, C-MOVE).
+//! Patient Root and Study Root Query/Retrieve models (C-FIND, C-MOVE, C-GET).
 //!
 //! Received instances go through the same ingest as STOW-RS, queries through the same
-//! search as QIDO-RS. C-MOVE sends the stored files to the destination as they are, unless
-//! it only accepts another transfer syntax.
+//! search as QIDO-RS. C-MOVE and C-GET send the stored files as they are (to the move
+//! destination, or back on the requestor's association), unless the receiver only accepts
+//! another transfer syntax.
 
 pub mod association;
 pub mod command;
@@ -94,6 +95,8 @@ pub(crate) const PATIENT_ROOT_FIND: &str = uids::PATIENT_ROOT_QUERY_RETRIEVE_INF
 pub(crate) const PATIENT_ROOT_MOVE: &str = uids::PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE;
 pub(crate) const STUDY_ROOT_FIND: &str = uids::STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND;
 pub(crate) const STUDY_ROOT_MOVE: &str = uids::STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE;
+pub(crate) const PATIENT_ROOT_GET: &str = uids::PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET;
+pub(crate) const STUDY_ROOT_GET: &str = uids::STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET;
 
 /// The DIMSE service: shared by all associations.
 #[derive(Clone)]
@@ -207,6 +210,11 @@ async fn dispatch(
         }
         Some(field::C_MOVE_RQ)
             if abstract_syntax == PATIENT_ROOT_MOVE || abstract_syntax == STUDY_ROOT_MOVE =>
+        {
+            retrieve::handle(dimse, connection, message).await
+        }
+        Some(field::C_GET_RQ)
+            if abstract_syntax == PATIENT_ROOT_GET || abstract_syntax == STUDY_ROOT_GET =>
         {
             retrieve::handle(dimse, connection, message).await
         }

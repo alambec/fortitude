@@ -6,6 +6,10 @@
 //! storage presentation context offers both compressed and uncompressed syntaxes, the
 //! compressed one (the data's own, almost always) is accepted, so that the sender does not
 //! decompress it.
+//!
+//! SCP/SCU role selection (PS3.7 §D.3.3.4) is accepted as proposed for storage SOP classes:
+//! a C-GET requestor proposes the SCP role to receive the retrieved instances on the same
+//! association.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -21,7 +25,7 @@ use dicom_ul::pdu::{
     AbortRQServiceProviderReason, AbortRQSource, AssociationAC, AssociationRJ, AssociationRJResult,
     AssociationRJServiceProviderPresentationReason, AssociationRJServiceUserReason,
     AssociationRJSource, PDataValue, PDataValueType, PresentationContextResult,
-    PresentationContextResultReason, UserVariableItem, write_pdu,
+    PresentationContextResultReason, RequestorRoles, UserVariableItem, write_pdu,
 };
 use futures::FutureExt;
 use tokio::io::AsyncWriteExt;
@@ -94,6 +98,8 @@ impl Acceptor {
             crate::PATIENT_ROOT_MOVE,
             crate::STUDY_ROOT_FIND,
             crate::STUDY_ROOT_MOVE,
+            crate::PATIENT_ROOT_GET,
+            crate::STUDY_ROOT_GET,
         ]
         .into_iter()
         .chain(sop_classes::STORAGE_SOP_CLASSES.iter().copied())
@@ -130,6 +136,7 @@ impl Acceptor {
             deferred: VecDeque::new(),
             max_data_set: config.max_instance_size,
             released: false,
+            cancel_requested: None,
         };
         let Pdu::AssociationRQ(request) = connection.read_pdu().await? else {
             return Err(Error::Protocol("expected A-ASSOCIATE-RQ".into()));
@@ -189,9 +196,27 @@ impl Acceptor {
                 };
             }
         }
+        // Roles: the requestor may be SCP of the storage SOP classes (to receive C-GET
+        // sub-operations), never of the others.
+        let mut roles = Vec::new();
+        for variable in &request.user_variables {
+            if let UserVariableItem::ScuScpRoleSelectionSubItem(sop_class, proposed) = variable {
+                let sop_class = trim(sop_class);
+                if self.abstract_syntaxes.contains(sop_class) {
+                    let accepted = RequestorRoles {
+                        scu: proposed.scu,
+                        scp: proposed.scp && is_storage(sop_class),
+                    };
+                    roles.push((sop_class.to_owned(), accepted));
+                }
+            }
+        }
+        let requestor_scp = |sop_class: &str| roles.iter().any(|(c, r)| c == sop_class && r.scp);
+
         let mut results = Vec::with_capacity(request.presentation_contexts.len());
         for proposed in &request.presentation_contexts {
             let abstract_syntax = trim(&proposed.abstract_syntax);
+            let retrieve = requestor_scp(abstract_syntax);
             let transfer_syntax = if self.abstract_syntaxes.contains(abstract_syntax) {
                 let candidates = proposed
                     .transfer_syntaxes
@@ -202,7 +227,9 @@ impl Acceptor {
                             .as_ref()
                             .is_none_or(|allowed| allowed.iter().any(|a| a == t))
                     });
-                choose_transfer_syntax(candidates, is_storage(abstract_syntax))
+                // Contexts Fortitude sends on prefer a native syntax, to which any instance
+                // can be transcoded.
+                choose_transfer_syntax(candidates, is_storage(abstract_syntax) && !retrieve)
                     .ok_or(PresentationContextResultReason::TransferSyntaxesNotSupported)
             } else {
                 Err(PresentationContextResultReason::AbstractSyntaxNotSupported)
@@ -220,6 +247,7 @@ impl Acceptor {
                         id: proposed.id,
                         abstract_syntax: abstract_syntax.to_owned(),
                         transfer_syntax: ts.to_owned(),
+                        requestor_scp: retrieve,
                     });
                     (PresentationContextResultReason::Acceptance, ts)
                 }
@@ -238,11 +266,18 @@ impl Acceptor {
             called_ae_title: request.called_ae_title,
             application_context_name: APPLICATION_CONTEXT.to_owned(),
             presentation_contexts: results,
-            user_variables: vec![
+            user_variables: [
                 UserVariableItem::MaxLength(config.max_pdu_length),
                 UserVariableItem::ImplementationClassUID(IMPLEMENTATION_CLASS_UID.to_owned()),
                 UserVariableItem::ImplementationVersionName(IMPLEMENTATION_VERSION_NAME.to_owned()),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                roles
+                    .into_iter()
+                    .map(|(c, r)| UserVariableItem::ScuScpRoleSelectionSubItem(c, r)),
+            )
+            .collect(),
         });
         connection.write_pdu(&accept).await?;
         Ok(connection)
@@ -261,6 +296,8 @@ fn is_storage(abstract_syntax: &str) -> bool {
             | crate::PATIENT_ROOT_MOVE
             | crate::STUDY_ROOT_FIND
             | crate::STUDY_ROOT_MOVE
+            | crate::PATIENT_ROOT_GET
+            | crate::STUDY_ROOT_GET
     )
 }
 
@@ -292,6 +329,9 @@ struct Accepted {
     id: u8,
     abstract_syntax: String,
     transfer_syntax: String,
+    /// The requestor accepted the SCP role for this SOP class: C-GET sub-operations can be
+    /// sent on this context.
+    requestor_scp: bool,
 }
 
 pub struct Connection {
@@ -309,6 +349,9 @@ pub struct Connection {
     deferred: VecDeque<Pdu>,
     max_data_set: usize,
     released: bool,
+    /// Message ID of a request whose cancellation arrived while a C-GET sub-operation was
+    /// waiting for its response.
+    cancel_requested: Option<u16>,
 }
 
 impl Connection {
@@ -322,6 +365,21 @@ impl Connection {
             .iter()
             .find(|pc| pc.id == id)
             .map(|pc| (pc.abstract_syntax.as_str(), pc.transfer_syntax.as_str()))
+    }
+
+    /// Accepted presentation contexts on which C-STORE sub-operations of a C-GET can be
+    /// sent: ID, SOP class and transfer syntax.
+    pub fn retrieve_contexts(&self) -> impl Iterator<Item = (u8, &str, &str)> {
+        self.contexts
+            .iter()
+            .filter(|pc| pc.requestor_scp)
+            .map(|pc| {
+                (
+                    pc.id,
+                    pc.abstract_syntax.as_str(),
+                    pc.transfer_syntax.as_str(),
+                )
+            })
     }
 
     /// Read one PDU; cancel safe (partial input stays in the buffer).
@@ -466,10 +524,60 @@ impl Connection {
         Ok(())
     }
 
+    /// Send a C-STORE sub-operation of C-GET request `parent` and wait for its response;
+    /// returns the response status. A cancellation of `parent` received meanwhile is
+    /// remembered for [`cancelled`](Self::cancelled).
+    pub async fn sub_operation(
+        &mut self,
+        context: u8,
+        request: &Command,
+        data: &[u8],
+        parent: u16,
+    ) -> Result<u16, Error> {
+        self.send(context, request, Some(data)).await?;
+        let message_id = request.message_id();
+        loop {
+            let Incoming::Message(message) = self.receive(|_, _, _| Vec::new()).await? else {
+                return Err(Error::Protocol(
+                    "association closed during a C-GET sub-operation".into(),
+                ));
+            };
+            let command = message.command;
+            let responding_to = command.u16(tags::MESSAGE_ID_BEING_RESPONDED_TO);
+            match command.field() {
+                Some(field::C_CANCEL_RQ) => {
+                    if responding_to == Some(parent) {
+                        self.cancel_requested = Some(parent);
+                    }
+                }
+                Some(f)
+                    if f == field::C_STORE_RQ | field::RESPONSE && responding_to == message_id =>
+                {
+                    return command
+                        .status()
+                        .ok_or_else(|| Error::Protocol("C-STORE response without status".into()));
+                }
+                field => {
+                    return Err(Error::Protocol(format!(
+                        "unexpected command {:04X} during a C-GET sub-operation",
+                        field.unwrap_or_default()
+                    )));
+                }
+            }
+        }
+    }
+
     /// Whether the peer asked to cancel request `message_id`, looking only at what has
     /// already arrived. A release or abort counts as a cancel; other PDUs are kept for
     /// [`receive`](Self::receive).
     pub fn cancelled(&mut self, message_id: u16) -> bool {
+        if self
+            .cancel_requested
+            .take_if(|id| *id == message_id)
+            .is_some()
+        {
+            return true;
+        }
         while let Some(Ok(pdu)) = self.read_pdu().now_or_never() {
             match &pdu {
                 Pdu::PData { data }

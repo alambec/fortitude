@@ -282,7 +282,8 @@ It initiates associations only for C-MOVE sub-operations.
 | Implementation Version Name | `FORTITUDE_<version>` |
 | Maximum PDU length received | `dimse.max_pdu_length` (default 262144) |
 | Concurrent associations | `dimse.max_associations` (default 64); more are rejected (transient, local limit exceeded) |
-| Asynchronous operations, role selection, extended negotiation | Not supported (not negotiated) |
+| Asynchronous operations, extended negotiation | Not supported (not negotiated) |
+| SCP/SCU role selection | Accepted as proposed for storage SOP classes (the requestor may take the SCP role, to receive C-GET sub-operations); for other SOP classes, the SCP role of the requestor is refused |
 | Timeouts | `dimse.timeout_secs` (default 30) for each network read or write, and to connect to a move destination |
 
 ### SOP classes (SCP)
@@ -294,10 +295,12 @@ It initiates associations only for C-MOVE sub-operations.
 | Patient Root Query/Retrieve – MOVE | `1.2.840.10008.5.1.4.1.2.1.2` |
 | Study Root Query/Retrieve – FIND | `1.2.840.10008.5.1.4.1.2.2.1` |
 | Study Root Query/Retrieve – MOVE | `1.2.840.10008.5.1.4.1.2.2.2` |
+| Patient Root Query/Retrieve – GET | `1.2.840.10008.5.1.4.1.2.1.3` |
+| Study Root Query/Retrieve – GET | `1.2.840.10008.5.1.4.1.2.2.3` |
 | Every standard storage SOP class (`1.2.840.10008.5.1.4.1.1.*`, retired ones included) | |
 | Storage SOP classes listed in `dimse.extra_sop_classes` (e.g. private ones) | |
 
-C-GET and the Modality Worklist are not supported; their presentation contexts are refused.
+The Modality Worklist is not supported; its presentation contexts are refused.
 
 ### Association acceptance
 
@@ -308,7 +311,8 @@ C-GET and the Modality Worklist are not supported; their presentation contexts a
 - **Transfer syntaxes.** Every transfer syntax known to dicom-rs is accepted (uncompressed,
   deflated, JPEG, JPEG-LS, JPEG 2000, HTJ2K, RLE, MPEG/HEVC). When a presentation context
   proposes several: for storage SOP classes, the first non-native one in the requestor's
-  order (the sender's data is then not decompressed); for verification and query/retrieve,
+  order (the sender's data is then not decompressed); for verification, query/retrieve, and
+  storage SOP classes for which the requestor takes the SCP role (Fortitude sends on them),
   the first native one (Explicit/Implicit VR Little Endian, Explicit VR Big Endian, Deflated).
 
 ### C-ECHO
@@ -375,4 +379,23 @@ Failures carry an Error Comment (0000,0902). A data set larger than
 | `FE00` | Cancelled. |
 | `A801` | Unknown move destination. |
 | `A702` | The destination cannot be reached or accepts no proposed context. |
+| `A900` | Invalid identifier. |
+
+### C-GET
+
+- The identifier selects instances as for C-MOVE (same keys, same `A900` failures).
+- Instances are sent with C-STORE on the requestor's association, on the presentation
+  contexts of storage SOP classes for which it took the SCP role (role selection). Each is
+  sent as stored when a context of its SOP class accepted its transfer syntax, otherwise
+  transcoded to an accepted Explicit or Implicit VR Little Endian context; an instance
+  without either fails, as does one that cannot be decoded.
+- Sub-operations are sent one at a time, each after the response to the previous one. A
+  pending response follows each sub-operation; C-CANCEL is honored between them, including
+  one received while waiting for a sub-operation's response.
+
+| Final status | When |
+|---|---|
+| `0000` | Every sub-operation succeeded (or nothing matched). |
+| `B000` | Some sub-operations failed or completed with a warning; Failed SOP Instance UID List is returned. |
+| `FE00` | Cancelled. |
 | `A900` | Invalid identifier. |
