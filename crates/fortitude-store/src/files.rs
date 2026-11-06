@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use dicom_dictionary_std::tags;
@@ -87,6 +88,15 @@ impl std::fmt::Debug for FileStore {
 
 /// Size of the chunks of a local file stream.
 const STREAM_CHUNK: usize = 256 * 1024;
+
+/// A file of the storage, as listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub key: String,
+    pub size: u64,
+    /// Time of the last modification: for a file that is never rewritten, of its creation.
+    pub modified: SystemTime,
+}
 
 /// Bytes of a stored file, in chunks.
 pub type FileStream = BoxStream<'static, io::Result<Bytes>>;
@@ -217,33 +227,75 @@ impl FileStore {
 
     /// Keys of all the stored files.
     pub async fn keys(&self) -> io::Result<Vec<String>> {
+        Ok(self.list("").await?.into_iter().map(|f| f.key).collect())
+    }
+
+    /// The stored files whose key starts with the directory `prefix` (e.g. `ab/`, or `""` for
+    /// all of them), in no particular order.
+    pub async fn list(&self, prefix: &str) -> io::Result<Vec<StoredFile>> {
+        let prefix = prefix.trim_matches('/');
         match &*self.backend {
             Backend::Local { root, .. } => {
                 let root = root.clone();
+                let dir = root.join(prefix);
                 blocking(move || {
-                    let mut keys = Vec::new();
-                    list_dir(&root, &root, &mut keys)?;
-                    Ok(keys)
+                    let mut files = Vec::new();
+                    match list_dir(&root, &dir, &mut files) {
+                        Err(e) if e.kind() == io::ErrorKind::NotFound && dir != root => Ok(files),
+                        result => result.map(|()| files),
+                    }
                 })
                 .await
             }
-            Backend::S3 { bucket, prefix, .. } => {
-                let base = object_store::path::Path::from(prefix.as_str());
-                let skip = base.parts().count();
+            Backend::S3 {
+                bucket,
+                prefix: base,
+                ..
+            } => {
+                let skip = object_store::path::Path::from(base.as_str())
+                    .parts()
+                    .count();
+                let listed = if prefix.is_empty() {
+                    object_store::path::Path::from(base.as_str())
+                } else {
+                    location(base, prefix)
+                };
                 bucket
-                    .list(Some(&base))
-                    .map_ok(|meta| {
-                        let parts: Vec<_> = meta.location.parts().skip(skip).collect();
-                        parts
-                            .iter()
-                            .map(AsRef::as_ref)
-                            .collect::<Vec<&str>>()
-                            .join("/")
+                    .list(Some(&listed))
+                    .map_ok(|meta| StoredFile {
+                        key: meta
+                            .location
+                            .parts()
+                            .skip(skip)
+                            .map(|part| part.as_ref().to_owned())
+                            .collect::<Vec<_>>()
+                            .join("/"),
+                        size: meta.size,
+                        modified: meta.last_modified.into(),
                     })
                     .try_collect()
                     .await
                     .map_err(io_error)
             }
+        }
+    }
+
+    /// Size of a file; `None` when it does not exist.
+    pub async fn size(&self, key: &str) -> io::Result<Option<u64>> {
+        let size = match &*self.backend {
+            Backend::Local { root, .. } => {
+                tokio::fs::metadata(root.join(key)).await.map(|m| m.len())
+            }
+            Backend::S3 { bucket, prefix, .. } => bucket
+                .head(&location(prefix, key))
+                .await
+                .map(|meta| meta.size)
+                .map_err(io_error),
+        };
+        match size {
+            Ok(size) => Ok(Some(size)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -412,13 +464,23 @@ fn write_file(path: &Path, bytes: &[u8], fsync: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn list_dir(root: &Path, dir: &Path, keys: &mut Vec<String>) -> io::Result<()> {
+fn list_dir(root: &Path, dir: &Path, files: &mut Vec<StoredFile>) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
-            list_dir(root, &entry.path(), keys)?;
+            list_dir(root, &entry.path(), files)?;
         } else if let Ok(key) = entry.path().strip_prefix(root) {
-            keys.push(key.to_string_lossy().into_owned());
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                // Removed since the directory was read.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            files.push(StoredFile {
+                key: key.to_string_lossy().into_owned(),
+                size: metadata.len(),
+                modified: metadata.modified()?,
+            });
         }
     }
     Ok(())

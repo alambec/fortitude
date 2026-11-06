@@ -58,14 +58,18 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
    studies and series as ZIP archives, upload files and folders. A static page
    embedded in the binary, over QIDO-RS, WADO-RS, STOW-RS and WADO-URI only (plus a dictionary lookup
    for tag and SOP class names, and the ZIP archives). *(done)*
+10. **Integrity** — periodic and on-demand check of the files against the index, one key
+    prefix at a time (index on `instances(path, size)`, schema version 2): orphan files left by
+    crashes or failed removals are removed after a grace period; missing and truncated files
+    are reported with their UIDs, never deleted automatically. *(done)*
 
 ## Next
 
 - **12-bit JPEG Extended** decoding (jpeg-decoder supports 8-bit DCT only), and a faster
   JPEG 2000 decoder.
 - **DIMSE**: C-GET, storage commitment, TLS.
-- **Retention and integrity**: periodic check of files against the index, orphan file
-  cleanup after crashes.
+- **Retention**: configurable deletion of series by age of ingestion.
+- **Integrity**: checksums recorded at ingest, to detect corrupted files of the right size.
 
 ## Benchmarks
 

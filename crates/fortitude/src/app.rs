@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, Auth};
 use crate::config::Config;
+use crate::integrity::Checker;
 use crate::{admin, metrics, ui};
 
 /// The application: DICOMweb, WADO-URI and administration services, behind authentication
@@ -19,6 +20,7 @@ use crate::{admin, metrics, ui};
 pub fn build(
     config: &Config,
     store: Arc<Store>,
+    integrity: Arc<Checker>,
     metrics_handle: Option<PrometheusHandle>,
 ) -> Router {
     let dicomweb = DicomWeb {
@@ -44,7 +46,7 @@ pub fn build(
             &config.http.dicomweb_root,
             fortitude_dicomweb::router(dicomweb),
         )
-        .nest("/admin", admin::router(store.clone()));
+        .nest("/admin", admin::router(store.clone(), integrity));
     if let Some(auth) = Auth::new(&config.auth) {
         services = services.layer(middleware::from_fn_with_state(auth, auth::require));
     }
@@ -117,7 +119,8 @@ mod tests {
             inline_binary_max: 64,
         })
         .unwrap();
-        let app = build(&config, store, Some(metrics_handle()));
+        let integrity = Checker::new(store.clone(), config.integrity.clone());
+        let app = build(&config, store, integrity, Some(metrics_handle()));
         Harness { app, _dir: dir }
     }
 
@@ -182,6 +185,72 @@ mod tests {
 
     fn user() -> String {
         basic("user", "pass")
+    }
+
+    #[tokio::test]
+    async fn integrity_check_on_request() {
+        let h = harness(|_| {});
+        assert_eq!(h.stow(None).await, StatusCode::OK);
+        let (status, body) = h.send(get("/admin/integrity", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(state, serde_json::json!({ "running": false, "last": null }));
+
+        let start = || {
+            Request::post("/admin/integrity?remove_orphans=false")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, body) = h.send(start()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(state["running"], true);
+        assert_eq!(h.send(start()).await.0, StatusCode::CONFLICT);
+        let state = loop {
+            let (_, body) = h.send(get("/admin/integrity", None)).await;
+            let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if state["running"] == false {
+                break state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let report = &state["last"];
+        assert_eq!(report["remove_orphans"], false);
+        assert_eq!(
+            (&report["files"], &report["instances"]),
+            (&1.into(), &1.into())
+        );
+        assert_eq!(report["missing"], 0);
+        assert_eq!(report["problems"], serde_json::json!([]));
+        assert!(report.get("study_uid").is_none());
+
+        // A study, or a series, is checked at once.
+        let check = |query: &str| {
+            Request::post(format!("/admin/integrity?{query}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, body) = h.send(check("study=1.2")).await;
+        assert_eq!(status, StatusCode::OK);
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["study_uid"], "1.2");
+        assert_eq!(
+            (&report["files"], &report["missing"]),
+            (&1.into(), &0.into())
+        );
+        let (status, body) = h.send(check("study=1.2&series=1.2.3")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["series_uid"], "1.2.3");
+        assert_eq!(h.send(check("study=9.9")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            h.send(check("study=1.2&series=9.9")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            h.send(check("series=1.2.3")).await.0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -259,6 +328,11 @@ mod tests {
                 .0,
             StatusCode::OK
         );
+        let start_integrity = Request::post("/admin/integrity")
+            .header(header::AUTHORIZATION, basic("viewer", "look"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(h.send(start_integrity).await.0, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

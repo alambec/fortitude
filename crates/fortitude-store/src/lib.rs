@@ -7,6 +7,7 @@ pub mod files;
 pub mod imaging;
 pub mod index;
 pub mod ingest;
+pub mod integrity;
 pub mod pixel;
 pub mod retrieve;
 pub mod search;

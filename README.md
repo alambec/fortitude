@@ -80,6 +80,11 @@ ae_title = "VIEWER"
 host = "10.0.0.5"
 port = 104
 
+[integrity]                # checks of the stored files against the index
+interval_hours = 24        # first check one interval after the start; 0 = only on request
+orphan_grace_minutes = 60  # unreferenced files younger than this are kept (min. 5)
+remove_orphans = true      # false = only count orphan files
+
 [metrics]
 enabled = true             # Prometheus metrics on /metrics
 
@@ -121,6 +126,9 @@ uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 G
 | `{wado_root}` | WADO-URI |
 | `GET /ui/` (`/` redirects to it) | Web explorer: search, browse, download and upload |
 | `GET /admin/statistics` | Number of studies, series and instances, and stored size |
+| `POST /admin/integrity` | Start an integrity check (`?remove_orphans=false`: dry run); `409` if one is running |
+| `POST /admin/integrity?study=…[&series=…]` | Check one study or series now, and return its report (`404` if not stored) |
+| `GET /admin/integrity` | Whether a check is running, and the report of the last one |
 | `GET /health` | Liveness (never authenticated) |
 | `GET /metrics` | Prometheus metrics (never authenticated) |
 
@@ -132,6 +140,44 @@ STOW-RS, one request per file, and reports each failure. Text fields match prefi
 description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
 case-insensitively. It is served only when `auth.users` is configured, and only to those
 users (the browser asks for one): Bearer tokens do not open it.
+
+### Integrity checks
+
+The index and the files are not updated in one transaction, so a crash or a failed removal
+can leave **orphan** files (stored, but referenced by no instance), and files can go
+**missing** or be truncated behind the server's back. The integrity check lists the storage
+one key prefix at a time (`00/` to `ff/`, so memory stays bounded whatever the archive size)
+and compares it with the index:
+
+- orphan files older than `orphan_grace_minutes` are removed (younger ones may belong to an
+  ingest in progress), unless `remove_orphans = false`;
+- instances whose file is missing, or not of the size recorded at ingest, are logged and
+  reported with their UIDs, never deleted: delete them (`DELETE` on DICOMweb) or restore
+  their files.
+
+Files whose key was not written by Fortitude (`ab/cd/<uuid>.dcm`) are left alone. Each
+suspect file is checked again before it is reported or removed, so checks can run while
+the server stores and deletes instances. The report of the last check is returned by
+`GET /admin/integrity` (up to 1000 problems are listed; the counts include all of them).
+A single study or series is checked on request, at once: `POST
+/admin/integrity?study={uid}[&series={uid}]` returns its report (with `study_uid` and
+`series_uid`), counting its missing files and size mismatches. Orphan files belong to no
+study, so only the full check finds them.
+
+The check relies on an index of `instances(path, size)`, which it reads without reading the
+instance rows. The index is created on the first start of a version that has it: on a large
+existing index this takes a while, during which ingest waits.
+
+```json
+{"running": false, "last": {"started_at": 1793232000, "duration_seconds": 41.2,
+  "remove_orphans": true, "files": 1203311, "instances": 1203310,
+  "orphans": 1, "orphans_size": 524288, "orphans_removed": 1, "recent_files": 0,
+  "foreign_files": 0, "missing": 1, "size_mismatches": 0,
+  "problems": [{"kind": "missing", "study_uid": "1.2.3", "series_uid": "1.2.3.4",
+    "sop_uid": "1.2.3.4.5", "path": "3f/a2/3fa2….dcm", "expected_size": 524416,
+    "actual_size": null}],
+  "errors": []}}
+```
 
 The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
 DIMSE has no authentication beyond AE titles: restrict its port at the network level.
@@ -150,6 +196,9 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_dimse_request_duration_seconds` (histogram) | `command` |
 | `fortitude_dimse_instances_total` (C-STORE) | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_dimse_moved_instances_total` (C-MOVE) | `outcome`: `sent`, `failed` |
+| `fortitude_integrity_orphans`, `_missing`, `_size_mismatches`, `_errors` (gauges: last check) | |
+| `fortitude_integrity_orphans_removed_total` | |
+| `fortitude_integrity_last_run_timestamp_seconds`, `_last_run_duration_seconds` (gauges) | |
 
 ## Tests
 

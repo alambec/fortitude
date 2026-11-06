@@ -17,6 +17,7 @@ pub struct Config {
     pub dicomweb: DicomWebConfig,
     pub dimse: DimseConfig,
     pub auth: AuthConfig,
+    pub integrity: IntegrityConfig,
     pub metrics: MetricsConfig,
     pub log: LogConfig,
 }
@@ -332,6 +333,29 @@ pub struct Token {
     pub read_only: bool,
 }
 
+/// Checks of the stored files against the index (see `fortitude_store::integrity`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IntegrityConfig {
+    /// Hours between two checks, the first one interval after the start; 0: only on request
+    /// (`POST /admin/integrity`).
+    pub interval_hours: u64,
+    /// Files no instance references are removed once older than this (at least 5 minutes).
+    pub orphan_grace_minutes: u64,
+    /// Remove orphan files; `false`: only count them.
+    pub remove_orphans: bool,
+}
+
+impl Default for IntegrityConfig {
+    fn default() -> Self {
+        Self {
+            interval_hours: 24,
+            orphan_grace_minutes: 60,
+            remove_orphans: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -406,6 +430,31 @@ mod tests {
             assert_eq!(config.http.listen, "127.0.0.1:9001".parse().unwrap());
             assert_eq!(config.storage.path, PathBuf::from("/srv/fortitude"));
             assert_eq!(config.http.dicomweb_root, "/dicom-web");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn integrity_checks() {
+        figment::Jail::expect_with(|jail| {
+            let defaults = Config::load(None).map_err(|e| *e)?.integrity;
+            assert_eq!(defaults.interval_hours, 24);
+            assert_eq!(defaults.orphan_grace_minutes, 60);
+            assert!(defaults.remove_orphans);
+
+            jail.create_file(
+                "fortitude.toml",
+                r#"
+                [integrity]
+                interval_hours = 0
+                remove_orphans = false
+                "#,
+            )?;
+            jail.set_env("FORTITUDE_INTEGRITY__ORPHAN_GRACE_MINUTES", "1");
+            let config = Config::load(Some(Path::new("fortitude.toml"))).map_err(|e| *e)?;
+            assert_eq!(config.integrity.interval_hours, 0);
+            assert!(!config.integrity.remove_orphans);
+            assert_eq!(config.integrity.orphan_grace_minutes, 1);
             Ok(())
         });
     }

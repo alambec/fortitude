@@ -8,13 +8,20 @@
 //!
 //! PostgreSQL text columns use the "C" collation: comparisons are bytewise as in SQLite, and
 //! their indexes serve `LIKE` prefix patterns.
+//!
+//! Versions: 1 is the initial schema; 2 indexes `instances.path`, for the integrity check
+//! (which compares the files of the storage against the index, one key prefix at a time).
 
 use fortitude_core::attrs::{self, Kind, Level};
 
 use super::IndexError;
 use super::db::{Connection, Dialect};
 
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
+
+/// Upgrade from version 1. The integrity check reads `path` and `size` by ranges of `path`:
+/// with `size` in the index, it reads the index alone, not one (wide) row per instance.
+const UPGRADE_1: &str = "CREATE INDEX instances_path ON instances(path, size);";
 
 /// Per-connection SQLite settings.
 pub fn configure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -49,7 +56,9 @@ pub fn migrate(conn: &mut Connection) -> Result<(), IndexError> {
             let version =
                 conn.query_row("SELECT version FROM schema_version", &[], |r| r.i64(0))?;
             finish(conn, dialect, version.unwrap_or(0), |conn| {
-                conn.batch(&format!("INSERT INTO schema_version VALUES ({VERSION})"))
+                conn.batch(&format!(
+                    "DELETE FROM schema_version; INSERT INTO schema_version VALUES ({VERSION});"
+                ))
             })
         }
     }
@@ -65,6 +74,10 @@ fn finish(
     let result = match version {
         VERSION => Ok(()),
         0 => conn.batch(&ddl(dialect)).and_then(|()| record(conn)),
+        1 => {
+            tracing::info!("upgrading the index schema to version {VERSION}");
+            conn.batch(UPGRADE_1).and_then(|()| record(conn))
+        }
         _ => Err(IndexError::Database(format!(
             "unsupported index schema version {version}"
         ))),
@@ -169,6 +182,7 @@ fn ddl(dialect: Dialect) -> String {
         CREATE INDEX series_study ON series(study_pk, series_number);
         CREATE INDEX instances_series ON instances(series_pk, instance_number);
         CREATE INDEX instances_study ON instances(study_pk);
+        {UPGRADE_1}
         {study_indexes}{series_indexes}{instance_indexes}",
         study = column_defs(Level::Study),
         series = column_defs(Level::Series),
@@ -204,5 +218,22 @@ mod tests {
         assert!(count > 20, "{count} indexes");
         assert_eq!(columns(Level::Study)[0], "study_uid");
         assert!(columns(Level::Study).contains(&"patient_name_key".to_owned()));
+    }
+
+    #[test]
+    fn version_1_is_upgraded() {
+        let mut conn = Connection::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        migrate(&mut conn).unwrap();
+        conn.batch("DROP INDEX instances_path; PRAGMA user_version = 1;")
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        let version = conn.query_row("PRAGMA user_version", &[], |r| r.i64(0));
+        assert_eq!(version.unwrap(), Some(VERSION));
+        let indexed = conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'instances_path'",
+            &[],
+            |_| Ok(()),
+        );
+        assert!(indexed.unwrap().is_some());
     }
 }
