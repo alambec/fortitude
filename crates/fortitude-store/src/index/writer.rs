@@ -37,8 +37,14 @@ pub(crate) enum Command {
         Box<InstanceRecord>,
         oneshot::Sender<Result<InsertOutcome, IndexError>>,
     ),
-    /// Delete the instances of a scope; replies with the paths of their files.
-    Delete(Scope, oneshot::Sender<Result<Vec<String>, IndexError>>),
+    /// Delete the instances of a scope; replies with the paths of their files. With a time
+    /// (milliseconds since the Unix epoch), only if no series of the study was stored since
+    /// (retention).
+    Delete(
+        Scope,
+        Option<i64>,
+        oneshot::Sender<Result<Vec<String>, IndexError>>,
+    ),
 }
 
 enum Applied {
@@ -110,7 +116,7 @@ fn fail(batch: &mut Vec<Command>, error: &IndexError) {
             Command::Insert(_, reply) => {
                 let _ = reply.send(Err(error.clone()));
             }
-            Command::Delete(_, reply) => {
+            Command::Delete(_, _, reply) => {
                 let _ = reply.send(Err(error.clone()));
             }
         }
@@ -133,8 +139,15 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
                     let keep = matches!(result, Ok(InsertOutcome::Inserted));
                     (Applied::Insert(result), keep)
                 }
-                Command::Delete(scope, _) => {
-                    let result = delete(conn, statements.dialect, scope);
+                Command::Delete(scope, unchanged_since, _) => {
+                    let result = match unchanged_since {
+                        Some(since) => match has_series_since(conn, &scope.study, *since) {
+                            Ok(true) => Ok(Vec::new()),
+                            Ok(false) => delete(conn, statements.dialect, scope),
+                            Err(e) => Err(e),
+                        },
+                        None => delete(conn, statements.dialect, scope),
+                    };
                     let keep = result.as_ref().is_ok_and(|paths| !paths.is_empty());
                     (Applied::Delete(result), keep)
                 }
@@ -165,17 +178,28 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
             (Command::Insert(_, reply), Some(Applied::Insert(result))) if committed.is_ok() => {
                 let _ = reply.send(result);
             }
-            (Command::Delete(_, reply), Some(Applied::Delete(result))) if committed.is_ok() => {
+            (Command::Delete(_, _, reply), Some(Applied::Delete(result))) if committed.is_ok() => {
                 let _ = reply.send(result);
             }
             (Command::Insert(_, reply), _) => {
                 let _ = reply.send(Err(failure()));
             }
-            (Command::Delete(_, reply), _) => {
+            (Command::Delete(_, _, reply), _) => {
                 let _ = reply.send(Err(failure()));
             }
         }
     }
+}
+
+/// Whether a series of the study was stored at or after `since` (milliseconds).
+fn has_series_since(conn: &mut Connection, study: &str, since: i64) -> Result<bool, IndexError> {
+    let found = conn.query_row(
+        "SELECT 1 FROM series s JOIN studies st ON st.pk = s.study_pk
+         WHERE st.study_uid = ? AND s.created_at >= ?",
+        &[Value::Text(study.to_owned()), Value::Integer(since)],
+        |_| Ok(()),
+    )?;
+    Ok(found.is_some())
 }
 
 /// Delete the instances of `scope`, then the series and studies left empty, and refresh

@@ -85,6 +85,10 @@ interval_hours = 24        # first check one interval after the start; 0 = only 
 orphan_grace_minutes = 60  # unreferenced files younger than this are kept (min. 5)
 remove_orphans = true      # false = only count orphan files
 
+[retention]                # deletion of whole studies by age
+max_age_days = 0           # delete studies whose series were all stored longer ago; 0 = keep
+interval_hours = 24        # first run one interval after the start; 0 = only on request
+
 [metrics]
 enabled = true             # Prometheus metrics on /metrics
 
@@ -129,6 +133,8 @@ uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 G
 | `POST /admin/integrity` | Start an integrity check (`?remove_orphans=false`: dry run); `409` if one is running |
 | `POST /admin/integrity?study=…[&series=…]` | Check one study or series now, and return its report (`404` if not stored) |
 | `GET /admin/integrity` | Whether a check is running, and the report of the last one |
+| `POST /admin/retention` | Start a retention run (`?dry_run=true[&max_age_days=N]`: list only); `409` if one is running |
+| `GET /admin/retention` | Whether a retention run is in progress, and the report of the last one |
 | `GET /health` | Liveness (never authenticated) |
 | `GET /metrics` | Prometheus metrics (never authenticated) |
 
@@ -166,7 +172,8 @@ study, so only the full check finds them.
 
 The check relies on an index of `instances(path, size)`, which it reads without reading the
 instance rows. The index is created on the first start of a version that has it: on a large
-existing index this takes a while, during which ingest waits.
+existing index this takes a while, during which ingest waits (the same goes for the
+`studies.created_at` index of retention).
 
 ```json
 {"running": false, "last": {"started_at": 1793232000, "duration_seconds": 41.2,
@@ -178,6 +185,33 @@ existing index this takes a while, during which ingest waits.
     "actual_size": null}],
   "errors": []}}
 ```
+
+### Retention
+
+With `retention.max_age_days` set, studies are deleted, whole, once **all** their series were
+stored more than that many days ago: a study that receives a new series (priors sent again,
+a late series) is kept in full, and its age starts over. The age is that of storage in
+Fortitude, not the Study Date. The decision is checked again in the transaction that
+deletes each study, so a series stored during a run saves its study. Each deleted study is
+logged (UID, patient ID, study date, accession number); files that cannot be removed are
+reported, and later removed as orphans by the integrity check.
+
+Preview before enabling it: `POST /admin/retention?dry_run=true&max_age_days=3650` lists
+the studies that would be deleted (an age given in the request only applies to dry runs),
+and `GET /admin/retention` returns the report:
+
+```json
+{"running": false, "last": {"started_at": 1793232000, "duration_seconds": 0.8,
+  "dry_run": true, "max_age_days": 3650.0, "cutoff": 1477872000,
+  "studies": 1, "instances": 212,
+  "expired": [{"study_uid": "1.2.3", "patient_id": "P1", "study_date": "20160402",
+    "accession_number": "A17", "instances": 212, "last_stored_at": 1459600000}],
+  "errors": []}}
+```
+
+Up to 1000 studies are listed; the counts include all of them. Expired studies are found
+through an index of `studies.created_at` (schema version 3), so a run reads only the
+studies stored before the cutoff.
 
 The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
 DIMSE has no authentication beyond AE titles: restrict its port at the network level.
@@ -199,6 +233,8 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_integrity_orphans`, `_missing`, `_size_mismatches`, `_errors` (gauges: last check) | |
 | `fortitude_integrity_orphans_removed_total` | |
 | `fortitude_integrity_last_run_timestamp_seconds`, `_last_run_duration_seconds` (gauges) | |
+| `fortitude_retention_deleted_studies_total`, `fortitude_retention_deleted_instances_total` | |
+| `fortitude_retention_last_run_timestamp_seconds` (gauge) | |
 
 ## Tests
 

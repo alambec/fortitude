@@ -4,7 +4,9 @@ mod archive;
 mod auth;
 mod config;
 mod integrity;
+mod jobs;
 mod metrics;
+mod retention;
 mod ui;
 
 use std::path::PathBuf;
@@ -98,9 +100,17 @@ async fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)
         .context("invalid DIMSE configuration")?;
     let integrity = integrity::Checker::new(store.clone(), config.integrity.clone());
-    let app = app::build(&config, store.clone(), integrity.clone(), metrics_handle);
+    let retention = retention::Retention::new(store.clone(), config.retention.clone());
+    let app = app::build(
+        &config,
+        store.clone(),
+        integrity.clone(),
+        retention.clone(),
+        metrics_handle,
+    );
     let shutdown = CancellationToken::new();
     tokio::spawn(integrity.run_periodically(shutdown.clone()));
+    tokio::spawn(retention.run_periodically(shutdown.clone()));
 
     // Without TCP_NODELAY, the last segment of a streamed response can wait for the
     // client's delayed ACK (~40 ms).

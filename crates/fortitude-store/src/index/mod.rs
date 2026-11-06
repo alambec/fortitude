@@ -137,7 +137,23 @@ impl Index {
     pub async fn delete(&self, scope: Scope) -> Result<Vec<String>, IndexError> {
         let (reply, response) = oneshot::channel();
         self.writer
-            .send(Command::Delete(scope, reply))
+            .send(Command::Delete(scope, None, reply))
+            .await
+            .map_err(|_| IndexError::WriterStopped)?;
+        response.await.map_err(|_| IndexError::WriterStopped)?
+    }
+
+    /// Delete a study unless one of its series was stored at or after `since` (milliseconds
+    /// since the Unix epoch), checked in the same transaction; returns the paths of the files
+    /// of its instances (none when it was kept, or is not stored).
+    pub async fn delete_study_unchanged_since(
+        &self,
+        study: &str,
+        since: i64,
+    ) -> Result<Vec<String>, IndexError> {
+        let (reply, response) = oneshot::channel();
+        self.writer
+            .send(Command::Delete(Scope::study(study), Some(since), reply))
             .await
             .map_err(|_| IndexError::WriterStopped)?;
         response.await.map_err(|_| IndexError::WriterStopped)?

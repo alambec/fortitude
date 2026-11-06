@@ -9,6 +9,7 @@ pub mod index;
 pub mod ingest;
 pub mod integrity;
 pub mod pixel;
+pub mod retention;
 pub mod retrieve;
 pub mod search;
 pub mod walker;

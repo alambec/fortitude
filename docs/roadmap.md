@@ -62,13 +62,16 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
     prefix at a time (index on `instances(path, size)`, schema version 2): orphan files left by
     crashes or failed removals are removed after a grace period; missing and truncated files
     are reported with their UIDs, never deleted automatically. *(done)*
+11. **Retention** — `retention.max_age_days`: whole studies are deleted once all their
+    series were stored longer ago (index on `studies.created_at`, schema version 3), with
+    the decision checked again in the deleting transaction; dry runs list them first.
+    *(done)*
 
 ## Next
 
 - **12-bit JPEG Extended** decoding (jpeg-decoder supports 8-bit DCT only), and a faster
   JPEG 2000 decoder.
 - **DIMSE**: C-GET, storage commitment, TLS.
-- **Retention**: configurable deletion of series by age of ingestion.
 - **Integrity**: checksums recorded at ingest, to detect corrupted files of the right size.
 
 ## Benchmarks

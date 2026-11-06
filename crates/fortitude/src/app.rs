@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 use crate::auth::{self, Auth};
 use crate::config::Config;
 use crate::integrity::Checker;
+use crate::retention::Retention;
 use crate::{admin, metrics, ui};
 
 /// The application: DICOMweb, WADO-URI and administration services, behind authentication
@@ -21,6 +22,7 @@ pub fn build(
     config: &Config,
     store: Arc<Store>,
     integrity: Arc<Checker>,
+    retention: Arc<Retention>,
     metrics_handle: Option<PrometheusHandle>,
 ) -> Router {
     let dicomweb = DicomWeb {
@@ -46,7 +48,14 @@ pub fn build(
             &config.http.dicomweb_root,
             fortitude_dicomweb::router(dicomweb),
         )
-        .nest("/admin", admin::router(store.clone(), integrity));
+        .nest(
+            "/admin",
+            admin::router(admin::Admin {
+                store: store.clone(),
+                integrity,
+                retention,
+            }),
+        );
     if let Some(auth) = Auth::new(&config.auth) {
         services = services.layer(middleware::from_fn_with_state(auth, auth::require));
     }
@@ -120,7 +129,8 @@ mod tests {
         })
         .unwrap();
         let integrity = Checker::new(store.clone(), config.integrity.clone());
-        let app = build(&config, store, integrity, Some(metrics_handle()));
+        let retention = Retention::new(store.clone(), config.retention.clone());
+        let app = build(&config, store, integrity, retention, Some(metrics_handle()));
         Harness { app, _dir: dir }
     }
 
@@ -251,6 +261,64 @@ mod tests {
             h.send(check("series=1.2.3")).await.0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn retention_on_request() {
+        let post = |query: &str| {
+            Request::post(format!("/admin/retention{query}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let finished = |h: &Harness| {
+            let h = h.app.clone();
+            async move {
+                loop {
+                    let response = h.clone().oneshot(get("/admin/retention", None)).await;
+                    let body = axum::body::to_bytes(response.unwrap().into_body(), usize::MAX);
+                    let state: serde_json::Value =
+                        serde_json::from_slice(&body.await.unwrap()).unwrap();
+                    if state["running"] == false {
+                        return state["last"].clone();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        // Not configured: dry runs only, with an age.
+        let h = harness(|_| {});
+        assert_eq!(h.stow(None).await, StatusCode::OK);
+        assert_eq!(h.send(post("")).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.send(post("?dry_run=true&max_age_days=0")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            h.send(post("?max_age_days=1")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, _) = h.send(post("?dry_run=true&max_age_days=1")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let report = finished(&h).await;
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["max_age_days"], 1.0);
+        assert_eq!(
+            (&report["studies"], &report["expired"]),
+            (&0.into(), &serde_json::json!([]))
+        );
+
+        let h = harness(|c| c.retention.max_age_days = 3650);
+        assert_eq!(h.stow(None).await, StatusCode::OK);
+        assert_eq!(h.send(post("")).await.0, StatusCode::ACCEPTED);
+        let report = finished(&h).await;
+        assert_eq!(
+            (&report["dry_run"], &report["studies"]),
+            (&false.into(), &0.into())
+        );
+        let (_, body) = h.send(get("/admin/statistics", None)).await;
+        let statistics: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(statistics["studies"], 1);
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ pub struct Config {
     pub dimse: DimseConfig,
     pub auth: AuthConfig,
     pub integrity: IntegrityConfig,
+    pub retention: RetentionConfig,
     pub metrics: MetricsConfig,
     pub log: LogConfig,
 }
@@ -356,6 +357,27 @@ impl Default for IntegrityConfig {
     }
 }
 
+/// Deletion of whole studies by age (see `fortitude_store::retention`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Studies whose series were all stored more than this many days ago are deleted; 0:
+    /// studies are kept forever.
+    pub max_age_days: u64,
+    /// Hours between two runs, the first one interval after the start; 0: only on request
+    /// (`POST /admin/retention`).
+    pub interval_hours: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_age_days: 0,
+            interval_hours: 24,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -435,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_checks() {
+    fn integrity_checks_and_retention() {
         figment::Jail::expect_with(|jail| {
             let defaults = Config::load(None).map_err(|e| *e)?.integrity;
             assert_eq!(defaults.interval_hours, 24);
@@ -455,6 +477,11 @@ mod tests {
             assert_eq!(config.integrity.interval_hours, 0);
             assert!(!config.integrity.remove_orphans);
             assert_eq!(config.integrity.orphan_grace_minutes, 1);
+            assert_eq!(config.retention.max_age_days, 0);
+            jail.set_env("FORTITUDE_RETENTION__MAX_AGE_DAYS", "3650");
+            let config = Config::load(Some(Path::new("fortitude.toml"))).map_err(|e| *e)?;
+            assert_eq!(config.retention.max_age_days, 3650);
+            assert_eq!(config.retention.interval_hours, 24);
             Ok(())
         });
     }
