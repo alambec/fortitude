@@ -84,6 +84,7 @@ port = 104
 interval_hours = 24        # first check one interval after the start; 0 = only on request
 orphan_grace_minutes = 60  # unreferenced files younger than this are kept (min. 5)
 remove_orphans = true      # false = only count orphan files
+verify_checksums = false   # true = read every file and verify its checksum (reads all storage)
 
 [retention]                # deletion of whole studies by age
 max_age_days = 0           # delete studies whose series were all stored longer ago; 0 = keep
@@ -118,6 +119,9 @@ exist; Fortitude creates its tables on first start (in the connection's `search_
 schema, `public` by default). Connections are not encrypted yet: keep the database on a
 trusted network.
 
+Until the first release, the index schema changes without upgrades: an index (SQLite file or
+PostgreSQL schema) created by another version is refused at startup, and must be re-created.
+
 With `storage.backend = "s3"`, DICOM files are stored as objects of the bucket, under
 `prefix` (`<prefix>/ab/cd/<uuid>.dcm`); the bucket must exist, and the server checks that it
 can list it on startup. The service must support ranged `GetObject` (frames, rendering and
@@ -130,8 +134,8 @@ uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 G
 | `{wado_root}` | WADO-URI |
 | `GET /ui/` (`/` redirects to it) | Web explorer: search, browse, download and upload |
 | `GET /admin/statistics` | Number of studies, series and instances, and stored size |
-| `POST /admin/integrity` | Start an integrity check (`?remove_orphans=false`: dry run); `409` if one is running |
-| `POST /admin/integrity?study=…[&series=…]` | Check one study or series now, and return its report (`404` if not stored) |
+| `POST /admin/integrity` | Start an integrity check (`?remove_orphans=false`: dry run; `?verify_checksums=true`: verify checksums); `409` if one is running |
+| `POST /admin/integrity?study=…[&series=…]` | Check one study or series now, checksums included (unless `verify_checksums=false`), and return its report (`404` if not stored) |
 | `GET /admin/integrity` | Whether a check is running, and the report of the last one |
 | `POST /admin/retention` | Start a retention run (`?dry_run=true[&max_age_days=N]`: list only); `409` if one is running |
 | `GET /admin/retention` | Whether a retention run is in progress, and the report of the last one |
@@ -159,7 +163,14 @@ and compares it with the index:
   ingest in progress), unless `remove_orphans = false`;
 - instances whose file is missing, or not of the size recorded at ingest, are logged and
   reported with their UIDs, never deleted: delete them (`DELETE` on DICOMweb) or restore
-  their files.
+  their files;
+- with `verify_checksums = true` (or `?verify_checksums=true`), every file is also read and
+  its CRC-32 compared with the one recorded at ingest: files corrupted with their size
+  intact (bit rot, a faulty disk, a bad copy or restore) are reported in the same way, as
+  `checksum_mismatch`.
+
+Verifying checksums reads the whole storage (from S3, every object is downloaded), so it is
+off by default: run it on request, or enable it with a long `interval_hours`.
 
 Files whose key was not written by Fortitude (`ab/cd/<uuid>.dcm`) are left alone. Each
 suspect file is checked again before it is reported or removed, so checks can run while
@@ -167,22 +178,25 @@ the server stores and deletes instances. The report of the last check is returne
 `GET /admin/integrity` (up to 1000 problems are listed; the counts include all of them).
 A single study or series is checked on request, at once: `POST
 /admin/integrity?study={uid}[&series={uid}]` returns its report (with `study_uid` and
-`series_uid`), counting its missing files and size mismatches. Orphan files belong to no
-study, so only the full check finds them.
+`series_uid`), counting its missing files, size and checksum mismatches (checksums are
+verified unless `verify_checksums=false`). Orphan files belong to no study, so only the full
+check finds them.
 
-The check relies on an index of `instances(path, size)`, which it reads without reading the
-instance rows. The index is created on the first start of a version that has it: on a large
-existing index this takes a while, during which ingest waits (the same goes for the
-`studies.created_at` index of retention).
+The check relies on an index of `instances(path, size, crc32)`, which it reads without
+reading the instance rows.
 
 ```json
 {"running": false, "last": {"started_at": 1793232000, "duration_seconds": 41.2,
-  "remove_orphans": true, "files": 1203311, "instances": 1203310,
+  "remove_orphans": true, "verify_checksums": true, "files": 1203311, "instances": 1203310,
   "orphans": 1, "orphans_size": 524288, "orphans_removed": 1, "recent_files": 0,
-  "foreign_files": 0, "missing": 1, "size_mismatches": 0,
+  "foreign_files": 0, "missing": 1, "size_mismatches": 0, "checksums_verified": 1203308,
+  "checksum_mismatches": 1,
   "problems": [{"kind": "missing", "study_uid": "1.2.3", "series_uid": "1.2.3.4",
     "sop_uid": "1.2.3.4.5", "path": "3f/a2/3fa2….dcm", "expected_size": 524416,
-    "actual_size": null}],
+    "actual_size": null},
+   {"kind": "checksum_mismatch", "study_uid": "1.2.3", "series_uid": "1.2.3.4",
+    "sop_uid": "1.2.3.4.6", "path": "8c/01/8c01….dcm", "expected_size": 524416,
+    "actual_size": 524416, "expected_crc32": "5d3e0f7a", "actual_crc32": "c41b9e02"}],
   "errors": []}}
 ```
 
@@ -210,7 +224,7 @@ and `GET /admin/retention` returns the report:
 ```
 
 Up to 1000 studies are listed; the counts include all of them. Expired studies are found
-through an index of `studies.created_at` (schema version 3), so a run reads only the
+through an index of `studies.created_at`, so a run reads only the
 studies stored before the cutoff.
 
 The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
@@ -231,6 +245,7 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_dimse_instances_total` (C-STORE) | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_dimse_moved_instances_total` (C-MOVE) | `outcome`: `sent`, `failed` |
 | `fortitude_integrity_orphans`, `_missing`, `_size_mismatches`, `_errors` (gauges: last check) | |
+| `fortitude_integrity_checksum_mismatches` (gauge: last check that verified checksums) | |
 | `fortitude_integrity_orphans_removed_total` | |
 | `fortitude_integrity_last_run_timestamp_seconds`, `_last_run_duration_seconds` (gauges) | |
 | `fortitude_retention_deleted_studies_total`, `fortitude_retention_deleted_instances_total` | |

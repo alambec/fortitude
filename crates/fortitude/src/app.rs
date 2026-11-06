@@ -226,6 +226,9 @@ mod tests {
         };
         let report = &state["last"];
         assert_eq!(report["remove_orphans"], false);
+        // Checksums are verified when configured, or asked for.
+        assert_eq!(report["verify_checksums"], false);
+        assert_eq!(report["checksums_verified"], 0);
         assert_eq!(
             (&report["files"], &report["instances"]),
             (&1.into(), &1.into())
@@ -244,6 +247,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let report: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(report["study_uid"], "1.2");
+        // Unless asked not to.
+        assert_eq!(
+            (&report["verify_checksums"], &report["checksums_verified"]),
+            (&true.into(), &1.into())
+        );
+        let (_, body) = h.send(check("study=1.2&verify_checksums=false")).await;
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["checksums_verified"], 0);
         assert_eq!(
             (&report["files"], &report["missing"]),
             (&1.into(), &0.into())

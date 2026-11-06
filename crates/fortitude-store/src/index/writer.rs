@@ -305,6 +305,7 @@ impl Statements {
                     "frames",
                     "path",
                     "size",
+                    "crc32",
                     "pixel",
                     "attrs",
                     "metadata",
@@ -416,6 +417,7 @@ fn insert(
         Value::Integer(i64::from(record.frames)),
         Value::Text(record.path.clone()),
         Value::Integer(record.size as i64),
+        Value::Integer(i64::from(record.crc32)),
         record
             .pixel
             .as_ref()

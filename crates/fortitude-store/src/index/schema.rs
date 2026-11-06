@@ -9,26 +9,17 @@
 //! PostgreSQL text columns use the "C" collation: comparisons are bytewise as in SQLite, and
 //! their indexes serve `LIKE` prefix patterns.
 //!
-//! Versions: 1 is the initial schema; 2 indexes `instances.path`, for the integrity check
-//! (which compares the files of the storage against the index, one key prefix at a time);
-//! 3 indexes `studies.created_at`, for retention (which looks for studies ingested before a
-//! date).
+//! The schema has a version, recorded in the database. Fortitude is not deployed yet, so the
+//! schema changes in place: an index of another version is refused, and must be re-created.
+//! Once it is deployed, each change will bump the version and add an upgrade.
 
 use fortitude_core::attrs::{self, Kind, Level};
 
 use super::IndexError;
 use super::db::{Connection, Dialect};
 
-const VERSION: i64 = 3;
-
-/// Upgrades from version 1, 2, …: `UPGRADES[n - 1]` turns version `n` into `n + 1`.
-///
-/// The integrity check reads `path` and `size` by ranges of `path`: with `size` in the index,
-/// it reads the index alone, not one (wide) row per instance.
-const UPGRADES: [&str; VERSION as usize - 1] = [
-    "CREATE INDEX instances_path ON instances(path, size);",
-    "CREATE INDEX studies_created_at ON studies(created_at, pk);",
-];
+/// Versions 1 to 3 were development versions, without checksums.
+const VERSION: i64 = 4;
 
 /// Per-connection SQLite settings.
 pub fn configure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -81,15 +72,8 @@ fn finish(
     let result = match version {
         VERSION => Ok(()),
         0 => conn.batch(&ddl(dialect)).and_then(|()| record(conn)),
-        1..VERSION => {
-            tracing::info!("upgrading the index schema from version {version} to {VERSION}");
-            UPGRADES[version as usize - 1..]
-                .iter()
-                .try_for_each(|upgrade| conn.batch(upgrade))
-                .and_then(|()| record(conn))
-        }
         _ => Err(IndexError::Database(format!(
-            "unsupported index schema version {version}"
+            "unsupported index schema version {version} (expected {VERSION}): re-create the index"
         ))),
     };
     match result {
@@ -184,6 +168,7 @@ fn ddl(dialect: Dialect) -> String {
             frames {int} NOT NULL,
             path {text} NOT NULL,
             size {int} NOT NULL,
+            crc32 {int} NOT NULL,
             pixel {blob},
             attrs {blob} NOT NULL,
             metadata {blob} NOT NULL,
@@ -192,12 +177,12 @@ fn ddl(dialect: Dialect) -> String {
         CREATE INDEX series_study ON series(study_pk, series_number);
         CREATE INDEX instances_series ON instances(series_pk, instance_number);
         CREATE INDEX instances_study ON instances(study_pk);
-        {upgrades}
+        CREATE INDEX instances_path ON instances(path, size, crc32);
+        CREATE INDEX studies_created_at ON studies(created_at, pk);
         {study_indexes}{series_indexes}{instance_indexes}",
         study = column_defs(Level::Study),
         series = column_defs(Level::Series),
         instance = column_defs(Level::Instance),
-        upgrades = UPGRADES.concat(),
         study_indexes = indexes(Level::Study),
         series_indexes = indexes(Level::Series),
         instance_indexes = indexes(Level::Instance),
@@ -212,7 +197,6 @@ fn is_own_uid(column: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::Value;
 
     #[test]
     fn schema_applies_and_is_idempotent() {
@@ -233,33 +217,11 @@ mod tests {
     }
 
     #[test]
-    fn older_versions_are_upgraded() {
-        let indexed = |conn: &mut Connection, name: &str| {
-            conn.query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-                &[Value::Text(name.to_owned())],
-                |_| Ok(()),
-            )
-            .unwrap()
-            .is_some()
-        };
-        for (version, downgrade) in [
-            (
-                1,
-                "DROP INDEX instances_path; DROP INDEX studies_created_at;",
-            ),
-            (2, "DROP INDEX studies_created_at;"),
-        ] {
-            let mut conn = Connection::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
-            migrate(&mut conn).unwrap();
-            conn.batch(&format!("{downgrade} PRAGMA user_version = {version};"))
-                .unwrap();
-            assert!(!indexed(&mut conn, "studies_created_at"));
-            migrate(&mut conn).unwrap();
-            let current = conn.query_row("PRAGMA user_version", &[], |r| r.i64(0));
-            assert_eq!(current.unwrap(), Some(VERSION));
-            assert!(indexed(&mut conn, "instances_path"));
-            assert!(indexed(&mut conn, "studies_created_at"));
-        }
+    fn other_versions_are_refused() {
+        let mut conn = Connection::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        migrate(&mut conn).unwrap();
+        conn.batch("PRAGMA user_version = 3").unwrap();
+        let error = migrate(&mut conn).unwrap_err().to_string();
+        assert!(error.contains("re-create the index"), "{error}");
     }
 }

@@ -345,6 +345,9 @@ pub struct IntegrityConfig {
     pub orphan_grace_minutes: u64,
     /// Remove orphan files; `false`: only count them.
     pub remove_orphans: bool,
+    /// Read every file and compare its checksum with the one recorded at ingest, to find
+    /// files corrupted with their size intact. This reads the whole storage.
+    pub verify_checksums: bool,
 }
 
 impl Default for IntegrityConfig {
@@ -353,6 +356,7 @@ impl Default for IntegrityConfig {
             interval_hours: 24,
             orphan_grace_minutes: 60,
             remove_orphans: true,
+            verify_checksums: false,
         }
     }
 }
@@ -463,6 +467,7 @@ mod tests {
             assert_eq!(defaults.interval_hours, 24);
             assert_eq!(defaults.orphan_grace_minutes, 60);
             assert!(defaults.remove_orphans);
+            assert!(!defaults.verify_checksums);
 
             jail.create_file(
                 "fortitude.toml",
@@ -470,12 +475,14 @@ mod tests {
                 [integrity]
                 interval_hours = 0
                 remove_orphans = false
+                verify_checksums = true
                 "#,
             )?;
             jail.set_env("FORTITUDE_INTEGRITY__ORPHAN_GRACE_MINUTES", "1");
             let config = Config::load(Some(Path::new("fortitude.toml"))).map_err(|e| *e)?;
             assert_eq!(config.integrity.interval_hours, 0);
             assert!(!config.integrity.remove_orphans);
+            assert!(config.integrity.verify_checksums);
             assert_eq!(config.integrity.orphan_grace_minutes, 1);
             assert_eq!(config.retention.max_age_days, 0);
             jail.set_env("FORTITUDE_RETENTION__MAX_AGE_DAYS", "3650");

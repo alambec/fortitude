@@ -128,6 +128,7 @@ impl Clean for Arc<Store> {
         let options = fortitude_store::integrity::IntegrityOptions {
             remove_orphans: false,
             orphan_grace: Duration::ZERO,
+            verify_checksums: true,
         };
         let report = self.check_integrity(options).await;
         report.is_clean() && report.orphans == 0

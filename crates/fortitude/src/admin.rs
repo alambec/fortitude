@@ -48,14 +48,17 @@ async fn integrity_state(State(admin): State<Admin>) -> Response {
 struct StartParams {
     /// Overrides `integrity.remove_orphans` (`false` for a dry run).
     remove_orphans: Option<bool>,
+    /// Overrides `integrity.verify_checksums`; checks of a study or series verify them unless
+    /// `false`.
+    verify_checksums: Option<bool>,
     /// Check only this study, or this series of it.
     study: Option<String>,
     series: Option<String>,
 }
 
 /// Start a full check in the background: `202 Accepted`, or `409 Conflict` when one is
-/// running. With `study` (and `series`), check them now and answer with the report: `404`
-/// when they are not stored.
+/// running. With `study` (and `series`), check them now, checksums included, and answer with
+/// the report: `404` when they are not stored.
 async fn start_integrity(
     State(admin): State<Admin>,
     Query(params): Query<StartParams>,
@@ -66,7 +69,12 @@ async fn start_integrity(
                 Some(series) => Scope::series(&study, series),
                 None => Scope::study(&study),
             };
-            return match admin.store.check_scope_integrity(scope).await {
+            let verify_checksums = params.verify_checksums.unwrap_or(true);
+            return match admin
+                .store
+                .check_scope_integrity(scope, verify_checksums)
+                .await
+            {
                 Ok(Some(report)) => Json(report).into_response(),
                 Ok(None) => StatusCode::NOT_FOUND.into_response(),
                 Err(e) => {
@@ -80,7 +88,10 @@ async fn start_integrity(
         }
         (None, None) => {}
     }
-    let status = if admin.integrity.start(params.remove_orphans) {
+    let status = if admin
+        .integrity
+        .start(params.remove_orphans, params.verify_checksums)
+    {
         StatusCode::ACCEPTED
     } else {
         StatusCode::CONFLICT

@@ -327,6 +327,39 @@ impl FileStore {
         }
     }
 
+    /// CRC-32 of a file, read in chunks; fails with [`io::ErrorKind::NotFound`] when it does not
+    /// exist.
+    pub async fn crc32(&self, key: &str) -> io::Result<u32> {
+        match &*self.backend {
+            Backend::Local { root, .. } => {
+                let path = root.join(key);
+                blocking(move || {
+                    use std::io::Read;
+                    let mut file = File::open(path)?;
+                    let mut hasher = crc32fast::Hasher::new();
+                    let mut buffer = vec![0; STREAM_CHUNK];
+                    loop {
+                        match file.read(&mut buffer) {
+                            Ok(0) => return Ok(hasher.finalize()),
+                            Ok(read) => hasher.update(&buffer[..read]),
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                })
+                .await
+            }
+            Backend::S3 { .. } => {
+                let mut chunks = self.stream(key).await?;
+                let mut hasher = crc32fast::Hasher::new();
+                while let Some(chunk) = chunks.try_next().await? {
+                    hasher.update(&chunk);
+                }
+                Ok(hasher.finalize())
+            }
+        }
+    }
+
     /// Parts of a file, each the concatenation of byte ranges (e.g. frames, made of fragments).
     pub async fn read_parts(&self, key: &str, parts: Vec<Vec<Range>>) -> io::Result<Vec<Vec<u8>>> {
         match &*self.backend {

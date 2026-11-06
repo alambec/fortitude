@@ -59,12 +59,16 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
    embedded in the binary, over QIDO-RS, WADO-RS, STOW-RS and WADO-URI only (plus a dictionary lookup
    for tag and SOP class names, and the ZIP archives). *(done)*
 10. **Integrity** — periodic and on-demand check of the files against the index, one key
-    prefix at a time (index on `instances(path, size)`, schema version 2): orphan files left by
+    prefix at a time (index on `instances(path, size, crc32)`): orphan files left by
     crashes or failed removals are removed after a grace period; missing and truncated files
     are reported with their UIDs, never deleted automatically. *(done)*
 11. **Retention** — `retention.max_age_days`: whole studies are deleted once all their
-    series were stored longer ago (index on `studies.created_at`, schema version 3), with
+    series were stored longer ago (index on `studies.created_at`), with
     the decision checked again in the deleting transaction; dry runs list them first.
+    *(done)*
+12. **Checksums** — CRC-32 of every file recorded at ingest (`instances.crc32`); the
+    integrity check verifies them on request (`integrity.verify_checksums`, and by default
+    when checking one study or series) to find files corrupted with their size intact.
     *(done)*
 
 ## Next
@@ -72,7 +76,6 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 - **12-bit JPEG Extended** decoding (jpeg-decoder supports 8-bit DCT only), and a faster
   JPEG 2000 decoder.
 - **DIMSE**: C-GET, storage commitment, TLS.
-- **Integrity**: checksums recorded at ingest, to detect corrupted files of the right size.
 
 ## Benchmarks
 

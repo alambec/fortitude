@@ -34,9 +34,11 @@ pub struct InstanceRecord {
     pub transfer_syntax: String,
     pub frames: u32,
     pub pixel: Option<PixelLayout>,
-    /// File location relative to the storage root, and size.
+    /// File location relative to the storage root, size, and CRC-32 (that of ZIP and PNG)
+    /// of the whole file.
     pub path: String,
     pub size: u64,
+    pub crc32: u32,
 }
 
 impl InstanceRecord {
@@ -169,6 +171,7 @@ fn build(
         pixel,
         path: String::new(),
         size: bytes.len() as u64,
+        crc32: crc32fast::hash(bytes),
         study_uid,
         series_uid,
         sop_uid,

@@ -34,10 +34,10 @@ impl Checker {
         self.job.state()
     }
 
-    /// Start a check in the background, unless one is running; `remove_orphans` overrides the
-    /// configuration. Returns whether it started.
-    pub fn start(&self, remove_orphans: Option<bool>) -> bool {
-        self.job.start(self.check(remove_orphans))
+    /// Start a check in the background, unless one is running; `remove_orphans` and
+    /// `verify_checksums` override the configuration. Returns whether it started.
+    pub fn start(&self, remove_orphans: Option<bool>, verify_checksums: Option<bool>) -> bool {
+        self.job.start(self.check(remove_orphans, verify_checksums))
     }
 
     /// Check every `interval_hours`, the first time one interval after the start, until
@@ -45,17 +45,22 @@ impl Checker {
     pub async fn run_periodically(self: Arc<Self>, shutdown: CancellationToken) {
         if let Some(interval) = jobs::hours(self.config.interval_hours) {
             let job = self.job.clone();
-            job.run_periodically(interval, shutdown, || self.check(None))
+            job.run_periodically(interval, shutdown, || self.check(None, None))
                 .await;
         }
     }
 
-    fn check(&self, remove_orphans: Option<bool>) -> impl Future<Output = IntegrityReport> + use<> {
+    fn check(
+        &self,
+        remove_orphans: Option<bool>,
+        verify_checksums: Option<bool>,
+    ) -> impl Future<Output = IntegrityReport> + use<> {
         let store = self.store.clone();
         let options = IntegrityOptions {
             remove_orphans: remove_orphans.unwrap_or(self.config.remove_orphans),
             orphan_grace: Duration::from_secs(self.config.orphan_grace_minutes.saturating_mul(60))
                 .max(MIN_ORPHAN_GRACE),
+            verify_checksums: verify_checksums.unwrap_or(self.config.verify_checksums),
         };
         async move { store.check_integrity(options).await }
     }

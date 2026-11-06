@@ -1212,6 +1212,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "charls",
+ "crc32fast",
  "dicom-core",
  "dicom-dictionary-std",
  "dicom-encoding",
