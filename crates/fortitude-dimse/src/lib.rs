@@ -5,6 +5,9 @@
 //! search as QIDO-RS. C-MOVE and C-GET send the stored files as they are (to the move
 //! destination, or back on the requestor's association), unless the receiver only accepts
 //! another transfer syntax.
+//!
+//! As an SCU ([`remote`]), Fortitude verifies, queries and retrieves from the known peers
+//! (C-ECHO, C-FIND, C-MOVE).
 
 pub mod association;
 pub mod command;
@@ -12,6 +15,7 @@ mod echo;
 mod find;
 pub mod part10;
 mod pdata;
+pub mod remote;
 mod retrieve;
 pub mod scu;
 mod sop_classes;
@@ -21,7 +25,7 @@ mod tests;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use dicom_dictionary_std::uids;
@@ -34,13 +38,45 @@ use crate::command::{field, status};
 
 pub use crate::part10::IMPLEMENTATION_CLASS_UID;
 
-/// A remote application entity: a C-MOVE destination, and when
-/// [`Config::allow_unknown_peers`] is off, one of the only peers allowed to associate.
+/// A remote application entity: a C-MOVE destination, a node to verify, query and retrieve
+/// from, and when [`Config::allow_unknown_peers`] is off, one of the only peers allowed to
+/// associate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
     pub ae_title: String,
     pub host: String,
     pub port: u16,
+}
+
+/// The known peers, shared by every association and replaceable at runtime (when
+/// modalities are registered or removed). Clones share the same list.
+#[derive(Debug, Clone, Default)]
+pub struct Peers(Arc<RwLock<Arc<Vec<Peer>>>>);
+
+impl Peers {
+    pub fn new(peers: Vec<Peer>) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(peers))))
+    }
+
+    /// The peer with this AE title; the first one when several have it.
+    pub fn get(&self, ae_title: &str) -> Option<Peer> {
+        self.all().iter().find(|p| p.ae_title == ae_title).cloned()
+    }
+
+    pub fn all(&self) -> Arc<Vec<Peer>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the list, for the associations negotiated and requests received from now on.
+    pub fn set(&self, peers: Vec<Peer>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(peers);
+    }
+}
+
+impl From<Vec<Peer>> for Peers {
+    fn from(peers: Vec<Peer>) -> Self {
+        Self::new(peers)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,14 +86,17 @@ pub struct Config {
     pub check_called_ae_title: bool,
     /// Accept associations from AE titles that are not in [`peers`](Self::peers).
     pub allow_unknown_peers: bool,
-    pub peers: Vec<Peer>,
+    pub peers: Peers,
     /// Concurrent associations; more are rejected (transient, local limit exceeded).
     pub max_associations: usize,
     /// Largest PDU this node accepts.
     pub max_pdu_length: u32,
     /// Time allowed for each read or write on an association, and to connect to a C-MOVE
-    /// destination.
+    /// destination or a peer queried as an SCU.
     pub timeout: Duration,
+    /// Time allowed between two responses to a C-MOVE request sent as an SCU (the peer may
+    /// take long to find and send each instance).
+    pub retrieve_timeout: Duration,
     /// Maximum number of C-FIND matches (0 for no limit); beyond it, the query fails with
     /// status A700 after the first matches.
     pub max_find_results: usize,
@@ -73,10 +112,11 @@ impl Default for Config {
             ae_title: "FORTITUDE".to_owned(),
             check_called_ae_title: false,
             allow_unknown_peers: true,
-            peers: Vec::new(),
+            peers: Peers::default(),
             max_associations: 64,
             max_pdu_length: 256 * 1024,
             timeout: Duration::from_secs(30),
+            retrieve_timeout: Duration::from_secs(600),
             max_find_results: 10_000,
             max_instance_size: 4096 << 20,
             extra_sop_classes: Vec::new(),
@@ -85,8 +125,8 @@ impl Default for Config {
 }
 
 impl Config {
-    fn peer(&self, ae_title: &str) -> Option<&Peer> {
-        self.peers.iter().find(|p| p.ae_title == ae_title)
+    fn peer(&self, ae_title: &str) -> Option<Peer> {
+        self.peers.get(ae_title)
     }
 }
 

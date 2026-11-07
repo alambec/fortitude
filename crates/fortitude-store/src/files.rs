@@ -215,7 +215,8 @@ impl FileStore {
                     .delete_stream(futures::stream::iter(locations).boxed())
                     .filter_map(|deleted| async move {
                         match deleted {
-                            Err(object_store::Error::NotFound { .. }) | Ok(_) => None,
+                            Err(e) if is_missing(&e) => None,
+                            Ok(_) => None,
                             Err(e) => Some(io_error(e)),
                         }
                     })
@@ -464,6 +465,20 @@ fn location(prefix: &str, key: &str) -> object_store::path::Path {
     }
 }
 
+/// Whether a removal failed only because the object was already gone. AWS reports keys
+/// missing from a DeleteObjects request as deleted, but some compatible services (e.g.
+/// versitygw) report them as per-key `NoSuchKey` errors, which `object_store` only passes
+/// on as generic errors.
+fn is_missing(e: &object_store::Error) -> bool {
+    match e {
+        object_store::Error::NotFound { .. } => true,
+        object_store::Error::Generic { source, .. } => {
+            source.to_string().contains("(code: NoSuchKey)")
+        }
+        _ => false,
+    }
+}
+
 fn io_error(e: object_store::Error) -> io::Error {
     match e {
         object_store::Error::NotFound { .. } => io::Error::new(io::ErrorKind::NotFound, e),
@@ -517,4 +532,28 @@ fn list_dir(root: &Path, dir: &Path, files: &mut Vec<StoredFile>) -> io::Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod missing_tests {
+    use super::*;
+
+    #[test]
+    fn keys_already_deleted_are_missing() {
+        let generic = |message: &str| object_store::Error::Generic {
+            store: "S3",
+            source: message.to_owned().into(),
+        };
+        assert!(is_missing(&generic(
+            "DeleteObjects request failed for key a/b/c.dcm: The specified key does not exist. \
+             (code: NoSuchKey)"
+        )));
+        assert!(!is_missing(&generic(
+            "DeleteObjects request failed for key a/b/c.dcm: Access Denied (code: AccessDenied)"
+        )));
+        assert!(is_missing(&object_store::Error::NotFound {
+            path: "a/b/c.dcm".into(),
+            source: "gone".into(),
+        }));
+    }
 }

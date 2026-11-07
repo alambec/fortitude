@@ -6,6 +6,7 @@ mod config;
 mod integrity;
 mod jobs;
 mod metrics;
+mod modalities;
 mod retention;
 mod ui;
 
@@ -99,6 +100,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .map_err(anyhow::Error::msg)
         .context("invalid DIMSE configuration")?;
+    let dimse = Arc::new(dimse);
+    let modalities = modalities::Modalities::new(store.clone(), dimse.clone(), &config.dimse);
+    modalities
+        .load()
+        .await
+        .context("cannot read the registered modalities")?;
     let integrity = integrity::Checker::new(store.clone(), config.integrity.clone());
     let retention = retention::Retention::new(store.clone(), config.retention.clone());
     let app = app::build(
@@ -106,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         store.clone(),
         integrity.clone(),
         retention.clone(),
+        modalities,
         metrics_handle,
     );
     let shutdown = CancellationToken::new();
@@ -130,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(listen = %address, ae_title = dimse.ae_title, "DIMSE service started");
             let dimse = fortitude_dimse::Dimse {
                 store,
-                config: Arc::new(dimse),
+                config: dimse,
             };
             Some(tokio::spawn(fortitude_dimse::serve(
                 listener,

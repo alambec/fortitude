@@ -159,6 +159,20 @@ impl Index {
         response.await.map_err(|_| IndexError::WriterStopped)?
     }
 
+    /// Run `write` in a transaction of the writer (its own savepoint: rolled back on error);
+    /// returns what it returned, usually the number of rows changed.
+    pub async fn write(
+        &self,
+        write: impl FnOnce(&mut Connection) -> Result<u64, IndexError> + Send + 'static,
+    ) -> Result<u64, IndexError> {
+        let (reply, response) = oneshot::channel();
+        self.writer
+            .send(Command::Write(Box::new(write), reply))
+            .await
+            .map_err(|_| IndexError::WriterStopped)?;
+        response.await.map_err(|_| IndexError::WriterStopped)?
+    }
+
     pub async fn instance_exists(&self, sop_uid: &str) -> Result<bool, IndexError> {
         let sop_uid = Value::Text(sop_uid.to_owned());
         self.readers

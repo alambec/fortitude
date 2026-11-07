@@ -18,8 +18,9 @@ use fortitude_core::attrs::{self, Kind, Level};
 use super::IndexError;
 use super::db::{Connection, Dialect};
 
-/// Versions 1 to 3 were development versions, without checksums.
-const VERSION: i64 = 4;
+/// Versions 1 to 3 were development versions, without checksums; version 4 had no
+/// `modalities` table, which the upgrade to 5 adds.
+const VERSION: i64 = 5;
 
 /// Per-connection SQLite settings.
 pub fn configure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -71,7 +72,13 @@ fn finish(
 ) -> Result<(), IndexError> {
     let result = match version {
         VERSION => Ok(()),
-        0 => conn.batch(&ddl(dialect)).and_then(|()| record(conn)),
+        0 => conn
+            .batch(&ddl(dialect))
+            .and_then(|()| conn.batch(&modalities_ddl(dialect)))
+            .and_then(|()| record(conn)),
+        4 => conn
+            .batch(&modalities_ddl(dialect))
+            .and_then(|()| record(conn)),
         _ => Err(IndexError::Database(format!(
             "unsupported index schema version {version} (expected {VERSION}): re-create the index"
         ))),
@@ -189,6 +196,23 @@ fn ddl(dialect: Dialect) -> String {
     )
 }
 
+/// Remote application entities registered at runtime (see [`crate::modalities`]).
+fn modalities_ddl(dialect: Dialect) -> String {
+    let (int, text) = match dialect {
+        Dialect::Sqlite => ("INTEGER", "TEXT"),
+        Dialect::Postgres => ("BIGINT", "TEXT COLLATE \"C\""),
+    };
+    format!(
+        "CREATE TABLE modalities (
+            ae_title {text} PRIMARY KEY,
+            host {text} NOT NULL,
+            port {int} NOT NULL,
+            description {text} NOT NULL DEFAULT '',
+            created_at {int} NOT NULL
+        );"
+    )
+}
+
 /// The UID identifying rows of a table (`study_uid`, `series_uid`, `sop_uid`).
 fn is_own_uid(column: &str) -> bool {
     matches!(column, "study_uid" | "series_uid" | "sop_uid")
@@ -214,6 +238,19 @@ mod tests {
         assert!(count > 20, "{count} indexes");
         assert_eq!(columns(Level::Study)[0], "study_uid");
         assert!(columns(Level::Study).contains(&"patient_name_key".to_owned()));
+    }
+
+    #[test]
+    fn version_4_is_upgraded() {
+        let mut conn = Connection::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        migrate(&mut conn).unwrap();
+        conn.batch("DROP TABLE modalities; PRAGMA user_version = 4")
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        let version = conn.query_row("PRAGMA user_version", &[], |r| r.i64(0));
+        assert_eq!(version.unwrap(), Some(VERSION));
+        let count = conn.query_row("SELECT count(*) FROM modalities", &[], |r| r.i64(0));
+        assert_eq!(count.unwrap(), Some(0));
     }
 
     #[test]

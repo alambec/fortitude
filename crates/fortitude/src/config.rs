@@ -212,8 +212,9 @@ impl Default for DicomWebConfig {
     }
 }
 
-/// DIMSE service (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET as an SCP). It has no authentication
-/// beyond AE titles: restrict access to it at the network level.
+/// DIMSE service (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET as an SCP), and the peers Fortitude
+/// verifies, queries and retrieves from (C-ECHO, C-FIND, C-MOVE as an SCU). The SCP has no
+/// authentication beyond AE titles: restrict access to it at the network level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DimseConfig {
@@ -228,14 +229,17 @@ pub struct DimseConfig {
     pub max_associations: usize,
     /// Largest PDU accepted, in bytes.
     pub max_pdu_length: u32,
-    /// Time allowed for each network read or write, and to connect to a C-MOVE destination.
+    /// Time allowed for each network read or write, and to connect to a peer.
     pub timeout_secs: u64,
+    /// Time allowed between two responses of a peer to a C-MOVE request sent by Fortitude.
+    pub retrieve_timeout_secs: u64,
     /// Maximum number of C-FIND matches (0 for no limit).
     pub max_find_results: usize,
     /// Storage SOP classes accepted besides the standard ones (e.g. private classes).
     pub extra_sop_classes: Vec<String>,
-    /// Known application entities: C-MOVE destinations, and the only peers allowed to
-    /// associate when `allow_unknown_peers` is off.
+    /// Known application entities: C-MOVE destinations, modalities to query and retrieve
+    /// from, and the only peers allowed to associate when `allow_unknown_peers` is off.
+    /// Others can be registered at runtime (`/admin/modalities`).
     pub peers: Vec<Peer>,
 }
 
@@ -250,6 +254,7 @@ impl Default for DimseConfig {
             max_associations: defaults.max_associations,
             max_pdu_length: defaults.max_pdu_length,
             timeout_secs: defaults.timeout.as_secs(),
+            retrieve_timeout_secs: defaults.retrieve_timeout.as_secs(),
             max_find_results: defaults.max_find_results,
             extra_sop_classes: defaults.extra_sop_classes,
             peers: Vec::new(),
@@ -263,19 +268,26 @@ pub struct Peer {
     pub ae_title: String,
     pub host: String,
     pub port: u16,
+    /// Free text shown in the web explorer.
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Whether `ae` is a valid AE title: 1 to 16 printable ASCII characters, not all spaces,
+/// without backslash.
+pub fn valid_ae_title(ae: &str) -> bool {
+    !ae.trim().is_empty()
+        && ae.len() <= 16
+        && ae.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+        && !ae.contains('\\')
 }
 
 impl DimseConfig {
-    /// Service configuration; `max_instance_size` bounds received data sets.
+    /// Service configuration; `max_instance_size` bounds received data sets. Its peers are
+    /// those of the file; the modalities registered at runtime are added to them.
     pub fn service(&self, max_instance_size: usize) -> Result<fortitude_dimse::Config, String> {
-        let valid_ae = |ae: &str| {
-            !ae.trim().is_empty()
-                && ae.len() <= 16
-                && ae.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
-                && !ae.contains('\\')
-        };
         for ae in std::iter::once(&self.ae_title).chain(self.peers.iter().map(|p| &p.ae_title)) {
-            if !valid_ae(ae) {
+            if !valid_ae_title(ae) {
                 return Err(format!(
                     "invalid AE title {ae:?} (1 to 16 ASCII characters)"
                 ));
@@ -293,10 +305,12 @@ impl DimseConfig {
                     host: p.host.clone(),
                     port: p.port,
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             max_associations: self.max_associations.max(1),
             max_pdu_length: self.max_pdu_length,
             timeout: std::time::Duration::from_secs(self.timeout_secs.max(1)),
+            retrieve_timeout: std::time::Duration::from_secs(self.retrieve_timeout_secs.max(1)),
             max_find_results: self.max_find_results,
             max_instance_size,
             extra_sop_classes: self.extra_sop_classes.clone(),
@@ -534,7 +548,8 @@ mod tests {
             assert_eq!(config.dimse.listen, Some("0.0.0.0:4242".parse().unwrap()));
             let service = config.dimse.service(1 << 20).unwrap();
             assert_eq!(service.ae_title, "FORTITUDE");
-            assert_eq!(service.peers[0].port, 104);
+            assert_eq!(service.peers.all()[0].port, 104);
+            assert_eq!(service.retrieve_timeout.as_secs(), 600);
 
             let mut invalid = config.dimse.clone();
             invalid.ae_title = "A_VERY_LONG_AE_TITLE".into();

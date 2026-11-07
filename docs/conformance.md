@@ -273,7 +273,9 @@ There is no per-study access control. TLS is expected to be terminated by a reve
 ## DIMSE
 
 Fortitude is a DIMSE service class provider when `dimse.listen` is set (disabled by default).
-It initiates associations only for C-MOVE sub-operations.
+It initiates associations for C-MOVE sub-operations, and as a service class user of its
+peers, on request through the [administration API](#scu) (whether or not `dimse.listen` is
+set).
 
 | | |
 |---|---|
@@ -284,7 +286,7 @@ It initiates associations only for C-MOVE sub-operations.
 | Concurrent associations | `dimse.max_associations` (default 64); more are rejected (transient, local limit exceeded) |
 | Asynchronous operations, extended negotiation | Not supported (not negotiated) |
 | SCP/SCU role selection | Accepted as proposed for storage SOP classes (the requestor may take the SCP role, to receive C-GET sub-operations); for other SOP classes, the SCP role of the requestor is refused |
-| Timeouts | `dimse.timeout_secs` (default 30) for each network read or write, and to connect to a move destination |
+| Timeouts | `dimse.timeout_secs` (default 30) for each network read or write, and to connect to a peer; `dimse.retrieve_timeout_secs` (default 600) between two responses to a C-MOVE Fortitude requested |
 
 ### SOP classes (SCP)
 
@@ -399,3 +401,32 @@ Failures carry an Error Comment (0000,0902). A data set larger than
 | `B000` | Some sub-operations failed or completed with a warning; Failed SOP Instance UID List is returned. |
 | `FE00` | Cancelled. |
 | `A900` | Invalid identifier. |
+
+### SCU
+
+Fortitude verifies, queries and retrieves from its peers on request (`/admin/modalities`, see
+the [README](../README.md#modalities)): those of `dimse.peers` and those registered at runtime.
+Each request opens an association of its own, with `dimse.ae_title` as calling AE title and
+`dimse.max_pdu_length` as maximum PDU length, proposing Explicit and Implicit VR Little
+Endian.
+
+| SOP class | UID | Used for |
+|---|---|---|
+| Verification | `1.2.840.10008.1.1` | C-ECHO |
+| Study Root Query/Retrieve – FIND | `1.2.840.10008.5.1.4.1.2.2.1` | C-FIND at the `STUDY`, `SERIES` and `IMAGE` levels |
+| Patient Root Query/Retrieve – FIND | `1.2.840.10008.5.1.4.1.2.1.1` | C-FIND at the `PATIENT` level, and at the others when the peer refuses Study Root |
+| Study Root Query/Retrieve – MOVE | `1.2.840.10008.5.1.4.1.2.2.2` | C-MOVE at the `STUDY`, `SERIES` and `IMAGE` levels |
+| Patient Root Query/Retrieve – MOVE | `1.2.840.10008.5.1.4.1.2.1.2` | C-MOVE at the `PATIENT` level, and at the others when the peer refuses Study Root |
+
+- **C-FIND.** The identifier holds the matching keys given, and the usual return keys of the
+  level (empty). Values are sent as given (wildcards, ranges); Specific Character Set
+  `ISO_IR 192` is added when a value is not ASCII. Responses are decoded with their own
+  Specific Character Set. Beyond the requested number of matches, a C-CANCEL is sent; a
+  final `A700` after some matches is reported as a truncated result.
+- **C-MOVE.** The identifier holds the unique keys given; the key of the level is required.
+  The Move Destination is `dimse.ae_title` by default (the peer must know Fortitude's
+  address, and `dimse.listen` must be set), or another AE title the peer knows. Pending
+  responses update the progress of the retrieval; cancelling it sends a C-CANCEL with the
+  next one. Final statuses `0000`, `B000` and `FE00` end it as succeeded, partial or
+  cancelled; any other fails it.
+- C-STORE requests received on these associations are refused (`A700`).

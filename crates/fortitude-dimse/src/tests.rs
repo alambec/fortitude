@@ -436,7 +436,7 @@ fn peer(ae_title: &str, port: u16) -> Peer {
 #[tokio::test]
 async fn move_sends_stored_files() {
     let (port, received) = destination(&[EXPLICIT_VR_LE, IMPLICIT_VR_LE, JPEG_BASELINE]).await;
-    let h = harness(|c| c.peers = vec![peer("DEST", port)]).await;
+    let h = harness(|c| c.peers = vec![peer("DEST", port)].into()).await;
     let instances = stored(&h).await;
     let mut scu = Client::connect(h.address, ALL_MODELS).await;
 
@@ -473,7 +473,7 @@ async fn move_sends_stored_files() {
 #[tokio::test]
 async fn move_transcodes_when_needed() {
     let (port, received) = destination(&[IMPLICIT_VR_LE]).await;
-    let h = harness(|c| c.peers = vec![peer("DEST", port)]).await;
+    let h = harness(|c| c.peers = vec![peer("DEST", port)].into()).await;
     stored(&h).await;
     let mut scu = Client::connect(h.address, ALL_MODELS).await;
     let responses = scu
@@ -498,7 +498,7 @@ async fn move_transcodes_when_needed() {
 
 #[tokio::test]
 async fn move_failures() {
-    let h = harness(|c| c.peers = vec![peer("OFFLINE", 1)]).await;
+    let h = harness(|c| c.peers = vec![peer("OFFLINE", 1)].into()).await;
     stored(&h).await;
     let mut scu = Client::connect(h.address, ALL_MODELS).await;
     let study = || identifier("STUDY", &[(tags::STUDY_INSTANCE_UID, VR::UI, "1.2.1")]);
@@ -537,11 +537,121 @@ async fn move_failures() {
 }
 
 #[tokio::test]
+async fn remote_echo_find_and_move() {
+    use crate::remote::{self, Level, RemoteError, key};
+
+    let (port, received) = destination(&[EXPLICIT_VR_LE, IMPLICIT_VR_LE, JPEG_BASELINE]).await;
+    let h = harness(|c| c.peers = vec![peer("DEST", port)].into()).await;
+    stored(&h).await;
+    let config = Config {
+        ae_title: "LOCAL".into(),
+        timeout: TIMEOUT,
+        ..Config::default()
+    };
+    let remote = peer("FORTITUDE", h.address.port());
+    remote::echo(&config, &remote).await.unwrap();
+    let offline = remote::echo(&config, &peer("OFFLINE", 1))
+        .await
+        .unwrap_err();
+    assert!(matches!(offline, RemoteError::Unreachable(_)), "{offline}");
+    assert!(offline.to_string().contains("127.0.0.1:1"), "{offline}");
+
+    let query = |keys: &[(dicom_core::Tag, &str)]| {
+        InMemDicomObject::from_element_iter(
+            keys.iter().map(|(tag, value)| key(*tag, value).unwrap()),
+        )
+    };
+    let studies = query(&[
+        (tags::PATIENT_ID, "PAT-1"),
+        (tags::STUDY_INSTANCE_UID, ""),
+        (tags::STUDY_DATE, ""),
+        (tags::MODALITIES_IN_STUDY, ""),
+    ]);
+    let found = remote::find(&config, &remote, Level::Study, studies.clone(), 0)
+        .await
+        .unwrap();
+    assert!(!found.truncated);
+    let mut uids: Vec<_> = found
+        .matches
+        .iter()
+        .map(|m| text(m, tags::STUDY_INSTANCE_UID))
+        .collect();
+    uids.sort();
+    assert_eq!(uids, ["1.2.1", "1.2.2"]);
+    assert!(found.matches[0].get(tags::QUERY_RETRIEVE_LEVEL).is_none());
+    // Beyond the limit, the query is cancelled.
+    let found = remote::find(&config, &remote, Level::Study, studies, 1)
+        .await
+        .unwrap();
+    assert_eq!((found.matches.len(), found.truncated), (1, true));
+    let series = query(&[
+        (tags::STUDY_INSTANCE_UID, "1.2.2"),
+        (tags::SERIES_INSTANCE_UID, ""),
+        (tags::MODALITY, ""),
+    ]);
+    let found = remote::find(&config, &remote, Level::Series, series, 0)
+        .await
+        .unwrap();
+    assert_eq!(found.matches.len(), 1);
+    assert_eq!(text(&found.matches[0], tags::MODALITY), "MR");
+    let patients = query(&[(tags::PATIENT_ID, ""), (tags::PATIENT_NAME, "")]);
+    let found = remote::find(&config, &remote, Level::Patient, patients, 0)
+        .await
+        .unwrap();
+    assert_eq!(found.matches.len(), 1);
+
+    // Retrieval, with progress.
+    let study = || query(&[(tags::STUDY_INSTANCE_UID, "1.2.1")]);
+    let mut updates = Vec::new();
+    let moved = remote::retrieve(&config, &remote, Level::Study, study(), "DEST", |p| {
+        updates.push(*p);
+        false
+    })
+    .await
+    .unwrap();
+    assert_eq!(moved.status, status::SUCCESS);
+    assert_eq!(
+        (
+            moved.progress.completed,
+            moved.progress.failed,
+            moved.progress.remaining
+        ),
+        (3, 0, None)
+    );
+    assert_eq!(updates.len(), 2);
+    assert_eq!((updates[0].remaining, updates[0].completed), (Some(2), 1));
+    assert_eq!(received.lock().unwrap().len(), 3);
+
+    // Cancelled after the first instance.
+    let moved = remote::retrieve(&config, &remote, Level::Study, study(), "DEST", |_| true)
+        .await
+        .unwrap();
+    assert_eq!(moved.status, status::CANCEL);
+    assert!(moved.progress.completed < 3, "{moved:?}");
+
+    let unknown = remote::retrieve(&config, &remote, Level::Study, study(), "NOWHERE", |_| {
+        false
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            unknown,
+            RemoteError::Failed {
+                status: status::MOVE_DESTINATION_UNKNOWN,
+                ..
+            }
+        ),
+        "{unknown}"
+    );
+}
+
+#[tokio::test]
 async fn access_control() {
     let h = harness(|c| {
         c.allow_unknown_peers = false;
         c.check_called_ae_title = true;
-        c.peers = vec![peer("KNOWN", 104)];
+        c.peers = vec![peer("KNOWN", 104)].into();
     })
     .await;
     let echo: &[(&str, &[&str])] = &[(uids::VERIFICATION, UNCOMPRESSED)];

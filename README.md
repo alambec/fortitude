@@ -13,7 +13,7 @@ See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 | `crates/fortitude-core` | Identifiers, indexed attributes, QIDO query model and matching, DICOM JSON encoder |
 | `crates/fortitude-store` | File layout, ingest, index (SQLite or PostgreSQL) and its writer |
 | `crates/fortitude-dicomweb` | STOW-RS, WADO-RS, QIDO-RS, WADO-URI routes |
-| `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET |
+| `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET; SCU of the modalities: C-ECHO, C-FIND, C-MOVE |
 | `crates/fortitude` | Server binary: configuration, logging, wiring, web explorer (`ui/`) |
 | `bench/` | Load generator, Orthanc baselines, results |
 
@@ -65,20 +65,22 @@ stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
 max_instance_size_mib = 4096
 qido_max_results = 10000   # QIDO-RS results per request (0 = no limit); page with offset
 
-[dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET (SCP)
-# listen = "0.0.0.0:4242"  # unset: DIMSE disabled
+[dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET (SCP); C-ECHO, C-FIND, C-MOVE (SCU)
+# listen = "0.0.0.0:4242"  # unset: DIMSE SCP disabled (modalities can still be queried)
 ae_title = "FORTITUDE"
 check_called_ae_title = false
 allow_unknown_peers = true # false: only the peers below may associate
 max_associations = 64
 max_pdu_length = 262144
 timeout_secs = 30
+retrieve_timeout_secs = 600  # between two responses of a modality to a C-MOVE Fortitude sent
 max_find_results = 10000   # 0 = no limit
 extra_sop_classes = []     # e.g. private storage SOP classes
-[[dimse.peers]]            # C-MOVE destinations
+[[dimse.peers]]            # modalities: C-MOVE destinations, queried and retrieved from
 ae_title = "VIEWER"
 host = "10.0.0.5"
 port = 104
+description = "Viewing station, room 2"   # optional, shown in the web explorer
 
 [integrity]                # checks of the stored files against the index
 interval_hours = 24        # first check one interval after the start; 0 = only on request
@@ -121,6 +123,8 @@ trusted network.
 
 Until the first release, the index schema changes without upgrades: an index (SQLite file or
 PostgreSQL schema) created by another version is refused at startup, and must be re-created.
+The one exception is the table of registered modalities, added to an index of the previous
+version (schema 4) on startup.
 
 With `storage.backend = "s3"`, DICOM files are stored as objects of the bucket, under
 `prefix` (`<prefix>/ab/cd/<uuid>.dcm`); the bucket must exist, and the server checks that it
@@ -139,6 +143,12 @@ uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 G
 | `GET /admin/integrity` | Whether a check is running, and the report of the last one |
 | `POST /admin/retention` | Start a retention run (`?dry_run=true[&max_age_days=N]`: list only); `409` if one is running |
 | `GET /admin/retention` | Whether a retention run is in progress, and the report of the last one |
+| `GET /admin/modalities` | Fortitude's AE title, whether its DIMSE service listens, and the modalities |
+| `PUT /admin/modalities/{ae}`, `DELETE …` | Register (or change) a modality: `{"host": "…", "port": 104, "description": "…"}`; remove it |
+| `GET /admin/modalities/{ae}/echo` | C-ECHO: round-trip time, or `502` with the reason |
+| `GET /admin/modalities/{ae}/find?level=STUDY&PatientID=…` | C-FIND, matches in DICOM JSON |
+| `POST /admin/modalities/{ae}/move` | Start a C-MOVE: `{"level": "STUDY", "keys": {"StudyInstanceUID": "…"}, "destination": "…"}` |
+| `GET /admin/moves`, `POST /admin/moves/{id}/cancel` | Retrievals and their progress; cancel one |
 | `GET /health` | Liveness (never authenticated) |
 | `GET /metrics` | Prometheus metrics (never authenticated) |
 
@@ -146,7 +156,8 @@ The web explorer searches patients (grouped from matching studies), studies or s
 patient ID, name, accession number, study description, study date and modality, and opens a
 study, series or instance by UID. Patients, studies and series download as ZIP archives
 (`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files. Its upload page stores files or whole folders with
-STOW-RS, one request per file, and reports each failure. Text fields match prefixes (IDs) or substrings (name,
+STOW-RS, one request per file, and reports each failure. Its modalities page registers,
+verifies, queries and retrieves from modalities (see below). Text fields match prefixes (IDs) or substrings (name,
 description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
 case-insensitively. It is served only when `auth.users` is configured, and only to those
 users (the browser asks for one): Bearer tokens do not open it.
@@ -227,6 +238,49 @@ Up to 1000 studies are listed; the counts include all of them. Expired studies a
 through an index of `studies.created_at`, so a run reads only the
 studies stored before the cutoff.
 
+### Modalities
+
+Fortitude verifies (C-ECHO), queries (C-FIND) and retrieves from (C-MOVE) other DICOM nodes:
+PACS, scanners, workstations. They are those of `dimse.peers`, fixed by the configuration
+file, and those registered through the API or the web explorer, kept in the index (they
+survive restarts). Both are C-MOVE destinations of Fortitude's own DIMSE service, and allowed
+to associate with it when `allow_unknown_peers` is off. A modality is identified by its AE
+title; one of the configuration file cannot be changed or removed at runtime.
+
+```sh
+curl -X PUT -H 'Content-Type: application/json' localhost:8042/admin/modalities/PACS \
+    -d '{"host": "10.0.0.7", "port": 104, "description": "Main PACS"}'
+curl localhost:8042/admin/modalities/PACS/echo
+curl 'localhost:8042/admin/modalities/PACS/find?level=STUDY&PatientName=DOE*&StudyDate=20240101-'
+curl -X POST -H 'Content-Type: application/json' localhost:8042/admin/modalities/PACS/move \
+    -d '{"level": "STUDY", "keys": {"StudyInstanceUID": "1.2.3"}}'
+curl localhost:8042/admin/moves
+```
+
+- **Queries** take a level (`PATIENT`, `STUDY`, `SERIES` or `IMAGE`) and matching keys, by
+  keyword or tag, with C-FIND values (`*` and `?` wildcards, date ranges, `\`-separated UID
+  lists). The usual return keys of the level are always requested; `includefield` adds
+  others. At most `limit` matches are returned (1000 by default, `max_find_results` at most);
+  `truncated` tells when the modality had more. Lower levels need the unique keys of the
+  levels above (e.g. `StudyInstanceUID` for series), as most modalities only support
+  hierarchical queries.
+- **Retrievals** need the unique key of their level (and, for most modalities, those of the
+  levels above). The instances go to Fortitude unless another `destination` is given: the
+  modality must know Fortitude's AE title, address and DIMSE port, and `dimse.listen` must be
+  set. They run in the background, one association each; `GET /admin/moves` lists the last
+  100 with their state (`running`, `succeeded`, `partial`, `cancelled`, `failed`), counts of
+  sub-operations, final status and error, until the server restarts.
+
+```json
+{"moves": [{"id": 1, "modality": "PACS", "destination": "FORTITUDE", "level": "STUDY",
+  "keys": {"StudyInstanceUID": "1.2.3"}, "state": "succeeded", "status": "0000",
+  "remaining": null, "completed": 212, "failed": 0, "warning": 0,
+  "started_at": 1793232000, "finished_at": 1793232041}]}
+```
+
+Echoes and queries are `GET` requests, open to read-only credentials; registrations and
+retrievals are not.
+
 The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
 DIMSE has no authentication beyond AE titles: restrict its port at the network level.
 
@@ -245,6 +299,7 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_dimse_instances_total` (C-STORE) | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_dimse_moved_instances_total` (C-MOVE) | `outcome`: `sent`, `failed` |
 | `fortitude_dimse_get_instances_total` (C-GET) | `outcome`: `sent`, `failed` |
+| `fortitude_dimse_scu_requests_total` (requests to modalities) | `command`: `C-ECHO`, `C-FIND`, `C-MOVE`; `outcome`: `success`, `failure` |
 | `fortitude_integrity_orphans`, `_missing`, `_size_mismatches`, `_errors` (gauges: last check) | |
 | `fortitude_integrity_checksum_mismatches` (gauge: last check that verified checksums) | |
 | `fortitude_integrity_orphans_removed_total` | |

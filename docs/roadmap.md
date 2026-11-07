@@ -8,7 +8,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 | Topic | Decision |
 |---|---|
 | Deployment | Single node: local filesystem, and an index in SQLite (WAL, the default) or PostgreSQL. Both run the same SQL through a thin connection layer, with the same writer and reader pool. |
-| Protocols | DICOMweb first (STOW-RS, WADO-RS, QIDO-RS, WADO-URI), then DIMSE as SCP (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET), with `dicom-ul` for PDU encoding. |
+| Protocols | DICOMweb first (STOW-RS, WADO-RS, QIDO-RS, WADO-URI), then DIMSE as SCP (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET) and as SCU of the known peers (C-ECHO, C-FIND, C-MOVE), with `dicom-ul` for PDU encoding. |
 | Duplicates | An instance whose SOP Instance UID is already stored is **discarded**. The STOW-RS response still lists it in ReferencedSOPSequence (it is retrievable at its RetrieveURL) with the implementation-specific Warning Reason **`0xB111` "Duplicate SOP Instance, discarded"** (PS3.18 §I.2.1 allows additional warning codes; must appear in the conformance statement), so the response status is 202. |
 | Out of scope | Lua, plugin SDK, jobs engine, a built-in viewer (use OHIF; the explorer only searches and browses), Orthanc REST API compatibility. |
 | License | Proprietary, Alambec. |
@@ -73,12 +73,18 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 13. **C-GET** — Patient and Study Root, same selection as C-MOVE; the instances go back on
     the requestor's association, on the storage contexts for which it took the SCP role
     (role selection), as stored or transcoded like C-MOVE. *(done)*
+14. **Modalities (SCU)** — C-ECHO, C-FIND and C-MOVE as a service user of the peers of the
+    configuration file and of modalities registered at runtime (kept in the index, peers of
+    the SCP as well), through the administration API and the web explorer: verify, query
+    by study and series, retrieve to Fortitude or another peer, with the progress of each
+    retrieval. *(done)*
 
 ## Next
 
 - **12-bit JPEG Extended** decoding (jpeg-decoder supports 8-bit DCT only), and a faster
   JPEG 2000 decoder.
-- **DIMSE**: storage commitment, TLS.
+- **DIMSE**: storage commitment, TLS; C-STORE and C-GET as an SCU (send to a modality,
+  retrieve from one that cannot reach Fortitude).
 
 ## Benchmarks
 

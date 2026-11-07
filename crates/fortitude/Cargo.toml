@@ -21,6 +21,8 @@ clap.workspace = true
 crc32fast.workspace = true
 dicom-core.workspace = true
 dicom-dictionary-std = { workspace = true, features = ["sop-class"] }
+dicom-json.workspace = true
+dicom-object.workspace = true
 figment.workspace = true
 form_urlencoded.workspace = true
 futures.workspace = true

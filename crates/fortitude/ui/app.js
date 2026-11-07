@@ -1,6 +1,8 @@
-// Fortitude Explorer: search and browse patients, studies, series and instances.
+// Fortitude Explorer: search and browse patients, studies, series and instances, and query and
+// retrieve from modalities.
 //
-// A dependency-free single-page application over QIDO-RS, WADO-RS and WADO-URI. Routes live
+// A dependency-free single-page application over QIDO-RS, WADO-RS, WADO-URI and the
+// administration API (modalities). Routes live
 // in the URL fragment, so that the back button, reloads and shared links keep working.
 
 "use strict";
@@ -435,31 +437,11 @@ function searchParams(state, level) {
   return params;
 }
 
-function searchView(view, state) {
-  lastSearch = location.hash || "#/";
-  setCrumbs([["Search"]]);
-  const level = LEVELS.some(([l]) => l === state.get("level")) ? state.get("level") : "studies";
-
-  // Lookup by UID.
-  const uid = h("input", {
-    name: "uid",
-    placeholder: "StudyInstanceUID, SeriesInstanceUID or SOPInstanceUID",
-    autocomplete: "off",
-    spellcheck: "false",
-    "aria-label": "Instance UID",
-  });
-  const lookupMessage = h("div");
-  const lookup = h("section", { class: "card" },
-    h("div", { class: "card-head" }, h("h2", {}, "Find by UID")),
-    h("form", {
-      class: "card-body",
-      onsubmit: (e) => {
-        e.preventDefault();
-        findUid(uid.value.trim(), lookupMessage);
-      },
-    }, h("div", { class: "lookup" }, uid, h("button", { class: "primary", type: "submit" }, "Open")), lookupMessage));
-
-  // Search form.
+/**
+ * Inputs of the search criteria (patient, accession, description, modality, study date) set
+ * from `state`, their grid, and the date range chips, which call `submit()`.
+ */
+function criteriaForm(state, submit) {
   const inputs = {};
   const fields = FIELDS.map((field) => h("label", { class: "field" }, field.label,
     inputs[field.key] = h("input", {
@@ -494,6 +476,48 @@ function searchView(view, state) {
     submit();
   };
 
+  const grid = h("div", { class: "search-grid" },
+    fields,
+    h("label", { class: "field" }, "Modality", inputs.Modality,
+      h("datalist", { id: "modalities" }, MODALITIES.map((m) => h("option", { value: m })))),
+    h("label", { class: "field wide" }, "Study date",
+      h("div", { class: "date-range" }, inputs.from, h("span", { class: "muted" }, "→"), inputs.to)));
+  const chips = h("div", { class: "chips" },
+    h("button", { type: "button", class: "small", onclick: () => setRange(0) }, "Today"),
+    h("button", { type: "button", class: "small", onclick: () => setRange(1) }, "Yesterday"),
+    h("button", { type: "button", class: "small", onclick: () => setRange(7) }, "Last 7 days"),
+    h("button", { type: "button", class: "small", onclick: () => setRange(30) }, "Last 30 days"),
+    h("button", { type: "button", class: "small", onclick: () => setRange(null) }, "Any date"));
+  return { inputs, grid, chips };
+}
+
+function searchView(view, state) {
+  lastSearch = location.hash || "#/";
+  setCrumbs([["Search"]]);
+  const level = LEVELS.some(([l]) => l === state.get("level")) ? state.get("level") : "studies";
+
+  // Lookup by UID.
+  const uid = h("input", {
+    name: "uid",
+    placeholder: "StudyInstanceUID, SeriesInstanceUID or SOPInstanceUID",
+    autocomplete: "off",
+    spellcheck: "false",
+    "aria-label": "Instance UID",
+  });
+  const lookupMessage = h("div");
+  const lookup = h("section", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Find by UID")),
+    h("form", {
+      class: "card-body",
+      onsubmit: (e) => {
+        e.preventDefault();
+        findUid(uid.value.trim(), lookupMessage);
+      },
+    }, h("div", { class: "lookup" }, uid, h("button", { class: "primary", type: "submit" }, "Open")), lookupMessage));
+
+  // Search form.
+  const { inputs, grid, chips } = criteriaForm(state, () => submit());
+
   let selectedLevel = level;
   const levelButtons = LEVELS.map(([value, label]) => h("button", {
     type: "button",
@@ -522,19 +546,9 @@ function searchView(view, state) {
       submit();
     },
   },
-  h("div", { class: "search-grid" },
-    fields,
-    h("label", { class: "field" }, "Modality", inputs.Modality,
-      h("datalist", { id: "modalities" }, MODALITIES.map((m) => h("option", { value: m })))),
-    h("label", { class: "field wide" }, "Study date",
-      h("div", { class: "date-range" }, inputs.from, h("span", { class: "muted" }, "→"), inputs.to))),
+  grid,
   h("div", { class: "form-foot" },
-    h("div", { class: "chips" },
-      h("button", { type: "button", class: "small", onclick: () => setRange(0) }, "Today"),
-      h("button", { type: "button", class: "small", onclick: () => setRange(1) }, "Yesterday"),
-      h("button", { type: "button", class: "small", onclick: () => setRange(7) }, "Last 7 days"),
-      h("button", { type: "button", class: "small", onclick: () => setRange(30) }, "Last 30 days"),
-      h("button", { type: "button", class: "small", onclick: () => setRange(null) }, "Any date")),
+    chips,
     h("div", { class: "actions" },
       h("div", { class: "segmented", role: "group", "aria-label": "Search level" }, levelButtons),
       h("button", {
@@ -1349,12 +1363,560 @@ function uploadStatus() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Modalities: remote application entities the server verifies (C-ECHO), queries (C-FIND) and
+// retrieves from (C-MOVE).
+
+const ADMIN = "../admin";
+/** Matches asked of a modality per query. */
+const REMOTE_LIMIT = 500;
+
+/** Send `body` as JSON with `method`; resolves to the JSON response, if any. */
+async function send(method, url, body) {
+  const response = await fetch(url, {
+    method,
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const reply = await response.text();
+  if (!response.ok) {
+    throw new HttpError(`${response.status} ${response.statusText}${reply.trim() ? `: ${reply.trim()}` : ""}`);
+  }
+  return reply ? JSON.parse(reply) : null;
+}
+
+const modalityUrl = (ae) => `${ADMIN}/modalities/${encodeURIComponent(ae)}`;
+const modalityRoute = (ae) => `#/modalities/${encodeURIComponent(ae)}`;
+const remoteStudyRoute = (ae, study) => `${modalityRoute(ae)}/studies/${encodeURIComponent(study)}`;
+
+/** `{ ae_title, listening, modalities }`: the server's AE title and the modalities. */
+async function loadModalities() {
+  return (await get(`${ADMIN}/modalities`, "application/json")).json();
+}
+
+/** C-FIND on a modality: `{ matches, truncated }`. */
+async function remoteFind(ae, level, params) {
+  const query = new URLSearchParams(Object.entries({ level, limit: REMOTE_LIMIT, ...params })
+    .filter(([, v]) => v != null && v !== ""));
+  return (await get(`${modalityUrl(ae)}/find?${query}`, "application/json")).json();
+}
+
+/** Results of the last verification of each modality, kept while browsing. */
+const echoes = new Map();
+
+/** A button verifying the connection with `ae`, and its last result; failures go to `report`. */
+function echoControl(ae, report) {
+  const result = h("span");
+  const show = () => {
+    const echo = echoes.get(ae);
+    result.className = echo ? `echo-result ${echo.ok === true ? "ok" : echo.ok === false ? "bad" : "muted"}` : "echo-result";
+    result.textContent = echo ? echo.text : "";
+    result.title = echo && echo.error ? echo.error : "";
+  };
+  const button = h("button", {
+    class: "small",
+    title: "Verify the connection (C-ECHO)",
+    onclick: async (e) => {
+      e.stopPropagation();
+      button.disabled = true;
+      echoes.set(ae, { ok: null, text: "…" });
+      show();
+      try {
+        const reply = await (await get(`${modalityUrl(ae)}/echo`, "application/json", null)).json();
+        echoes.set(ae, { ok: true, text: `✓ ${integer.format(reply.milliseconds)} ms` });
+      } catch (error) {
+        echoes.set(ae, { ok: false, text: "✗ Failed", error: error.message });
+        report(notice("error", `${ae}: ${error.message}`));
+      }
+      button.disabled = false;
+      show();
+    },
+  }, "Echo");
+  show();
+  return h("span", { class: "echo" }, button, result);
+}
+
+function modalitiesView(view) {
+  setCrumbs([["Modalities"]]);
+  const messages = h("div");
+  const report = (node) => messages.replaceChildren(node);
+  const count = h("span", { class: "count" });
+  const own = h("div", { class: "card-body muted" });
+  const content = h("div", {}, loading());
+  const form = modalityForm(() => draw());
+
+  const table = dataTable([
+    { label: "AE title", value: (m) => m.ae_title, render: (m) => h("a", { class: "mono", href: modalityRoute(m.ae_title) }, m.ae_title) },
+    { label: "Host", value: (m) => m.host, cls: "mono" },
+    { label: "Port", value: (m) => m.port, num: true },
+    { label: "Description", value: (m) => m.description, wrap: true },
+    {
+      label: "Source",
+      value: (m) => m.source,
+      render: (m) => h("span", {
+        class: "badge",
+        title: m.source === "config" ? "Set in the configuration file (dimse.peers)" : "Registered from this page",
+      }, m.source === "config" ? "file" : "registered"),
+    },
+    { label: "Connection", value: () => "", sort: false, render: (m) => echoControl(m.ae_title, report) },
+    {
+      label: "",
+      value: () => "",
+      sort: false,
+      render: (m) => h("div", { class: "actions nowrap" },
+        h("a", { class: "button small", href: modalityRoute(m.ae_title) }, "Query"),
+        m.source === "registered" ? [
+          h("button", { class: "small", onclick: () => form.edit(m) }, "Edit"),
+          h("button", {
+            class: "small ghost",
+            onclick: async () => {
+              if (!confirm(`Remove the modality ${m.ae_title}?`)) return;
+              try {
+                await send("DELETE", modalityUrl(m.ae_title));
+                echoes.delete(m.ae_title);
+                draw();
+              } catch (error) {
+                report(notice("error", error.message));
+              }
+            },
+          }, "Remove"),
+        ] : null),
+    },
+  ], { href: (m) => modalityRoute(m.ae_title), sort: { column: 0, direction: 1 }, empty: "No modality yet: add one below." });
+
+  async function draw() {
+    try {
+      const data = await loadModalities();
+      table.set(data.modalities);
+      count.textContent = data.modalities.length;
+      content.replaceChildren(table.el);
+      own.replaceChildren(
+        "Requests are sent with the AE title ", h("b", { class: "mono" }, data.ae_title), ". ",
+        data.listening
+          ? "Modalities retrieve to it once they know this server under that AE title (its DIMSE address and port)."
+          : h("span", { class: "warn-text" }, "The DIMSE service of this server is disabled (dimse.listen): modalities can be queried, but cannot send it instances."));
+    } catch (error) {
+      if (error.name !== "AbortError") content.replaceChildren(notice("error", error.message));
+    }
+  }
+  draw();
+
+  view.append(
+    h("section", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "Modalities", count)),
+      own, messages, content),
+    form.el,
+    movesCard());
+}
+
+/** Form registering a modality, or changing a registered one; `saved()` is called after. */
+function modalityForm(saved) {
+  const inputs = {
+    ae: h("input", { name: "ae", required: true, maxlength: 16, placeholder: "PACS", autocomplete: "off", spellcheck: "false" }),
+    host: h("input", { name: "host", required: true, placeholder: "10.0.0.5 or pacs.example.org", autocomplete: "off", spellcheck: "false" }),
+    port: h("input", { name: "port", type: "number", required: true, min: 1, max: 65535, value: 104 }),
+    description: h("input", { name: "description", maxlength: 200, placeholder: "CT, room 3", autocomplete: "off" }),
+  };
+  const title = h("h2", {}, "Add a modality");
+  const message = h("div");
+  const save = h("button", { class: "primary", type: "submit" }, "Add");
+  const cancel = h("button", { type: "button", class: "ghost", hidden: true, onclick: () => reset() }, "Cancel");
+
+  function reset() {
+    inputs.ae.disabled = false;
+    for (const input of Object.values(inputs)) input.value = "";
+    inputs.port.value = 104;
+    title.textContent = "Add a modality";
+    save.textContent = "Add";
+    cancel.hidden = true;
+  }
+
+  const form = h("form", {
+    class: "card-body",
+    onsubmit: async (e) => {
+      e.preventDefault();
+      const ae = inputs.ae.value.trim();
+      save.disabled = true;
+      try {
+        await send("PUT", modalityUrl(ae), {
+          host: inputs.host.value.trim(),
+          port: Number(inputs.port.value),
+          description: inputs.description.value.trim(),
+        });
+        message.replaceChildren(notice("ok", `${ae} saved.`));
+        reset();
+        saved();
+      } catch (error) {
+        message.replaceChildren(notice("error", error.message));
+      } finally {
+        save.disabled = false;
+      }
+    },
+  },
+  h("div", { class: "search-grid" },
+    h("label", { class: "field" }, "AE title", inputs.ae),
+    h("label", { class: "field" }, "Host", inputs.host),
+    h("label", { class: "field" }, "Port", inputs.port),
+    h("label", { class: "field" }, "Description", inputs.description)),
+  h("div", { class: "form-foot" },
+    h("div", { class: "muted" }, "The modality must also know this server: its AE title, address and DIMSE port."),
+    h("div", { class: "actions" }, cancel, save)),
+  message);
+
+  const el = h("section", { class: "card" }, h("div", { class: "card-head" }, title), form);
+  return {
+    el,
+    edit(modality) {
+      inputs.ae.value = modality.ae_title;
+      inputs.ae.disabled = true;
+      inputs.host.value = modality.host;
+      inputs.port.value = modality.port;
+      inputs.description.value = modality.description;
+      title.textContent = `Edit ${modality.ae_title}`;
+      save.textContent = "Save";
+      cancel.hidden = false;
+      message.replaceChildren();
+      el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      inputs.host.focus();
+    },
+  };
+}
+
+const MOVE_STATES = {
+  running: ["Running", ""],
+  succeeded: ["Done", "ok"],
+  partial: ["Partly done", "warn"],
+  cancelled: ["Cancelled", "warn"],
+  failed: ["Failed", "bad"],
+};
+
+/** Local route of what a retrieval brought to this server, when known. */
+function retrievedRoute(move) {
+  const study = move.keys.StudyInstanceUID;
+  if (!study || !["succeeded", "partial"].includes(move.state)) return null;
+  return move.keys.SeriesInstanceUID ? seriesRoute(study, move.keys.SeriesInstanceUID) : studyRoute(study);
+}
+
+/** The retrievals (C-MOVE) since the server started, refreshed while some are running. */
+function movesCard() {
+  const signal = navigation.signal;
+  const count = h("span", { class: "count" });
+  const content = h("div", {}, loading());
+  let own = null;
+  let timer = null;
+  const table = dataTable([
+    { label: "Started", value: (m) => m.started_at, render: (m) => new Date(m.started_at * 1000).toLocaleString() },
+    { label: "From", value: (m) => m.modality, cls: "mono" },
+    { label: "To", value: (m) => m.destination, cls: "mono" },
+    { label: "Level", value: (m) => m.level, render: (m) => h("span", { class: "badge" }, m.level) },
+    {
+      label: "UID",
+      value: (m) => Object.values(m.keys).join(" "),
+      render: (m) => {
+        const uid = m.keys.SOPInstanceUID || m.keys.SeriesInstanceUID || m.keys.StudyInstanceUID || m.keys.PatientID || "";
+        return h("span", { class: "mono ellipsis", title: Object.entries(m.keys).map(([k, v]) => `${k}: ${v}`).join("\n") }, uid);
+      },
+    },
+    {
+      label: "State",
+      value: (m) => m.state,
+      render: (m) => h("span", { class: `state ${MOVE_STATES[m.state]?.[1] || ""}`, title: m.status ? `Status ${m.status}` : null },
+        MOVE_STATES[m.state]?.[0] || m.state),
+    },
+    {
+      label: "Progress",
+      value: (m) => m.completed,
+      render: (m) => {
+        const total = m.completed + m.failed + m.warning + (m.remaining || 0);
+        const done = m.completed + m.failed + m.warning;
+        const percent = total ? Math.round((done / total) * 100) : m.state === "running" ? 0 : 100;
+        return h("div", { class: "move-progress" },
+          h("div", { class: "progress" }, h("div", { class: "bar", style: `width: ${percent}%` })),
+          h("span", { class: "muted" }, `${integer.format(m.completed)}${total ? ` / ${integer.format(total)}` : ""}`,
+            m.failed ? h("span", { class: "bad" }, ` · ${integer.format(m.failed)} failed`) : null,
+            m.warning ? ` · ${integer.format(m.warning)} warnings` : null));
+      },
+    },
+    { label: "Error", value: (m) => m.error || "", wrap: true },
+    {
+      label: "",
+      value: () => "",
+      sort: false,
+      render: (m) => {
+        if (m.state === "running") {
+          return h("button", {
+            class: "small",
+            onclick: async (e) => {
+              e.currentTarget.disabled = true;
+              try {
+                await send("POST", `${ADMIN}/moves/${m.id}/cancel`);
+              } catch {
+                // Over meanwhile: the next refresh shows it.
+              }
+              refresh();
+            },
+          }, "Cancel");
+        }
+        const route = own && m.destination === own ? retrievedRoute(m) : null;
+        return route ? h("a", { class: "button small", href: route }, "Open") : null;
+      },
+    },
+  ], { sort: { column: 0, direction: -1 }, empty: "No retrieval since the server started." });
+
+  async function refresh() {
+    clearTimeout(timer);
+    if (signal.aborted) return;
+    try {
+      if (own == null) own = (await loadModalities()).ae_title;
+      const { moves } = await (await get(`${ADMIN}/moves`, "application/json", signal)).json();
+      table.set(moves);
+      count.textContent = moves.length;
+      content.replaceChildren(table.el);
+      if (moves.some((m) => m.state === "running")) timer = setTimeout(refresh, 1000);
+      else if (moves.length) refreshStatistics();
+    } catch (error) {
+      if (error.name !== "AbortError") content.replaceChildren(notice("error", error.message));
+    }
+  }
+  signal.addEventListener("abort", () => clearTimeout(timer));
+  refresh();
+
+  return h("section", { class: "card", id: "retrievals" },
+    h("div", { class: "card-head" },
+      h("h2", {}, "Retrievals", count),
+      h("button", { class: "small ghost", onclick: () => refresh() }, "Refresh")),
+    content);
+}
+
+/** Destination of the retrievals started from this page, kept while browsing. */
+let retrieveDestination = null;
+
+/**
+ * The header of a modality's views: its address, a verification button and the choice of the
+ * destination of retrievals. Resolves to `null` when the modality is unknown.
+ */
+async function remoteHeader(ae, report, extra = []) {
+  const data = await loadModalities();
+  const modality = data.modalities.find((m) => m.ae_title === ae);
+  if (!modality) return null;
+  const choices = [
+    ...(data.listening ? [[data.ae_title, `This server (${data.ae_title})`]] : []),
+    ...data.modalities.filter((m) => m.ae_title !== ae).map((m) => [m.ae_title, m.ae_title]),
+  ];
+  if (!choices.some(([value]) => value === retrieveDestination)) retrieveDestination = choices.length ? choices[0][0] : null;
+  const destination = h("select", {
+    "aria-label": "Retrieve to",
+    disabled: !choices.length,
+    onchange: (e) => (retrieveDestination = e.target.value),
+  }, choices.map(([value, label]) => h("option", { value, selected: value === retrieveDestination }, label)));
+  return h("section", { class: "card title-card" },
+    h("h1", { class: "mono" }, ae),
+    h("div", { class: "subtitle" }, [modality.description, `${modality.host}:${modality.port}`].filter(Boolean).join(" · ")),
+    h("div", { class: "actions" },
+      echoControl(ae, report),
+      h("label", { class: "inline-field" }, "Retrieve to", destination),
+      data.listening ? null : h("span", { class: "warn-text" }, "The DIMSE service of this server is disabled: it cannot receive instances."),
+      extra));
+}
+
+/** A button asking modality `ae` to send what `keys` designate at `level`. */
+function retrieveButton(ae, level, keys, report, label = "Retrieve") {
+  const button = h("button", {
+    class: "small",
+    title: "Ask the modality to send these instances (C-MOVE)",
+    onclick: async (e) => {
+      e.stopPropagation();
+      if (!retrieveDestination) {
+        report(notice("error", "No destination: enable the DIMSE service of this server, or register another modality."));
+        return;
+      }
+      button.disabled = true;
+      try {
+        await send("POST", `${modalityUrl(ae)}/move`, { level, keys, destination: retrieveDestination });
+        button.textContent = "Started";
+        report(h("div", { class: "notice ok" }, `Retrieval to ${retrieveDestination} started: `,
+          h("a", { href: "#/modalities" }, "follow it in Retrievals"), "."));
+      } catch (error) {
+        button.disabled = false;
+        report(notice("error", error.message));
+      }
+    },
+  }, label);
+  return button;
+}
+
+/** Local copies of these studies: their numbers of instances by Study Instance UID. */
+async function localStudies(uids) {
+  const found = new Map();
+  try {
+    for (const item of await uploadedStudies(uids)) {
+      found.set(text(item, "StudyInstanceUID"), number(item, "NumberOfStudyRelatedInstances") ?? 0);
+    }
+  } catch {
+    // A convenience: the results are shown without it.
+  }
+  return found;
+}
+
+const storedHere = (study, local) => (local.has(study)
+  ? h("a", { class: "badge ok", href: studyRoute(study), title: "Open the copy stored on this server" },
+    `stored · ${integer.format(local.get(study))}`)
+  : null);
+
+function remoteView(view, state, ae) {
+  setCrumbs([["Modalities", "#/modalities"], [ae]]);
+  const messages = h("div");
+  const report = (node) => messages.replaceChildren(node);
+  const { inputs, grid, chips } = criteriaForm(state, () => submit());
+
+  function submit() {
+    const params = new URLSearchParams();
+    for (const [key, input] of Object.entries(inputs)) {
+      if (input.value.trim()) params.set(key, input.value.trim());
+    }
+    params.set("search", "1");
+    const target = `${modalityRoute(ae)}?${params}`;
+    if (location.hash === target) route();
+    else location.hash = target;
+  }
+
+  const form = h("form", {
+    class: "card-body",
+    onsubmit: (e) => {
+      e.preventDefault();
+      submit();
+    },
+  },
+  grid,
+  h("div", { class: "form-foot" },
+    chips,
+    h("div", { class: "actions" },
+      h("button", {
+        type: "button",
+        class: "ghost",
+        onclick: () => {
+          for (const input of Object.values(inputs)) input.value = "";
+        },
+      }, "Clear"),
+      h("button", { class: "primary", type: "submit" }, "Search"))));
+
+  const header = h("div", {}, loading());
+  const results = h("div");
+  view.append(header, h("section", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Search the modality")), form), messages, results);
+
+  remoteHeader(ae, report).then((card) => {
+    header.replaceChildren(card || notice("error", "This modality is not registered (anymore)."));
+  }, (error) => error.name !== "AbortError" && header.replaceChildren(notice("error", error.message)));
+
+  if (!state.get("search")) {
+    results.append(h("section", { class: "card" },
+      h("div", { class: "empty" }, "Enter criteria and search: the modality is queried at the study level (C-FIND).")));
+    return;
+  }
+  const count = h("span", { class: "count" });
+  const content = h("div", {}, loading("Querying the modality…"));
+  results.append(h("section", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Studies", count)), content));
+  (async () => {
+    try {
+      const { matches, truncated } = await remoteFind(ae, "STUDY", searchParams(state, "studies"));
+      const local = await localStudies(matches.map((m) => text(m, "StudyInstanceUID")).filter(Boolean));
+      const table = dataTable([
+        { label: "Patient", value: name, render: (r) => name(r) || h("span", { class: "muted" }, "(no name)") },
+        columns.patientId,
+        columns.birthDate,
+        columns.studyDate,
+        columns.studyDescription,
+        columns.accession,
+        columns.modalities,
+        columns.studySeries,
+        columns.studyInstances,
+        { label: "Here", value: (r) => local.get(text(r, "StudyInstanceUID")) ?? -1, render: (r) => storedHere(text(r, "StudyInstanceUID"), local) },
+        {
+          label: "",
+          value: () => "",
+          sort: false,
+          render: (r) => (text(r, "StudyInstanceUID")
+            ? retrieveButton(ae, "STUDY", { StudyInstanceUID: text(r, "StudyInstanceUID") }, report)
+            : null),
+        },
+      ], {
+        href: (r) => remoteStudyRoute(ae, text(r, "StudyInstanceUID")),
+        sort: byDateDesc(3),
+        empty: "No study of the modality matches these criteria.",
+      });
+      table.set(matches.filter((m) => text(m, "StudyInstanceUID")));
+      count.textContent = `${integer.format(matches.length)}${truncated ? "+" : ""}`;
+      content.replaceChildren(
+        truncated ? notice("warn", `Only the first ${integer.format(matches.length)} matches are shown: refine the search.`) : "",
+        table.el);
+    } catch (error) {
+      if (error.name !== "AbortError") content.replaceChildren(notice("error", error.message));
+    }
+  })();
+}
+
+function remoteStudyView(view, state, ae, study) {
+  setCrumbs([["Modalities", "#/modalities"], [ae, modalityRoute(ae)], ["Study"]]);
+  const messages = h("div");
+  const report = (node) => messages.replaceChildren(node);
+  render(view, async () => {
+    const [header, studies, series, local] = await Promise.all([
+      remoteHeader(ae, report, [retrieveButton(ae, "STUDY", { StudyInstanceUID: study }, report, "Retrieve the study")]),
+      remoteFind(ae, "STUDY", { StudyInstanceUID: study }),
+      remoteFind(ae, "SERIES", { StudyInstanceUID: study }),
+      localStudies([study]),
+    ]);
+    if (!header) throw new HttpError("This modality is not registered (anymore).");
+    const item = studies.matches[0] || {};
+    setCrumbs([["Modalities", "#/modalities"], [ae, modalityRoute(ae)], [crumb.study(item)[0]]]);
+    const table = dataTable([
+      columns.seriesNumber,
+      columns.modality,
+      { ...columns.seriesDescription, label: "Description" },
+      { label: "Body part", value: (s) => text(s, "BodyPartExamined") },
+      { label: "Date", value: (s) => dateTime(s, "SeriesDate", "SeriesTime") },
+      columns.seriesInstances,
+      {
+        label: "",
+        value: () => "",
+        sort: false,
+        render: (s) => retrieveButton(ae, "SERIES", { StudyInstanceUID: study, SeriesInstanceUID: text(s, "SeriesInstanceUID") }, report),
+      },
+    ], { sort: { column: 0, direction: 1 }, empty: "The modality returned no series for this study." });
+    table.set(series.matches.filter((s) => text(s, "SeriesInstanceUID")));
+    return [
+      header,
+      titleCard(text(item, "StudyDescription") || "(no description)", dateTime(item, "StudyDate", "StudyTime"), [
+        ["Patient", name(item)],
+        ["Patient ID", text(item, "PatientID")],
+        ["Birth date", formatDate(text(item, "PatientBirthDate"))],
+        ["Sex", text(item, "PatientSex")],
+        ["Accession number", text(item, "AccessionNumber")],
+        ["Study ID", text(item, "StudyID")],
+        ["Referring physician", formatName(text(item, "ReferringPhysicianName"))],
+        ["Modalities", badges(values(item, "ModalitiesInStudy"))],
+        ["Instances", number(item, "NumberOfStudyRelatedInstances") != null ? integer.format(number(item, "NumberOfStudyRelatedInstances")) : ""],
+        ["On this server", storedHere(study, local)],
+        ["Study Instance UID", study, { mono: true }],
+      ]),
+      messages,
+      h("section", { class: "card" },
+        h("div", { class: "card-head" }, h("h2", {}, "Series", h("span", { class: "count" }, series.matches.length))),
+        series.truncated ? notice("warn", "The modality has more series than shown.") : null,
+        table.el),
+    ];
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Router
 
 const ROUTES = [
   [/^\/?$/, searchView],
   [/^\/patient$/, patientView],
   [/^\/upload$/, uploadView],
+  [/^\/modalities$/, modalitiesView],
+  [/^\/modalities\/([^/]+)$/, remoteView],
+  [/^\/modalities\/([^/]+)\/studies\/([^/]+)$/, remoteStudyView],
   [/^\/studies\/([^/]+)$/, studyView],
   [/^\/studies\/([^/]+)\/series\/([^/]+)$/, seriesView],
   [/^\/studies\/([^/]+)\/series\/([^/]+)\/instances\/([^/]+)$/, instanceView],
@@ -1373,8 +1935,9 @@ function route() {
   view.replaceChildren();
   if (path !== currentPath) window.scrollTo(0, 0);
   currentPath = path;
+  const section = path === "/upload" ? "#/upload" : path.startsWith("/modalities") ? "#/modalities" : "#/";
   for (const link of document.querySelectorAll(".topnav a")) {
-    link.toggleAttribute("aria-current", link.getAttribute("href") === (path === "/upload" ? "#/upload" : "#/"));
+    link.toggleAttribute("aria-current", link.getAttribute("href") === section);
   }
   for (const [pattern, show] of ROUTES) {
     const match = pattern.exec(path);

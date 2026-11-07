@@ -1095,6 +1095,8 @@ dependencies = [
  "crc32fast",
  "dicom-core",
  "dicom-dictionary-std",
+ "dicom-json",
+ "dicom-object",
  "figment",
  "form_urlencoded",
  "fortitude-dicomweb",

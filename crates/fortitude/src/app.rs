@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 use crate::auth::{self, Auth};
 use crate::config::Config;
 use crate::integrity::Checker;
+use crate::modalities::{self, Modalities};
 use crate::retention::Retention;
 use crate::{admin, metrics, ui};
 
@@ -23,6 +24,7 @@ pub fn build(
     store: Arc<Store>,
     integrity: Arc<Checker>,
     retention: Arc<Retention>,
+    modalities: Arc<Modalities>,
     metrics_handle: Option<PrometheusHandle>,
 ) -> Router {
     let dicomweb = DicomWeb {
@@ -54,7 +56,8 @@ pub fn build(
                 store: store.clone(),
                 integrity,
                 retention,
-            }),
+            })
+            .merge(modalities::router(modalities)),
         );
     if let Some(auth) = Auth::new(&config.auth) {
         services = services.layer(middleware::from_fn_with_state(auth, auth::require));
@@ -95,6 +98,8 @@ mod tests {
 
     struct Harness {
         app: Router,
+        store: Arc<Store>,
+        dimse: Arc<fortitude_dimse::Config>,
         _dir: tempfile::TempDir,
     }
 
@@ -130,8 +135,22 @@ mod tests {
         .unwrap();
         let integrity = Checker::new(store.clone(), config.integrity.clone());
         let retention = Retention::new(store.clone(), config.retention.clone());
-        let app = build(&config, store, integrity, retention, Some(metrics_handle()));
-        Harness { app, _dir: dir }
+        let dimse = Arc::new(config.dimse.service(1 << 20).unwrap());
+        let modalities = Modalities::new(store.clone(), dimse.clone(), &config.dimse);
+        let app = build(
+            &config,
+            store.clone(),
+            integrity,
+            retention,
+            modalities,
+            Some(metrics_handle()),
+        );
+        Harness {
+            app,
+            store,
+            dimse,
+            _dir: dir,
+        }
     }
 
     impl Harness {
@@ -625,6 +644,281 @@ mod tests {
             h.send(get("/ui/", Some("Bearer t0ken"))).await.0,
             StatusCode::NOT_FOUND
         );
+    }
+
+    fn json(method: &str, path: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn modalities() {
+        use tokio::net::TcpListener;
+
+        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = local_listener.local_addr().unwrap();
+        // A remote Fortitude with one study, to which the local one is a move destination.
+        let remote = harness(|c| {
+            c.dimse.ae_title = "REMOTE".into();
+            c.dimse.peers = vec![crate::config::Peer {
+                ae_title: "LOCAL".into(),
+                host: "127.0.0.1".into(),
+                port: local.port(),
+                description: String::new(),
+            }];
+        });
+        assert_eq!(remote.stow(None).await, StatusCode::OK);
+        let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_port = remote_listener.local_addr().unwrap().port();
+        let dimse = |h: &Harness| fortitude_dimse::Dimse {
+            store: h.store.clone(),
+            config: h.dimse.clone(),
+        };
+        tokio::spawn(fortitude_dimse::serve(
+            remote_listener,
+            dimse(&remote),
+            std::future::pending(),
+        ));
+        let h = harness(|c| {
+            c.dimse.ae_title = "LOCAL".into();
+            c.dimse.listen = Some(local);
+            c.dimse.timeout_secs = 5;
+            c.dimse.peers = vec![crate::config::Peer {
+                ae_title: "CONFIGURED".into(),
+                host: "127.0.0.1".into(),
+                port: 1,
+                description: "from the file".into(),
+            }];
+        });
+        tokio::spawn(fortitude_dimse::serve(
+            local_listener,
+            dimse(&h),
+            std::future::pending(),
+        ));
+        let body = |text: String| serde_json::from_str::<serde_json::Value>(&text).unwrap();
+
+        let (status, list) = h.send(get("/admin/modalities", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = body(list);
+        assert_eq!(
+            (&list["ae_title"], &list["listening"]),
+            (&"LOCAL".into(), &true.into())
+        );
+        assert_eq!(list["modalities"][0]["source"], "config");
+        assert_eq!(list["modalities"][0]["description"], "from the file");
+
+        let registration = serde_json::json!({ "host": "127.0.0.1", "port": remote_port });
+        let (status, _) = h
+            .send(json(
+                "PUT",
+                "/admin/modalities/REMOTE",
+                registration.clone(),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = h
+            .send(json(
+                "PUT",
+                "/admin/modalities/REMOTE",
+                registration.clone(),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        for (path, registration) in [
+            (
+                "/admin/modalities/REMOTE",
+                serde_json::json!({ "host": "127.0.0.1", "port": 0 }),
+            ),
+            (
+                "/admin/modalities/REMOTE",
+                serde_json::json!({ "host": "a b", "port": 104 }),
+            ),
+            (
+                "/admin/modalities/REMOTE",
+                serde_json::json!({ "port": 104 }),
+            ),
+            (
+                "/admin/modalities/A_VERY_LONG_AE_TITLE",
+                registration.clone(),
+            ),
+        ] {
+            let (status, text) = h.send(json("PUT", path, registration)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
+        }
+        let (status, _) = h
+            .send(json(
+                "PUT",
+                "/admin/modalities/CONFIGURED",
+                registration.clone(),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let offline = serde_json::json!({ "host": "127.0.0.1", "port": 1, "description": "off" });
+        let (status, _) = h
+            .send(json("PUT", "/admin/modalities/OFF%20LINE", offline))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, list) = h.send(get("/admin/modalities", None)).await;
+        let list = body(list);
+        let titles: Vec<_> = list["modalities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["ae_title"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(titles, ["CONFIGURED", "OFF LINE", "REMOTE"]);
+        // Registered modalities are peers of the DIMSE service too.
+        assert!(h.dimse.peers.get("REMOTE").is_some());
+
+        let (status, echo) = h.send(get("/admin/modalities/REMOTE/echo", None)).await;
+        assert_eq!(status, StatusCode::OK, "{echo}");
+        assert!(body(echo)["milliseconds"].is_number());
+        let (status, reason) = h.send(get("/admin/modalities/OFF%20LINE/echo", None)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(reason.contains("OFF LINE at 127.0.0.1:1"), "{reason}");
+        assert_eq!(
+            h.send(get("/admin/modalities/NOBODY/echo", None)).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let (status, found) = h
+            .send(get(
+                "/admin/modalities/REMOTE/find?level=STUDY&PatientID=PAT*&includefield=00080090",
+                None,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        let found = body(found);
+        assert_eq!(found["truncated"], false);
+        let study = &found["matches"][0];
+        assert_eq!(study["0020000D"]["Value"][0], "1.2");
+        assert_eq!(study["00201208"]["Value"][0], 1);
+        assert!(study.get("00080090").is_some());
+        let (status, found) = h
+            .send(get(
+                "/admin/modalities/REMOTE/find?level=SERIES&StudyInstanceUID=1.2",
+                None,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body(found)["matches"][0]["0020000E"]["Value"][0], "1.2.3");
+        for query in [
+            "PatientID=1",
+            "level=STUDY&Nonsense=1",
+            "level=FRAME",
+            "level=STUDY&limit=x",
+        ] {
+            let path = format!("/admin/modalities/REMOTE/find?{query}");
+            assert_eq!(
+                h.send(get(&path, None)).await.0,
+                StatusCode::BAD_REQUEST,
+                "{query}"
+            );
+        }
+
+        // Retrieval into the local store.
+        let request =
+            serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "1.2" } });
+        let (status, job) = h
+            .send(json("POST", "/admin/modalities/REMOTE/move", request))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+        let job = body(job);
+        assert_eq!(
+            (&job["destination"], &job["state"]),
+            (&"LOCAL".into(), &"running".into())
+        );
+        let id = job["id"].as_u64().unwrap();
+        let job = loop {
+            let (_, moves) = h.send(get("/admin/moves", None)).await;
+            let job = body(moves)["moves"][0].clone();
+            if job["state"] != "running" {
+                break job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(job["id"], id);
+        assert_eq!(job["state"], "succeeded", "{job}");
+        assert_eq!((&job["completed"], &job["failed"]), (&1.into(), &0.into()));
+        assert_eq!(job["status"], "0000");
+        let (_, statistics) = h.send(get("/admin/statistics", None)).await;
+        assert_eq!(body(statistics)["instances"], 1);
+        let cancel = |id: u64| {
+            Request::post(format!("/admin/moves/{id}/cancel"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(h.send(cancel(id)).await.0, StatusCode::CONFLICT);
+        assert_eq!(h.send(cancel(999)).await.0, StatusCode::NOT_FOUND);
+
+        // A destination the modality does not know.
+        let request = serde_json::json!({
+            "level": "SERIES",
+            "keys": { "StudyInstanceUID": "1.2", "SeriesInstanceUID": "1.2.3" },
+            "destination": "ELSEWHERE",
+        });
+        let (status, _) = h
+            .send(json("POST", "/admin/modalities/REMOTE/move", request))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job = loop {
+            let (_, moves) = h.send(get("/admin/moves", None)).await;
+            let job = body(moves)["moves"][0].clone();
+            if job["state"] != "running" {
+                break job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            (&job["state"], &job["status"]),
+            (&"failed".into(), &"A801".into())
+        );
+        for request in [
+            serde_json::json!({ "level": "SERIES", "keys": { "StudyInstanceUID": "1.2" } }),
+            serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "" } }),
+            serde_json::json!({ "level": "STUDY", "keys": {} , "other": 1 }),
+        ] {
+            let (status, text) = h
+                .send(json("POST", "/admin/modalities/REMOTE/move", request))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        }
+
+        let remove = |path: &str| Request::delete(path).body(Body::empty()).unwrap();
+        assert_eq!(
+            h.send(remove("/admin/modalities/REMOTE")).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            h.send(remove("/admin/modalities/REMOTE")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            h.send(remove("/admin/modalities/CONFIGURED")).await.0,
+            StatusCode::CONFLICT
+        );
+        assert!(h.dimse.peers.get("REMOTE").is_none());
+        assert_eq!(
+            h.send(get("/admin/modalities/REMOTE/echo", None)).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        // Without the DIMSE service, Fortitude cannot be the destination.
+        let h = harness(|_| {});
+        let (status, _) = h
+            .send(json("PUT", "/admin/modalities/REMOTE", registration))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let request =
+            serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "1.2" } });
+        let (status, _) = h
+            .send(json("POST", "/admin/modalities/REMOTE/move", request))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]

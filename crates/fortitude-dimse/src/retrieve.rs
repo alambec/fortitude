@@ -140,7 +140,7 @@ pub(crate) async fn handle(
         None
     } else {
         let destination = command.string(tags::MOVE_DESTINATION).unwrap_or_default();
-        let Some(peer) = dimse.config.peer(&destination).cloned() else {
+        let Some(peer) = dimse.config.peer(&destination) else {
             let comment = format!("unknown move destination {destination:?}");
             connection
                 .send(

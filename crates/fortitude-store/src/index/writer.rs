@@ -45,11 +45,17 @@ pub(crate) enum Command {
         Option<i64>,
         oneshot::Sender<Result<Vec<String>, IndexError>>,
     ),
+    /// Any other write (e.g. the registered modalities); replies with the number of rows it
+    /// changed.
+    Write(Box<WriteFn>, oneshot::Sender<Result<u64, IndexError>>),
 }
+
+pub(crate) type WriteFn = dyn FnOnce(&mut Connection) -> Result<u64, IndexError> + Send;
 
 enum Applied {
     Insert(Result<InsertOutcome, IndexError>),
     Delete(Result<Vec<String>, IndexError>),
+    Write(Result<u64, IndexError>),
 }
 
 type Opener = dyn Fn() -> Result<Connection, IndexError> + Send;
@@ -119,6 +125,9 @@ fn fail(batch: &mut Vec<Command>, error: &IndexError) {
             Command::Delete(_, _, reply) => {
                 let _ = reply.send(Err(error.clone()));
             }
+            Command::Write(_, reply) => {
+                let _ = reply.send(Err(error.clone()));
+            }
         }
     }
 }
@@ -131,7 +140,7 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
     let mut results = Vec::with_capacity(batch.len());
     let committed = (|| -> Result<(), IndexError> {
         conn.batch("BEGIN")?;
-        for command in batch.iter() {
+        for command in batch.iter_mut() {
             conn.batch("SAVEPOINT command")?;
             let (applied, keep) = match command {
                 Command::Insert(record, _) => {
@@ -150,6 +159,13 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
                     };
                     let keep = result.as_ref().is_ok_and(|paths| !paths.is_empty());
                     (Applied::Delete(result), keep)
+                }
+                Command::Write(write, _) => {
+                    // Taken out of the command, which only keeps its reply.
+                    let write = std::mem::replace(write, Box::new(|_| Ok(0)));
+                    let result = write(conn);
+                    let keep = result.is_ok();
+                    (Applied::Write(result), keep)
                 }
             };
             conn.batch(if keep {
@@ -181,10 +197,16 @@ fn apply(conn: &mut Connection, statements: &Statements, batch: &mut Vec<Command
             (Command::Delete(_, _, reply), Some(Applied::Delete(result))) if committed.is_ok() => {
                 let _ = reply.send(result);
             }
+            (Command::Write(_, reply), Some(Applied::Write(result))) if committed.is_ok() => {
+                let _ = reply.send(result);
+            }
             (Command::Insert(_, reply), _) => {
                 let _ = reply.send(Err(failure()));
             }
             (Command::Delete(_, _, reply), _) => {
+                let _ = reply.send(Err(failure()));
+            }
+            (Command::Write(_, reply), _) => {
                 let _ = reply.send(Err(failure()));
             }
         }
