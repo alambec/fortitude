@@ -13,7 +13,7 @@ See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 | `crates/fortitude-core` | Identifiers, indexed attributes, QIDO query model and matching, DICOM JSON encoder |
 | `crates/fortitude-store` | File layout, ingest, index (SQLite or PostgreSQL) and its writer |
 | `crates/fortitude-dicomweb` | STOW-RS, WADO-RS, QIDO-RS, WADO-URI routes |
-| `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET; SCU of the modalities: C-ECHO, C-FIND, C-MOVE |
+| `crates/fortitude-dimse` | DIMSE SCP: C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET; SCU of the modalities: C-ECHO, C-FIND, C-MOVE, C-STORE |
 | `crates/fortitude` | Server binary: configuration, logging, wiring, web explorer (`ui/`) |
 | `bench/` | Load generator, Orthanc baselines, results |
 
@@ -65,7 +65,7 @@ stow_concurrency = 4       # instances of one STOW-RS request stored in parallel
 max_instance_size_mib = 4096
 qido_max_results = 10000   # QIDO-RS results per request (0 = no limit); page with offset
 
-[dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET (SCP); C-ECHO, C-FIND, C-MOVE (SCU)
+[dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET (SCP); C-ECHO, C-FIND, C-MOVE, C-STORE (SCU)
 # listen = "0.0.0.0:4242"  # unset: DIMSE SCP disabled (modalities can still be queried)
 ae_title = "FORTITUDE"
 check_called_ae_title = false
@@ -76,7 +76,7 @@ timeout_secs = 30
 retrieve_timeout_secs = 600  # between two responses of a modality to a C-MOVE Fortitude sent
 max_find_results = 10000   # 0 = no limit
 extra_sop_classes = []     # e.g. private storage SOP classes
-[[dimse.peers]]            # modalities: C-MOVE destinations, queried and retrieved from
+[[dimse.peers]]            # modalities: C-MOVE destinations, queried, retrieved from and sent to
 ae_title = "VIEWER"
 host = "10.0.0.5"
 port = 104
@@ -149,15 +149,18 @@ uploaded with a single `PutObject` (up to `max_instance_size_mib`, below the 5 G
 | `GET /admin/modalities/{ae}/find?level=STUDY&PatientID=…` | C-FIND, matches in DICOM JSON |
 | `POST /admin/modalities/{ae}/move` | Start a C-MOVE: `{"level": "STUDY", "keys": {"StudyInstanceUID": "…"}, "destination": "…"}` |
 | `GET /admin/moves`, `POST /admin/moves/{id}/cancel` | Retrievals and their progress; cancel one |
+| `POST /admin/modalities/{ae}/store` | Send stored instances (C-STORE): `{"level": "STUDY", "keys": {"StudyInstanceUID": "…"}}` |
+| `GET /admin/sends`, `POST /admin/sends/{id}/cancel` | Sends and their progress; cancel one |
 | `GET /health` | Liveness (never authenticated) |
 | `GET /metrics` | Prometheus metrics (never authenticated) |
 
 The web explorer searches patients (grouped from matching studies), studies or series by
 patient ID, name, accession number, study description, study date and modality, and opens a
 study, series or instance by UID. Patients, studies and series download as ZIP archives
-(`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files. Its upload page stores files or whole folders with
+(`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files; they can
+also be sent to a modality. Its upload page stores files or whole folders with
 STOW-RS, one request per file, and reports each failure. Its modalities page registers,
-verifies, queries and retrieves from modalities (see below). Text fields match prefixes (IDs) or substrings (name,
+verifies, queries and retrieves from modalities, and follows the sends (see below). Text fields match prefixes (IDs) or substrings (name,
 description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
 case-insensitively. It is served only when `auth.users` is configured, and only to those
 users (the browser asks for one): Bearer tokens do not open it.
@@ -240,8 +243,8 @@ studies stored before the cutoff.
 
 ### Modalities
 
-Fortitude verifies (C-ECHO), queries (C-FIND) and retrieves from (C-MOVE) other DICOM nodes:
-PACS, scanners, workstations. They are those of `dimse.peers`, fixed by the configuration
+Fortitude verifies (C-ECHO), queries (C-FIND), retrieves from (C-MOVE) and sends stored
+instances to (C-STORE) other DICOM nodes: PACS, scanners, workstations. They are those of `dimse.peers`, fixed by the configuration
 file, and those registered through the API or the web explorer, kept in the index (they
 survive restarts). Both are C-MOVE destinations of Fortitude's own DIMSE service, and allowed
 to associate with it when `allow_unknown_peers` is off. A modality is identified by its AE
@@ -255,6 +258,9 @@ curl 'localhost:8042/admin/modalities/PACS/find?level=STUDY&PatientName=DOE*&Stu
 curl -X POST -H 'Content-Type: application/json' localhost:8042/admin/modalities/PACS/move \
     -d '{"level": "STUDY", "keys": {"StudyInstanceUID": "1.2.3"}}'
 curl localhost:8042/admin/moves
+curl -X POST -H 'Content-Type: application/json' localhost:8042/admin/modalities/PACS/store \
+    -d '{"level": "SERIES", "keys": {"StudyInstanceUID": "1.2.3", "SeriesInstanceUID": "1.2.3.4"}}'
+curl localhost:8042/admin/sends
 ```
 
 - **Queries** take a level (`PATIENT`, `STUDY`, `SERIES` or `IMAGE`) and matching keys, by
@@ -278,8 +284,28 @@ curl localhost:8042/admin/moves
   "started_at": 1793232000, "finished_at": 1793232041}]}
 ```
 
-Echoes and queries are `GET` requests, open to read-only credentials; registrations and
-retrievals are not.
+- **Sends** select stored instances by `PatientID` (with `IssuerOfPatientID` to narrow it),
+  `StudyInstanceUID`, `SeriesInstanceUID` or `SOPInstanceUID`, as a C-MOVE received by
+  Fortitude does: the key of the level is required, the others narrow the selection, and
+  UIDs can be `\`-separated lists (`404` when nothing stored matches). The instances go over
+  one association, as stored when the modality accepts their transfer syntax, otherwise
+  transcoded to Explicit or Implicit VR Little Endian. `GET /admin/sends` lists the last 100
+  sends like the retrievals, with `failures`: the first 100 instances the modality refused,
+  with the reason. A send whose modality cannot be reached, or accepts none of the SOP
+  classes, fails, as does one whose instances were all refused; one with some refused
+  instances is `partial`; cancelling it stops after the instance being sent.
+
+```json
+{"sends": [{"id": 1, "modality": "PACS", "level": "SERIES",
+  "keys": {"StudyInstanceUID": "1.2.3", "SeriesInstanceUID": "1.2.3.4"}, "state": "partial",
+  "remaining": null, "completed": 132, "failed": 1, "warning": 0,
+  "error": "out of resources (A700)",
+  "failures": [{"sop_instance_uid": "1.2.3.4.5", "reason": "out of resources (A700)"}],
+  "started_at": 1793232000, "finished_at": 1793232012}]}
+```
+
+Echoes and queries are `GET` requests, open to read-only credentials; registrations,
+retrievals and sends are not.
 
 The DICOMweb and DIMSE services are described in the [conformance statement](docs/conformance.md).
 DIMSE has no authentication beyond AE titles: restrict its port at the network level.
@@ -299,7 +325,8 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_dimse_instances_total` (C-STORE) | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_dimse_moved_instances_total` (C-MOVE) | `outcome`: `sent`, `failed` |
 | `fortitude_dimse_get_instances_total` (C-GET) | `outcome`: `sent`, `failed` |
-| `fortitude_dimse_scu_requests_total` (requests to modalities) | `command`: `C-ECHO`, `C-FIND`, `C-MOVE`; `outcome`: `success`, `failure` |
+| `fortitude_dimse_sent_instances_total` (C-STORE to modalities) | `outcome`: `sent`, `failed` |
+| `fortitude_dimse_scu_requests_total` (requests to modalities; one per send) | `command`: `C-ECHO`, `C-FIND`, `C-MOVE`, `C-STORE`; `outcome`: `success`, `failure` |
 | `fortitude_integrity_orphans`, `_missing`, `_size_mismatches`, `_errors` (gauges: last check) | |
 | `fortitude_integrity_checksum_mismatches` (gauge: last check that verified checksums) | |
 | `fortitude_integrity_orphans_removed_total` | |

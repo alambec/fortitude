@@ -8,7 +8,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 | Topic | Decision |
 |---|---|
 | Deployment | Single node: local filesystem, and an index in SQLite (WAL, the default) or PostgreSQL. Both run the same SQL through a thin connection layer, with the same writer and reader pool. |
-| Protocols | DICOMweb first (STOW-RS, WADO-RS, QIDO-RS, WADO-URI), then DIMSE as SCP (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET) and as SCU of the known peers (C-ECHO, C-FIND, C-MOVE), with `dicom-ul` for PDU encoding. |
+| Protocols | DICOMweb first (STOW-RS, WADO-RS, QIDO-RS, WADO-URI), then DIMSE as SCP (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET) and as SCU of the known peers (C-ECHO, C-FIND, C-MOVE, C-STORE), with `dicom-ul` for PDU encoding. |
 | Duplicates | An instance whose SOP Instance UID is already stored is **discarded**. The STOW-RS response still lists it in ReferencedSOPSequence (it is retrievable at its RetrieveURL) with the implementation-specific Warning Reason **`0xB111` "Duplicate SOP Instance, discarded"** (PS3.18 §I.2.1 allows additional warning codes; must appear in the conformance statement), so the response status is 202. |
 | Out of scope | Lua, plugin SDK, jobs engine, a built-in viewer (use OHIF; the explorer only searches and browses), Orthanc REST API compatibility. |
 | License | Proprietary, Alambec. |
@@ -78,13 +78,18 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
     the SCP as well), through the administration API and the web explorer: verify, query
     by study and series, retrieve to Fortitude or another peer, with the progress of each
     retrieval. *(done)*
+15. **Sending to modalities (C-STORE SCU)** — stored instances of a patient, study, series
+    or instance sent to a modality over one association, through the administration API and
+    the web explorer; the same presentation contexts and transcoding as C-MOVE
+    sub-operations, with the progress of each send, the instances refused and their status,
+    and cancellation. *(done)*
 
 ## Next
 
 - **12-bit JPEG Extended** decoding (jpeg-decoder supports 8-bit DCT only), and a faster
   JPEG 2000 decoder.
-- **DIMSE**: storage commitment, TLS; C-STORE and C-GET as an SCU (send to a modality,
-  retrieve from one that cannot reach Fortitude).
+- **DIMSE**: storage commitment, TLS; C-GET as an SCU (retrieve from a modality that cannot
+  reach Fortitude).
 
 ## Benchmarks
 

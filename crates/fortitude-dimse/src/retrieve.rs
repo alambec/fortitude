@@ -39,7 +39,7 @@ const IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
 /// Presentation contexts an association can propose (odd IDs from 1 to 255).
 const MAX_CONTEXTS: usize = 128;
 /// Instances read (or transcoded) ahead of the one being sent.
-const READ_AHEAD: usize = 4;
+pub(crate) const READ_AHEAD: usize = 4;
 
 /// The instances designated by the unique keys of a C-MOVE or C-GET identifier, at and
 /// above its level; the key of the level itself is required.
@@ -346,10 +346,10 @@ fn failed_identifier(uids: &[String], transfer_syntax: &str) -> Vec<u8> {
     out
 }
 
-type Plan = Option<(u8, Option<String>)>;
+pub(crate) type Plan = Option<(u8, Option<String>)>;
 
 /// An instance with its plan and data set, ready to be sent.
-async fn prepare(
+pub(crate) async fn prepare(
     store: &Arc<Store>,
     (instance, plan): (StoredInstance, Plan),
 ) -> (StoredInstance, Plan, Result<(Bytes, usize), String>) {
@@ -405,15 +405,16 @@ fn plan<'a>(
         .map(|(id, _, ts)| (*id, Some((*ts).to_owned())))
 }
 
-/// The association to a move destination.
-struct Destination {
+/// An association to a storage SCP: a move destination, or a modality instances are sent to
+/// ([`crate::remote::send`]).
+pub(crate) struct Destination {
     association: AsyncClientAssociation<TcpStream>,
     ae_title: String,
     timeout: Duration,
 }
 
 impl Destination {
-    async fn open(
+    pub(crate) async fn open(
         config: &Config,
         peer: &Peer,
         instances: &[StoredInstance],
@@ -448,7 +449,7 @@ impl Destination {
 
     /// The presentation context to send `instance` on, and the transfer syntax to transcode
     /// it to when the destination does not accept the stored one.
-    fn plan(&self, instance: &StoredInstance) -> Plan {
+    pub(crate) fn plan(&self, instance: &StoredInstance) -> Plan {
         let accepted = self
             .association
             .presentation_contexts()
@@ -466,7 +467,12 @@ impl Destination {
 
     /// Send one C-STORE request; returns the response status. An error leaves the
     /// association unusable.
-    async fn store(&mut self, pc: u8, request: &Command, data: &[u8]) -> Result<u16, String> {
+    pub(crate) async fn store(
+        &mut self,
+        pc: u8,
+        request: &Command,
+        data: &[u8],
+    ) -> Result<u16, String> {
         let message_id = request.message_id();
         let max_pdu_length = self.association.peer_max_pdu_length();
         let timeout = self.timeout;
@@ -511,13 +517,13 @@ impl Destination {
         }
     }
 
-    async fn release(self) {
+    pub(crate) async fn release(self) {
         if let Err(e) = self.association.release().await {
-            tracing::debug!(error = %e, "C-MOVE: release failed");
+            tracing::debug!(error = %e, "release failed");
         }
     }
 
-    async fn abort(self) {
+    pub(crate) async fn abort(self) {
         let _ = self.association.abort().await;
     }
 }

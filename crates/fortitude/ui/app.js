@@ -1,5 +1,5 @@
-// Fortitude Explorer: search and browse patients, studies, series and instances, and query and
-// retrieve from modalities.
+// Fortitude Explorer: search and browse patients, studies, series and instances, query and
+// retrieve from modalities, and send to them.
 //
 // A dependency-free single-page application over QIDO-RS, WADO-RS, WADO-URI and the
 // administration API (modalities). Routes live
@@ -738,6 +738,7 @@ function patientView(view, state) {
       columns.studyInstances,
     ], { href: studyHref, sort: byDateDesc(0) });
     table.set(items);
+    const sending = id ? sendControl("PATIENT", issuer ? { PatientID: id, IssuerOfPatientID: issuer } : { PatientID: id }) : null;
     return [
       titleCard(name(patient) || "(no name)", `Patient ${id}`, [
         ["Patient ID", id, { mono: true }],
@@ -745,7 +746,8 @@ function patientView(view, state) {
         ["Birth date", formatDate(text(patient, "PatientBirthDate"))],
         ["Sex", text(patient, "PatientSex")],
         ["Studies", integer.format(items.length)],
-      ], id ? [archiveLink(issuer ? { patient: id, issuer } : { patient: id })] : []),
+      ], id ? [archiveLink(issuer ? { patient: id, issuer } : { patient: id }), sending.control] : []),
+      sending ? sending.messages : null,
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Studies", h("span", { class: "count" }, items.length))),
         truncated ? notice("warn", "This patient has more studies than the server returns at once.") : null,
@@ -778,6 +780,7 @@ function studyView(view, state, study) {
       columns.seriesInstances,
     ], { href: (s) => seriesRoute(study, text(s, "SeriesInstanceUID")) });
     table.set(series.items);
+    const sending = sendControl("STUDY", { StudyInstanceUID: study });
     return [
       titleCard(text(item, "StudyDescription") || "(no description)", dateTime(item, "StudyDate", "StudyTime"), [
         ["Patient", patientLink(item)],
@@ -791,7 +794,8 @@ function studyView(view, state, study) {
         ["Series", integer.format(number(item, "NumberOfStudyRelatedSeries") ?? 0)],
         ["Instances", integer.format(number(item, "NumberOfStudyRelatedInstances") ?? 0)],
         ["Study Instance UID", study, { mono: true }],
-      ], [archiveLink({ study })]),
+      ], [archiveLink({ study }), sending.control]),
+      sending.messages,
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Series", h("span", { class: "count" }, series.items.length))),
         table.el),
@@ -837,6 +841,7 @@ function seriesView(view, state, study, series) {
     table.set(instances.items);
     const title = [text(item, "SeriesNumber") && `#${text(item, "SeriesNumber")}`, text(item, "SeriesDescription") || "(no description)"]
       .filter(Boolean).join(" · ");
+    const sending = sendControl("SERIES", { StudyInstanceUID: study, SeriesInstanceUID: series });
     return [
       titleCard(title, `${name(studyItem)} · ${text(studyItem, "StudyDescription") || formatDate(text(studyItem, "StudyDate"))}`, [
         ["Modality", badges([text(item, "Modality")])],
@@ -845,7 +850,8 @@ function seriesView(view, state, study, series) {
         ["Date", dateTime(item, "SeriesDate", "SeriesTime")],
         ["Instances", integer.format(number(item, "NumberOfSeriesRelatedInstances") ?? instances.items.length)],
         ["Series Instance UID", series, { mono: true }],
-      ], [archiveLink({ study, series })]),
+      ], [archiveLink({ study, series }), sending.control]),
+      sending.messages,
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Instances", h("span", { class: "count" }, instances.items.length))),
         instances.truncated ? notice("warn", "This series has more instances than the server returns at once.") : null,
@@ -1363,8 +1369,8 @@ function uploadStatus() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Modalities: remote application entities the server verifies (C-ECHO), queries (C-FIND) and
-// retrieves from (C-MOVE).
+// Modalities: remote application entities the server verifies (C-ECHO), queries (C-FIND),
+// retrieves from (C-MOVE) and sends stored instances to (C-STORE).
 
 const ADMIN = "../admin";
 /** Matches asked of a modality per query. */
@@ -1505,7 +1511,8 @@ function modalitiesView(view) {
       h("div", { class: "card-head" }, h("h2", {}, "Modalities", count)),
       own, messages, content),
     form.el,
-    movesCard());
+    transfersCard("moves"),
+    transfersCard("sends"));
 }
 
 /** Form registering a modality, or changing a registered one; `saved()` is called after. */
@@ -1589,15 +1596,41 @@ const MOVE_STATES = {
   failed: ["Failed", "bad"],
 };
 
-/** Local route of what a retrieval brought to this server, when known. */
-function retrievedRoute(move) {
-  const study = move.keys.StudyInstanceUID;
-  if (!study || !["succeeded", "partial"].includes(move.state)) return null;
-  return move.keys.SeriesInstanceUID ? seriesRoute(study, move.keys.SeriesInstanceUID) : studyRoute(study);
+/** Local route of the study or series a transfer designates, when known. */
+function transferRoute(transfer) {
+  const study = transfer.keys.StudyInstanceUID;
+  if (!study || study.includes("\\")) return null;
+  const series = transfer.keys.SeriesInstanceUID;
+  return series && !series.includes("\\") ? seriesRoute(study, series) : studyRoute(study);
 }
 
-/** The retrievals (C-MOVE) since the server started, refreshed while some are running. */
-function movesCard() {
+const TRANSFERS = {
+  moves: {
+    title: "Retrievals",
+    id: "retrievals",
+    empty: "No retrieval since the server started.",
+    columns: [
+      { label: "From", value: (m) => m.modality, cls: "mono" },
+      { label: "To", value: (m) => m.destination, cls: "mono" },
+    ],
+    // What a retrieval brought to this server.
+    route: (m, own) => (own && m.destination === own && ["succeeded", "partial"].includes(m.state) ? transferRoute(m) : null),
+  },
+  sends: {
+    title: "Sends",
+    id: "sends",
+    empty: "Nothing sent since the server started: send a study or series from its page.",
+    columns: [{ label: "To", value: (m) => m.modality, cls: "mono" }],
+    route: (m) => transferRoute(m),
+  },
+};
+
+/**
+ * The retrievals (C-MOVE, `kind` "moves") or sends (C-STORE, "sends") since the server started,
+ * refreshed while some are running.
+ */
+function transfersCard(kind) {
+  const spec = TRANSFERS[kind];
   const signal = navigation.signal;
   const count = h("span", { class: "count" });
   const content = h("div", {}, loading());
@@ -1605,8 +1638,7 @@ function movesCard() {
   let timer = null;
   const table = dataTable([
     { label: "Started", value: (m) => m.started_at, render: (m) => new Date(m.started_at * 1000).toLocaleString() },
-    { label: "From", value: (m) => m.modality, cls: "mono" },
-    { label: "To", value: (m) => m.destination, cls: "mono" },
+    ...spec.columns,
     { label: "Level", value: (m) => m.level, render: (m) => h("span", { class: "badge" }, m.level) },
     {
       label: "UID",
@@ -1636,7 +1668,14 @@ function movesCard() {
             m.warning ? ` · ${integer.format(m.warning)} warnings` : null));
       },
     },
-    { label: "Error", value: (m) => m.error || "", wrap: true },
+    {
+      label: "Error",
+      value: (m) => m.error || "",
+      wrap: true,
+      render: (m) => (m.failures && m.failures.length
+        ? h("span", { title: m.failures.map((f) => `${f.sop_instance_uid}: ${f.reason}`).join("\n") }, m.error || "")
+        : m.error || ""),
+    },
     {
       label: "",
       value: () => "",
@@ -1648,7 +1687,7 @@ function movesCard() {
             onclick: async (e) => {
               e.currentTarget.disabled = true;
               try {
-                await send("POST", `${ADMIN}/moves/${m.id}/cancel`);
+                await send("POST", `${ADMIN}/${kind}/${m.id}/cancel`);
               } catch {
                 // Over meanwhile: the next refresh shows it.
               }
@@ -1656,23 +1695,23 @@ function movesCard() {
             },
           }, "Cancel");
         }
-        const route = own && m.destination === own ? retrievedRoute(m) : null;
+        const route = spec.route(m, own);
         return route ? h("a", { class: "button small", href: route }, "Open") : null;
       },
     },
-  ], { sort: { column: 0, direction: -1 }, empty: "No retrieval since the server started." });
+  ], { sort: { column: 0, direction: -1 }, empty: spec.empty });
 
   async function refresh() {
     clearTimeout(timer);
     if (signal.aborted) return;
     try {
       if (own == null) own = (await loadModalities()).ae_title;
-      const { moves } = await (await get(`${ADMIN}/moves`, "application/json", signal)).json();
-      table.set(moves);
-      count.textContent = moves.length;
+      const transfers = (await (await get(`${ADMIN}/${kind}`, "application/json", signal)).json())[kind];
+      table.set(transfers);
+      count.textContent = transfers.length;
       content.replaceChildren(table.el);
-      if (moves.some((m) => m.state === "running")) timer = setTimeout(refresh, 1000);
-      else if (moves.length) refreshStatistics();
+      if (transfers.some((m) => m.state === "running")) timer = setTimeout(refresh, 1000);
+      else if (kind === "moves" && transfers.length) refreshStatistics();
     } catch (error) {
       if (error.name !== "AbortError") content.replaceChildren(notice("error", error.message));
     }
@@ -1680,11 +1719,55 @@ function movesCard() {
   signal.addEventListener("abort", () => clearTimeout(timer));
   refresh();
 
-  return h("section", { class: "card", id: "retrievals" },
+  return h("section", { class: "card", id: spec.id },
     h("div", { class: "card-head" },
-      h("h2", {}, "Retrievals", count),
+      h("h2", {}, spec.title, count),
       h("button", { class: "small ghost", onclick: () => refresh() }, "Refresh")),
     content);
+}
+
+/** Modality the sends started from local pages go to, kept while browsing. */
+let sendTarget = null;
+
+/**
+ * Controls sending what `keys` designate at `level` to a modality (C-STORE), with the area
+ * where they report: empty while the modalities load, and when none is registered.
+ */
+function sendControl(level, keys) {
+  const messages = h("div");
+  const control = h("span", { class: "actions" });
+  loadModalities().then((data) => {
+    const titles = data.modalities.map((m) => m.ae_title);
+    if (!titles.length) return;
+    if (!titles.includes(sendTarget)) sendTarget = titles[0];
+    const target = h("select", {
+      "aria-label": "Send to",
+      onchange: (e) => (sendTarget = e.target.value),
+    }, data.modalities.map((m) => h("option", { value: m.ae_title, selected: m.ae_title === sendTarget },
+      m.description ? `${m.ae_title} · ${m.description}` : m.ae_title)));
+    const button = h("button", {
+      class: "small",
+      title: "Send these instances to the modality (C-STORE)",
+      onclick: async () => {
+        button.disabled = true;
+        const to = sendTarget;
+        try {
+          const job = await send("POST", `${modalityUrl(to)}/store`, { level, keys });
+          messages.replaceChildren(h("div", { class: "notice ok" },
+            `Sending ${integer.format(job.remaining ?? 0)} instance${job.remaining === 1 ? "" : "s"} to ${to}: `,
+            h("a", { href: "#/modalities" }, "follow it in Sends"), "."));
+        } catch (error) {
+          messages.replaceChildren(notice("error", error.message));
+        } finally {
+          button.disabled = false;
+        }
+      },
+    }, "Send");
+    control.replaceChildren(h("label", { class: "inline-field" }, "Send to", target), button);
+  }, () => {
+    // Without the administration API (or access to it), no sending.
+  });
+  return { control, messages };
 }
 
 /** Destination of the retrievals started from this page, kept while browsing. */

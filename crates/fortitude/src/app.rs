@@ -888,6 +888,95 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
         }
 
+        // Sending the retrieved study back (C-STORE): the remote has it already, which is
+        // not a failure.
+        let wait_send = || async {
+            loop {
+                let (_, sends) = h.send(get("/admin/sends", None)).await;
+                let job = body(sends)["sends"][0].clone();
+                if job["state"] != "running" {
+                    break job;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        let request = serde_json::json!({
+            "level": "SERIES",
+            "keys": { "StudyInstanceUID": "1.2", "SeriesInstanceUID": "1.2.3\\9.9" },
+        });
+        let (status, job) = h
+            .send(json("POST", "/admin/modalities/REMOTE/store", request))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+        let job = body(job);
+        assert_eq!(
+            (&job["modality"], &job["remaining"], &job["state"]),
+            (&"REMOTE".into(), &1.into(), &"running".into())
+        );
+        assert!(job.get("destination").is_none());
+        let id = job["id"].as_u64().unwrap();
+        let job = wait_send().await;
+        assert_eq!(job["id"], id);
+        assert_eq!(job["state"], "succeeded", "{job}");
+        assert_eq!((&job["completed"], &job["failed"]), (&1.into(), &0.into()));
+        assert_eq!(job["failures"], serde_json::json!([]));
+        let cancel = |id: u64| {
+            Request::post(format!("/admin/sends/{id}/cancel"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(h.send(cancel(id)).await.0, StatusCode::CONFLICT);
+        assert_eq!(h.send(cancel(999)).await.0, StatusCode::NOT_FOUND);
+
+        // A modality that cannot be reached.
+        let request =
+            serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "1.2" } });
+        let (status, _) = h
+            .send(json("POST", "/admin/modalities/OFF%20LINE/store", request))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job = wait_send().await;
+        assert_eq!(job["state"], "failed", "{job}");
+        assert!(
+            job["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot associate with OFF LINE"),
+            "{job}"
+        );
+        assert_eq!(job["remaining"], 1);
+
+        let (status, _) = h
+            .send(json(
+                "POST",
+                "/admin/modalities/REMOTE/store",
+                serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "9.9" } }),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            h.send(json(
+                "POST",
+                "/admin/modalities/NOBODY/store",
+                serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "1.2" } }),
+            ))
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        for request in [
+            serde_json::json!({ "level": "SERIES", "keys": { "StudyInstanceUID": "1.2" } }),
+            serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": " " } }),
+            serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "1.2", "Modality": "CT" } }),
+            serde_json::json!({ "level": "STUDY", "keys": { "StudyInstanceUID": "1.2" }, "destination": "X" }),
+            serde_json::json!({ "level": "FRAME", "keys": { "StudyInstanceUID": "1.2" } }),
+        ] {
+            let (status, text) = h
+                .send(json("POST", "/admin/modalities/REMOTE/store", request))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        }
+
         let remove = |path: &str| Request::delete(path).body(Body::empty()).unwrap();
         assert_eq!(
             h.send(remove("/admin/modalities/REMOTE")).await.0,

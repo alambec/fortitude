@@ -21,6 +21,7 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct Harness {
     address: SocketAddr,
+    store: Arc<Store>,
     _dir: tempfile::TempDir,
 }
 
@@ -43,11 +44,15 @@ async fn harness(configure: impl FnOnce(&mut Config)) -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let dimse = Dimse {
-        store,
+        store: store.clone(),
         config: Arc::new(config),
     };
     tokio::spawn(serve(listener, dimse, std::future::pending()));
-    Harness { address, _dir: dir }
+    Harness {
+        address,
+        store,
+        _dir: dir,
+    }
 }
 
 type Response = (Command, Option<InMemDicomObject>);
@@ -392,6 +397,15 @@ async fn find_limit() {
 type Received = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
 
 async fn destination(transfer_syntaxes: &'static [&'static str]) -> (u16, Received) {
+    responding(transfer_syntaxes, |_| status::SUCCESS).await
+}
+
+/// [`destination`], answering each instance with the status `respond` gives for its SOP
+/// Instance UID.
+async fn responding(
+    transfer_syntaxes: &'static [&'static str],
+    respond: fn(&str) -> u16,
+) -> (u16, Received) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let received = Received::default();
@@ -406,15 +420,16 @@ async fn destination(transfer_syntaxes: &'static [&'static str]) -> (u16, Receiv
                 connection.receive(|_, _, _| Vec::new()).await
             {
                 let (_, ts) = connection.context(message.context).unwrap();
-                recorded.lock().unwrap().push((
-                    message
-                        .command
-                        .string(tags::AFFECTED_SOP_INSTANCE_UID)
-                        .unwrap(),
-                    ts.to_owned(),
-                    message.data.unwrap(),
-                ));
-                let response = message.command.response(status::SUCCESS, false);
+                let uid = message
+                    .command
+                    .string(tags::AFFECTED_SOP_INSTANCE_UID)
+                    .unwrap();
+                let status = respond(&uid);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((uid, ts.to_owned(), message.data.unwrap()));
+                let response = message.command.response(status, false);
                 connection
                     .send(message.context, &response, None)
                     .await
@@ -644,6 +659,137 @@ async fn remote_echo_find_and_move() {
         ),
         "{unknown}"
     );
+}
+
+#[tokio::test]
+async fn remote_send() {
+    use crate::remote::{self, RemoteError};
+    use fortitude_store::retrieve::Selection;
+
+    let h = harness(|_| {}).await;
+    let instances = stored(&h).await;
+    let selected = h
+        .store
+        .select(Selection {
+            patient_id: Some("PAT-1".into()),
+            ..Selection::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 4);
+    let config = Config {
+        timeout: TIMEOUT,
+        ..Config::default()
+    };
+
+    // Files go out as stored, with progress before the first instance and after each one.
+    let (port, received) = destination(&[EXPLICIT_VR_LE, IMPLICIT_VR_LE, JPEG_BASELINE]).await;
+    let mut updates = Vec::new();
+    let sent = remote::send(
+        &config,
+        &peer("DEST", port),
+        &h.store,
+        selected.clone(),
+        |p| {
+            updates.push(*p);
+            false
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!sent.cancelled);
+    assert!(sent.failures.is_empty(), "{:?}", sent.failures);
+    assert_eq!(
+        (
+            sent.progress.completed,
+            sent.progress.failed,
+            sent.progress.remaining
+        ),
+        (4, 0, None)
+    );
+    assert_eq!(updates.len(), 5);
+    assert_eq!((updates[0].remaining, updates[0].completed), (Some(4), 0));
+    assert_eq!((updates[4].remaining, updates[4].completed), (Some(0), 4));
+    let received = received.lock().unwrap().clone();
+    assert_eq!(received.len(), 4);
+    for instance in &instances {
+        let (_, ts, data) = received
+            .iter()
+            .find(|(uid, _, _)| *uid == instance.sop_uid)
+            .expect("instance received");
+        let file = instance.to_bytes();
+        assert_eq!(*ts, instance.transfer_syntax);
+        assert_eq!(data[..], file[part10::data_set_offset(&file).unwrap()..]);
+    }
+
+    // Transcoded when the peer accepts no compressed syntax; refusals are listed.
+    let (port, received) = responding(&[IMPLICIT_VR_LE], |uid| {
+        if uid.ends_with(".2") {
+            0xA700
+        } else {
+            status::SUCCESS
+        }
+    })
+    .await;
+    let sent = remote::send(
+        &config,
+        &peer("DEST", port),
+        &h.store,
+        selected.clone(),
+        |_| false,
+    )
+    .await
+    .unwrap();
+    assert_eq!((sent.progress.completed, sent.progress.failed), (3, 1));
+    assert_eq!(sent.failures.len(), 1);
+    assert!(sent.failures[0].sop_instance_uid.ends_with(".2"));
+    assert_eq!(sent.failures[0].reason, "out of resources (A700)");
+    assert!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, ts, _)| ts == IMPLICIT_VR_LE)
+    );
+
+    // Into another Fortitude, cancelled after the first instance.
+    let other = harness(|_| {}).await;
+    let mut calls = 0;
+    let sent = remote::send(
+        &config,
+        &peer("FORTITUDE", other.address.port()),
+        &h.store,
+        selected.clone(),
+        |_| {
+            calls += 1;
+            calls > 1
+        },
+    )
+    .await
+    .unwrap();
+    assert!(sent.cancelled);
+    assert_eq!(
+        (sent.progress.completed, sent.progress.remaining),
+        (1, Some(3))
+    );
+    assert_eq!(stored_count(&other).await, 1);
+
+    let offline = remote::send(&config, &peer("OFFLINE", 1), &h.store, selected, |_| false)
+        .await
+        .unwrap_err();
+    assert!(matches!(offline, RemoteError::Unreachable(_)), "{offline}");
+}
+
+async fn stored_count(harness: &Harness) -> usize {
+    harness
+        .store
+        .select(fortitude_store::retrieve::Selection {
+            patient_id: Some("PAT-1".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .len()
 }
 
 #[tokio::test]

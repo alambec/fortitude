@@ -1,11 +1,13 @@
 //! Fortitude as a service user of its peers (modalities, PACS): verification (C-ECHO),
-//! queries (C-FIND) and retrievals (C-MOVE) on the Patient Root and Study Root models.
+//! queries (C-FIND) and retrievals (C-MOVE) on the Patient Root and Study Root models, and
+//! storage (C-STORE) of stored instances.
 //!
 //! Each operation opens an association of its own with Fortitude's AE title as calling AE
-//! title, proposing Explicit and Implicit VR Little Endian. Queries and retrievals use the
-//! Study Root model, or the Patient Root one at the patient level and with peers that only
-//! accept it.
+//! title, proposing Explicit and Implicit VR Little Endian (and, to send instances, their
+//! stored transfer syntaxes). Queries and retrievals use the Study Root model, or the Patient
+//! Root one at the patient level and with peers that only accept it.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dicom_core::{DataElement, PrimitiveValue, VR};
@@ -13,8 +15,12 @@ use dicom_dictionary_std::{tags, uids};
 use dicom_encoding::TransferSyntaxIndex;
 use dicom_object::InMemDicomObject;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+use fortitude_store::Store;
+use fortitude_store::retrieve::StoredInstance;
+use futures::StreamExt;
 
 use crate::command::{Command, field, status};
+use crate::retrieve::{Destination, Plan, READ_AHEAD, prepare};
 use crate::scu::{Options, Response, Scu};
 use crate::{Config, Peer};
 
@@ -426,6 +432,180 @@ pub async fn retrieve(
     }
     .await;
     finish(scu, result).await
+}
+
+/// Failures kept in [`Sent::failures`]; the others are only counted.
+pub const MAX_FAILURES: usize = 100;
+
+/// An instance a send could not store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub sop_instance_uid: String,
+    pub reason: String,
+}
+
+/// The end of a send.
+#[derive(Debug, Clone, Default)]
+pub struct Sent {
+    /// `remaining` is the number of instances not sent, when cancelled.
+    pub progress: Progress,
+    pub cancelled: bool,
+    /// The first [`MAX_FAILURES`] instances that were not stored, in order.
+    pub failures: Vec<Failure>,
+}
+
+/// The meaning of a failure status of a C-STORE response (PS3.4 Annex B).
+fn describe_store_failure(status: u16) -> &'static str {
+    match status {
+        s if s & 0xFF00 == 0xA700 => "out of resources",
+        s if s & 0xFF00 == 0xA900 => "data set does not match SOP class",
+        s if s & 0xF000 == 0xC000 => "cannot understand",
+        0x0122 => "SOP class not supported",
+        0x0124 => "not authorized",
+        0x0117 => "invalid SOP instance",
+        status::UNRECOGNIZED_OPERATION => "unrecognized operation",
+        _ => "failure",
+    }
+}
+
+/// Send stored `instances` to `peer` with C-STORE requests, over one association proposing
+/// their SOP classes, each in its stored transfer syntax and in Explicit and Implicit VR
+/// Little Endian (as for C-MOVE: files go out as stored, unless the peer only accepts an
+/// uncompressed syntax). `on_progress` is called before the first instance and after each
+/// one, and returns whether to stop; the association is then released.
+///
+/// Fails when the peer cannot be reached or accepts none of the SOP classes; otherwise the
+/// instances it refused are counted and listed as [failures](Sent::failures). When the
+/// association breaks, the instances not sent yet fail with it.
+pub async fn send(
+    config: &Config,
+    peer: &Peer,
+    store: &Arc<Store>,
+    instances: Vec<StoredInstance>,
+    mut on_progress: impl FnMut(&Progress) -> bool,
+) -> Result<Sent, RemoteError> {
+    let total = instances.len();
+    let mut sent = Sent {
+        progress: Progress {
+            remaining: Some(u16::try_from(total).unwrap_or(u16::MAX)),
+            ..Progress::default()
+        },
+        ..Sent::default()
+    };
+    if total == 0 {
+        sent.progress.remaining = None;
+        return Ok(sent);
+    }
+    let mut destination = Destination::open(config, peer, &instances)
+        .await
+        .map_err(|e| {
+            RemoteError::Unreachable(format!(
+                "{} at {}:{}: {e}",
+                peer.ae_title, peer.host, peer.port
+            ))
+        })?;
+    let plans: Vec<(StoredInstance, Plan)> = instances
+        .into_iter()
+        .map(|instance| {
+            let plan = destination.plan(&instance);
+            (instance, plan)
+        })
+        .collect();
+    if plans.iter().all(|(_, plan)| plan.is_none()) {
+        destination.release().await;
+        return Err(RemoteError::Unsupported(
+            "the SOP classes of these instances",
+        ));
+    }
+
+    let uids: Vec<String> = plans.iter().map(|(i, _)| i.sop_uid.clone()).collect();
+    let fail = |sent: &mut Sent, sop_instance_uid: &str, reason: String| {
+        sent.progress.failed = sent.progress.failed.saturating_add(1);
+        if sent.failures.len() < MAX_FAILURES {
+            sent.failures.push(Failure {
+                sop_instance_uid: sop_instance_uid.to_owned(),
+                reason,
+            });
+        }
+        metrics::counter!("fortitude_dimse_sent_instances_total", "outcome" => "failed")
+            .increment(1);
+    };
+    let mut processed = 0;
+    let mut broken = None;
+    let mut loads = futures::stream::iter(plans)
+        .map(|plan| prepare(store, plan))
+        .buffered(READ_AHEAD);
+    sent.cancelled = on_progress(&sent.progress);
+    while !sent.cancelled {
+        let Some((instance, plan, loaded)) = loads.next().await else {
+            break;
+        };
+        processed += 1;
+        sent.progress.remaining = Some(u16::try_from(total - processed).unwrap_or(u16::MAX));
+        let outcome = match (plan, loaded) {
+            (Some((pc, _)), Ok((bytes, offset))) => {
+                let request = Command::default()
+                    .with_u16(tags::COMMAND_FIELD, field::C_STORE_RQ)
+                    // 1 to 65535, then 1 again.
+                    .with_u16(tags::MESSAGE_ID, ((processed - 1) % 0xFFFF + 1) as u16)
+                    .with_u16(tags::PRIORITY, 0)
+                    .with_uid(tags::AFFECTED_SOP_CLASS_UID, &instance.sop_class_uid)
+                    .with_uid(tags::AFFECTED_SOP_INSTANCE_UID, &instance.sop_uid)
+                    .with_data_set(true);
+                let stored = destination.store(pc, &request, &bytes[offset..]).await;
+                if let Err(e) = &stored {
+                    broken = Some(e.clone());
+                }
+                stored
+            }
+            (_, Err(e)) => Err(e),
+            (None, Ok(_)) => Err(
+                "no presentation context accepted for its SOP class and transfer syntax".to_owned(),
+            ),
+        };
+        match outcome {
+            Ok(s) if s == status::SUCCESS || status::is_warning(s) => {
+                if s == status::SUCCESS {
+                    sent.progress.completed = sent.progress.completed.saturating_add(1);
+                } else {
+                    sent.progress.warning = sent.progress.warning.saturating_add(1);
+                }
+                metrics::counter!("fortitude_dimse_sent_instances_total", "outcome" => "sent")
+                    .increment(1);
+            }
+            Ok(s) => {
+                let reason = format!("{} ({s:04X})", describe_store_failure(s));
+                fail(&mut sent, &instance.sop_uid, reason);
+            }
+            Err(reason) => fail(&mut sent, &instance.sop_uid, reason),
+        }
+        if broken.is_some() {
+            break;
+        }
+        sent.cancelled = on_progress(&sent.progress);
+    }
+    drop(loads);
+    if let Some(e) = broken {
+        destination.abort().await;
+        // The instances not sent yet fail with the association.
+        let reason = format!("not sent: the association broke ({e})");
+        for uid in &uids[processed..] {
+            fail(&mut sent, uid, reason.clone());
+        }
+        sent.progress.remaining = None;
+    } else {
+        destination.release().await;
+        let remaining = total - processed;
+        sent.progress.remaining =
+            (remaining > 0).then(|| u16::try_from(remaining).unwrap_or(u16::MAX));
+    }
+    tracing::debug!(
+        peer = peer.ae_title,
+        completed = sent.progress.completed,
+        failed = sent.progress.failed,
+        "C-STORE: send finished"
+    );
+    Ok(sent)
 }
 
 /// A key of a query, typed with the VR of the standard dictionary.

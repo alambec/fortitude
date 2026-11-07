@@ -1,12 +1,13 @@
 //! Modalities: the remote application entities (PACS, scanners, workstations) Fortitude
-//! verifies (C-ECHO), queries (C-FIND) and retrieves from (C-MOVE), as a DIMSE service user.
+//! verifies (C-ECHO), queries (C-FIND), retrieves from (C-MOVE) and sends stored instances to
+//! (C-STORE), as a DIMSE service user.
 //!
 //! They are those of the configuration file (`dimse.peers`), which cannot be changed here,
 //! and those registered through this API, kept in the index. Both are C-MOVE destinations of
 //! Fortitude's own DIMSE service, and allowed to associate when unknown peers are not.
 //!
-//! Retrievals run in the background, one association each; the last ones are kept, with
-//! their progress, until the server stops.
+//! Retrievals and sends run in the background, one association each; the last ones of each
+//! kind are kept, with their progress, until the server stops.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,12 +27,13 @@ use fortitude_dimse::Peer;
 use fortitude_dimse::remote::{self, Level, RemoteError};
 use fortitude_store::Store;
 use fortitude_store::modalities::Modality;
+use fortitude_store::retrieve::Selection;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, DimseConfig};
 
-/// Retrievals kept, running or not.
-const MAX_MOVES: usize = 100;
+/// Retrievals kept, running or not, and sends.
+const MAX_TRANSFERS: usize = 100;
 /// Matches of a query when the request does not say.
 const DEFAULT_FIND_LIMIT: usize = 1000;
 
@@ -116,14 +118,10 @@ pub struct Modalities {
     listening: bool,
     /// Serializes changes, so that the peers follow the index.
     changes: tokio::sync::Mutex<()>,
-    moves: Mutex<Moves>,
-}
-
-#[derive(Default)]
-struct Moves {
-    next_id: u64,
-    /// Newest last.
-    list: VecDeque<MoveJob>,
+    /// Retrievals (C-MOVE).
+    moves: Transfers,
+    /// Sends (C-STORE).
+    sends: Transfers,
 }
 
 /// A modality, as listed.
@@ -149,7 +147,8 @@ impl Modalities {
             configured: config.peers.clone(),
             listening: config.listen.is_some(),
             changes: tokio::sync::Mutex::new(()),
-            moves: Mutex::new(Moves::default()),
+            moves: Transfers::default(),
+            sends: Transfers::default(),
         })
     }
 
@@ -204,10 +203,6 @@ impl Modalities {
     fn is_configured(&self, ae_title: &str) -> bool {
         self.configured.iter().any(|p| p.ae_title == ae_title)
     }
-
-    fn moves(&self) -> std::sync::MutexGuard<'_, Moves> {
-        self.moves.lock().unwrap_or_else(|e| e.into_inner())
-    }
 }
 
 pub fn router(modalities: Arc<Modalities>) -> Router {
@@ -217,8 +212,11 @@ pub fn router(modalities: Arc<Modalities>) -> Router {
         .route("/modalities/{ae}/echo", get(echo))
         .route("/modalities/{ae}/find", get(find))
         .route("/modalities/{ae}/move", post(start_move))
+        .route("/modalities/{ae}/store", post(start_send))
         .route("/moves", get(moves))
         .route("/moves/{id}/cancel", post(cancel_move))
+        .route("/sends", get(sends))
+        .route("/sends/{id}/cancel", post(cancel_send))
         .with_state(modalities)
 }
 
@@ -553,6 +551,154 @@ fn numbers(value: &mut serde_json::Value) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TransferState {
+    Running,
+    /// Every sub-operation (instance) succeeded.
+    Succeeded,
+    /// Some sub-operations failed, or completed with warnings.
+    Partial,
+    Cancelled,
+    Failed,
+}
+
+/// An instance a send could not store.
+#[derive(Debug, Clone, Serialize)]
+struct FailedInstance {
+    sop_instance_uid: String,
+    reason: String,
+}
+
+/// A retrieval (C-MOVE from `modality` to `destination`) or a send (C-STORE to `modality`).
+#[derive(Debug, Clone, Serialize)]
+struct Transfer {
+    id: u64,
+    modality: String,
+    /// Retrievals only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
+    level: &'static str,
+    keys: BTreeMap<String, String>,
+    state: TransferState,
+    /// Final status of a retrieval (hexadecimal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    remaining: Option<u16>,
+    completed: u16,
+    failed: u16,
+    warning: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Sends only: the first instances that were not stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failures: Option<Vec<FailedInstance>>,
+    started_at: u64,
+    finished_at: Option<u64>,
+    #[serde(skip)]
+    cancel: Arc<AtomicBool>,
+}
+
+impl Transfer {
+    fn new(modality: &str, level: Level, keys: BTreeMap<String, String>) -> Self {
+        Self {
+            id: 0,
+            modality: modality.to_owned(),
+            destination: None,
+            level: level.as_str(),
+            keys,
+            state: TransferState::Running,
+            status: None,
+            remaining: None,
+            completed: 0,
+            failed: 0,
+            warning: 0,
+            error: None,
+            failures: None,
+            started_at: now(),
+            finished_at: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn progress(&mut self, progress: &remote::Progress) {
+        self.remaining = progress.remaining;
+        self.completed = progress.completed;
+        self.failed = progress.failed;
+        self.warning = progress.warning;
+    }
+}
+
+/// The last transfers of one kind, running or not.
+#[derive(Default)]
+struct Transfers(Mutex<TransferList>);
+
+#[derive(Default)]
+struct TransferList {
+    next_id: u64,
+    /// Newest last.
+    list: VecDeque<Transfer>,
+}
+
+impl Transfers {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TransferList> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Add `transfer`, numbered here; the oldest finished ones go beyond the limit.
+    fn add(&self, mut transfer: Transfer) -> Transfer {
+        let mut transfers = self.lock();
+        transfers.next_id += 1;
+        transfer.id = transfers.next_id;
+        transfers.list.push_back(transfer.clone());
+        while transfers.list.len() > MAX_TRANSFERS {
+            match transfers
+                .list
+                .iter()
+                .position(|t| t.state != TransferState::Running)
+            {
+                Some(i) => {
+                    transfers.list.remove(i);
+                }
+                None => break,
+            }
+        }
+        transfer
+    }
+
+    fn update(&self, id: u64, f: impl FnOnce(&mut Transfer)) {
+        if let Some(transfer) = self.lock().list.iter_mut().find(|t| t.id == id) {
+            f(transfer);
+        }
+    }
+
+    /// Newest first.
+    fn list(&self) -> Vec<Transfer> {
+        self.lock().list.iter().rev().cloned().collect()
+    }
+
+    /// Ask a running transfer to stop: `202`, `404` when unknown, `409` when it is over.
+    fn cancel(&self, id: u64, name: &str) -> Response {
+        let transfers = self.lock();
+        match transfers.list.iter().find(|t| t.id == id) {
+            None => (StatusCode::NOT_FOUND, format!("unknown {name}")).into_response(),
+            Some(t) if t.state != TransferState::Running => {
+                (StatusCode::CONFLICT, format!("this {name} is over")).into_response()
+            }
+            Some(t) => {
+                t.cancel.store(true, Ordering::Relaxed);
+                (StatusCode::ACCEPTED, Json(t.clone())).into_response()
+            }
+        }
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MoveRequest {
@@ -564,45 +710,16 @@ struct MoveRequest {
     destination: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum MoveState {
-    Running,
-    /// Every sub-operation succeeded.
-    Succeeded,
-    /// Some sub-operations failed, or completed with warnings.
-    Partial,
-    Cancelled,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MoveJob {
-    id: u64,
-    modality: String,
-    destination: String,
-    level: &'static str,
-    keys: BTreeMap<String, String>,
-    state: MoveState,
-    /// Final status (hexadecimal).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    remaining: Option<u16>,
-    completed: u16,
-    failed: u16,
-    warning: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    started_at: u64,
-    finished_at: Option<u64>,
-    #[serde(skip)]
-    cancel: Arc<AtomicBool>,
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// `400` naming the unique key `level` requires.
+fn missing_unique_key(level: Level) -> Response {
+    let name = StandardDataDictionary
+        .by_tag(unique_key(level))
+        .map_or("unique key", |e| e.alias());
+    (
+        StatusCode::BAD_REQUEST,
+        format!("{name} is required at this level"),
+    )
+        .into_response()
 }
 
 /// Start a C-MOVE from the modality: `202 Accepted` with the retrieval (see `GET
@@ -638,16 +755,8 @@ async fn start_move(
             }
         };
     }
-    let required = unique_key(level);
-    if identifier.get(required).is_none() {
-        let name = StandardDataDictionary
-            .by_tag(required)
-            .map_or("unique key", |e| e.alias());
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("{name} is required at this level"),
-        )
-            .into_response();
+    if identifier.get(unique_key(level)).is_none() {
+        return missing_unique_key(level);
     }
     let own = &modalities.dimse.ae_title;
     let destination = request
@@ -666,43 +775,10 @@ async fn start_move(
             .into_response();
     }
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    let job = {
-        let mut moves = modalities.moves();
-        moves.next_id += 1;
-        let job = MoveJob {
-            id: moves.next_id,
-            modality: peer.ae_title.clone(),
-            destination: destination.clone(),
-            level: level.as_str(),
-            keys: request.keys,
-            state: MoveState::Running,
-            status: None,
-            remaining: None,
-            completed: 0,
-            failed: 0,
-            warning: 0,
-            error: None,
-            started_at: now(),
-            finished_at: None,
-            cancel: cancel.clone(),
-        };
-        moves.list.push_back(job.clone());
-        // The oldest finished retrievals go first.
-        while moves.list.len() > MAX_MOVES {
-            match moves
-                .list
-                .iter()
-                .position(|j| j.state != MoveState::Running)
-            {
-                Some(i) => {
-                    moves.list.remove(i);
-                }
-                None => break,
-            }
-        }
-        job
-    };
+    let job = modalities.moves.add(Transfer {
+        destination: Some(destination.clone()),
+        ..Transfer::new(&peer.ae_title, level, request.keys)
+    });
     tracing::info!(
         id = job.id,
         modality = peer.ae_title,
@@ -710,14 +786,9 @@ async fn start_move(
         level = job.level,
         "C-MOVE started"
     );
-    let id = job.id;
+    let (id, cancel) = (job.id, job.cancel.clone());
     let task = modalities.clone();
     tokio::spawn(async move {
-        let update = |f: &dyn Fn(&mut MoveJob)| {
-            if let Some(job) = task.moves().list.iter_mut().find(|j| j.id == id) {
-                f(job);
-            }
-        };
         let result = remote::retrieve(
             &task.dimse,
             &peer,
@@ -725,31 +796,25 @@ async fn start_move(
             identifier,
             &destination,
             |progress| {
-                update(&|job| {
-                    job.remaining = progress.remaining;
-                    job.completed = progress.completed;
-                    job.failed = progress.failed;
-                    job.warning = progress.warning;
-                });
+                task.moves.update(id, |job| job.progress(progress));
                 cancel.load(Ordering::Relaxed)
             },
         )
         .await;
         count("C-MOVE", &result);
-        update(&|job| {
+        task.moves.update(id, |job| {
             job.finished_at = Some(now());
             match &result {
                 Ok(moved) => {
                     let p = moved.progress;
-                    (job.remaining, job.completed, job.failed, job.warning) =
-                        (p.remaining, p.completed, p.failed, p.warning);
+                    job.progress(&p);
                     job.status = Some(format!("{:04X}", moved.status));
                     job.state = if moved.status == fortitude_dimse::command::status::CANCEL {
-                        MoveState::Cancelled
+                        TransferState::Cancelled
                     } else if p.failed > 0 || p.warning > 0 || moved.status != 0 {
-                        MoveState::Partial
+                        TransferState::Partial
                     } else {
-                        MoveState::Succeeded
+                        TransferState::Succeeded
                     };
                 }
                 Err(e) => {
@@ -757,7 +822,7 @@ async fn start_move(
                         job.status = Some(format!("{status:04X}"));
                     }
                     job.error = Some(e.to_string());
-                    job.state = MoveState::Failed;
+                    job.state = TransferState::Failed;
                 }
             }
         });
@@ -777,22 +842,184 @@ async fn start_move(
 
 /// The retrievals, newest first.
 async fn moves(State(modalities): State<Arc<Modalities>>) -> Response {
-    let moves: Vec<MoveJob> = modalities.moves().list.iter().rev().cloned().collect();
-    Json(serde_json::json!({ "moves": moves })).into_response()
+    Json(serde_json::json!({ "moves": modalities.moves.list() })).into_response()
 }
 
 /// Cancel a running retrieval (a C-CANCEL is sent with the next response of the modality):
 /// `202`, `404` when unknown, `409` when it is over.
 async fn cancel_move(State(modalities): State<Arc<Modalities>>, Path(id): Path<u64>) -> Response {
-    let moves = modalities.moves();
-    match moves.list.iter().find(|j| j.id == id) {
-        None => (StatusCode::NOT_FOUND, "unknown retrieval").into_response(),
-        Some(job) if job.state != MoveState::Running => {
-            (StatusCode::CONFLICT, "this retrieval is over").into_response()
+    modalities.moves.cancel(id, "retrieval")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendRequest {
+    level: String,
+    /// `PatientID` (and `IssuerOfPatientID`), `StudyInstanceUID`, `SeriesInstanceUID`,
+    /// `SOPInstanceUID`, by keyword or tag: the key of the level is required, the others
+    /// narrow the selection. UIDs can be lists separated by backslashes.
+    keys: BTreeMap<String, String>,
+}
+
+/// The stored instances `keys` select, as for a C-MOVE received by Fortitude.
+#[allow(clippy::result_large_err)]
+fn selection(level: Level, keys: &BTreeMap<String, String>) -> Result<Selection, Response> {
+    let mut selection = Selection::default();
+    for (name, value) in keys {
+        let value = value.trim();
+        let Some(tag) = attribute(name) else {
+            return Err(
+                (StatusCode::BAD_REQUEST, format!("unknown attribute {name}")).into_response(),
+            );
+        };
+        if value.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, format!("{name} has no value")).into_response());
         }
-        Some(job) => {
-            job.cancel.store(true, Ordering::Relaxed);
-            (StatusCode::ACCEPTED, Json(job.clone())).into_response()
+        let uids = || {
+            value
+                .split('\\')
+                .map(|u| u.trim().to_owned())
+                .filter(|u| !u.is_empty())
+                .collect()
+        };
+        match tag {
+            tags::PATIENT_ID => selection.patient_id = Some(value.to_owned()),
+            tags::ISSUER_OF_PATIENT_ID => selection.issuer_of_patient_id = Some(value.to_owned()),
+            tags::STUDY_INSTANCE_UID => selection.studies = uids(),
+            tags::SERIES_INSTANCE_UID => selection.series = uids(),
+            tags::SOP_INSTANCE_UID => selection.instances = uids(),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{name} does not select instances: use PatientID, IssuerOfPatientID, StudyInstanceUID, SeriesInstanceUID or SOPInstanceUID"),
+                )
+                    .into_response());
+            }
         }
     }
+    let present = match level {
+        Level::Patient => selection.patient_id.is_some(),
+        Level::Study => !selection.studies.is_empty(),
+        Level::Series => !selection.series.is_empty(),
+        Level::Image => !selection.instances.is_empty(),
+    };
+    if present {
+        Ok(selection)
+    } else {
+        Err(missing_unique_key(level))
+    }
+}
+
+/// Send stored instances to the modality (C-STORE): `202 Accepted` with the send (see `GET
+/// /admin/sends`), `404` when nothing stored matches.
+async fn start_send(
+    State(modalities): State<Arc<Modalities>>,
+    Path(ae_title): Path<String>,
+    body: Result<Json<SendRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    let peer = match peer(&modalities, &ae_title) {
+        Ok(peer) => peer,
+        Err(response) => return response,
+    };
+    let Some(level) = Level::parse(&request.level) else {
+        return (StatusCode::BAD_REQUEST, "invalid level").into_response();
+    };
+    let selection = match selection(level, &request.keys) {
+        Ok(selection) => selection,
+        Err(response) => return response,
+    };
+    let instances = match modalities.store.select(selection).await {
+        Ok(instances) => instances,
+        Err(e) => return internal(e),
+    };
+    if instances.is_empty() {
+        return (StatusCode::NOT_FOUND, "no stored instance matches").into_response();
+    }
+
+    let job = modalities.sends.add(Transfer {
+        remaining: Some(u16::try_from(instances.len()).unwrap_or(u16::MAX)),
+        failures: Some(Vec::new()),
+        ..Transfer::new(&peer.ae_title, level, request.keys)
+    });
+    tracing::info!(
+        id = job.id,
+        modality = peer.ae_title,
+        level = job.level,
+        instances = instances.len(),
+        "C-STORE send started"
+    );
+    let (id, cancel) = (job.id, job.cancel.clone());
+    let task = modalities.clone();
+    tokio::spawn(async move {
+        let result = remote::send(&task.dimse, &peer, &task.store, instances, |progress| {
+            task.sends.update(id, |job| job.progress(progress));
+            cancel.load(Ordering::Relaxed)
+        })
+        .await;
+        count("C-STORE", &result);
+        task.sends.update(id, |job| {
+            job.finished_at = Some(now());
+            match &result {
+                Ok(sent) => {
+                    let p = sent.progress;
+                    job.progress(&p);
+                    job.failures = Some(
+                        sent.failures
+                            .iter()
+                            .map(|f| FailedInstance {
+                                sop_instance_uid: f.sop_instance_uid.clone(),
+                                reason: f.reason.clone(),
+                            })
+                            .collect(),
+                    );
+                    job.error = sent.failures.first().map(|f| {
+                        if p.failed > 1 {
+                            format!("{} and {} more", f.reason, p.failed - 1)
+                        } else {
+                            f.reason.clone()
+                        }
+                    });
+                    job.state = if sent.cancelled {
+                        TransferState::Cancelled
+                    } else if p.failed > 0 && p.completed == 0 && p.warning == 0 {
+                        TransferState::Failed
+                    } else if p.failed > 0 || p.warning > 0 {
+                        TransferState::Partial
+                    } else {
+                        TransferState::Succeeded
+                    };
+                }
+                Err(e) => {
+                    job.error = Some(e.to_string());
+                    job.state = TransferState::Failed;
+                }
+            }
+        });
+        match &result {
+            Ok(sent) => tracing::info!(
+                id,
+                completed = sent.progress.completed,
+                failed = sent.progress.failed,
+                cancelled = sent.cancelled,
+                "C-STORE send finished"
+            ),
+            Err(e) => tracing::info!(id, error = %e, "C-STORE send failed"),
+        }
+    });
+    (StatusCode::ACCEPTED, Json(job)).into_response()
+}
+
+/// The sends, newest first.
+async fn sends(State(modalities): State<Arc<Modalities>>) -> Response {
+    Json(serde_json::json!({ "sends": modalities.sends.list() })).into_response()
+}
+
+/// Stop a running send after the instance being sent: `202`, `404` when unknown, `409` when
+/// it is over.
+async fn cancel_send(State(modalities): State<Arc<Modalities>>, Path(id): Path<u64>) -> Response {
+    modalities.sends.cancel(id, "send")
 }

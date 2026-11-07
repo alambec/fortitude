@@ -6,8 +6,8 @@
 //! destination, or back on the requestor's association), unless the receiver only accepts
 //! another transfer syntax.
 //!
-//! As an SCU ([`remote`]), Fortitude verifies, queries and retrieves from the known peers
-//! (C-ECHO, C-FIND, C-MOVE).
+//! As an SCU ([`remote`]), Fortitude verifies, queries and retrieves from the known peers,
+//! and sends them stored instances (C-ECHO, C-FIND, C-MOVE, C-STORE).
 
 pub mod association;
 pub mod command;
