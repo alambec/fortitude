@@ -19,25 +19,24 @@
   color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #111418;
-    --surface: #191d23;
-    --surface-2: #20252d;
-    --border: #2c323b;
-    --text: #e4e7ec;
-    --muted: #8d96a5;
-    --accent: #6b9bff;
-    --accent-soft: #1d2a44;
-    --ok: #5fd08f;
-    --danger: #ff7b70;
-    --danger-soft: #3a1e1c;
-    --warn: #f0c060;
-    --warn-soft: #3a3018;
-    --row-hover: #1f2633;
-    --shadow: none;
-    color-scheme: dark;
-  }
+/* Set by index.html and the theme button of app.js, from the viewer's choice or the system's. */
+:root[data-theme="dark"] {
+  --bg: #111418;
+  --surface: #191d23;
+  --surface-2: #20252d;
+  --border: #2c323b;
+  --text: #e4e7ec;
+  --muted: #8d96a5;
+  --accent: #6b9bff;
+  --accent-soft: #1d2a44;
+  --ok: #5fd08f;
+  --danger: #ff7b70;
+  --danger-soft: #3a1e1c;
+  --warn: #f0c060;
+  --warn-soft: #3a3018;
+  --row-hover: #1f2633;
+  --shadow: none;
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -97,6 +96,11 @@ a:hover { text-decoration: underline; }
 
 .stats { display: flex; gap: 18px; color: var(--muted); font-size: 13px; }
 .stats b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.theme-toggle { display: grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0; }
+.theme-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.theme-toggle .icon-sun, :root[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+:root[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
 
 .crumbs {
   display: flex;

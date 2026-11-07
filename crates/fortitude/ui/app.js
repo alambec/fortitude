@@ -1950,6 +1950,34 @@ function route() {
   view.append(notice("error", "This page does not exist."));
 }
 
+// Light or dark theme: index.html applies it before the first paint. Until the viewer picks
+// one with the button, it follows the system's.
+
+const THEME_KEY = "fortitude-theme";
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const button = document.getElementById("theme");
+  const label = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+  button.setAttribute("aria-label", label);
+  button.title = label;
+}
+
+function setupTheme() {
+  applyTheme(document.documentElement.dataset.theme === "dark" ? "dark" : "light");
+  document.getElementById("theme").addEventListener("click", () => {
+    const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    try { localStorage.setItem(THEME_KEY, theme); } catch { /* not remembered */ }
+    applyTheme(theme);
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (event) => {
+    let chosen = null;
+    try { chosen = localStorage.getItem(THEME_KEY); } catch { /* none */ }
+    if (chosen !== "light" && chosen !== "dark") applyTheme(event.matches ? "dark" : "light");
+  });
+}
+
 window.addEventListener("hashchange", route);
+setupTheme();
 route();
 refreshStatistics();
