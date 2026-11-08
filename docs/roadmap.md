@@ -83,11 +83,15 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
     the web explorer; the same presentation contexts and transcoding as C-MOVE
     sub-operations, with the progress of each send, the instances refused and their status,
     and cancellation. *(done)*
+16. **12-bit JPEG Extended** — jpeg-decoder, behind dicom-pixeldata, decodes 8-bit DCT-based
+    JPEG only: frames with 12-bit samples (process 4) are decoded by a decoder of sequential
+    DCT-based JPEG of Fortitude's own, for rendering, uncompressed frames and transcoding
+    (DICOMweb and DIMSE). Its inverse DCT, chroma upsampling and color conversion are those of
+    libjpeg-turbo, against whose output it is tested sample for sample. *(done)*
 
 ## Next
 
-- **12-bit JPEG Extended** decoding (jpeg-decoder supports 8-bit DCT only), and a faster
-  JPEG 2000 decoder.
+- A faster **JPEG 2000** decoder.
 - **DIMSE**: storage commitment, TLS; C-GET as an SCU (retrieve from a modality that cannot
   reach Fortitude).
 

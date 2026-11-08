@@ -1,6 +1,6 @@
-//! Pixel data that dicom-pixeldata alone does not decode or render correctly: JPEG-LS, big
-//! endian samples, native YBR, 32-bit and floating point samples, signed samples without a
-//! window, and attributes encoded with VR UN.
+//! Pixel data that dicom-pixeldata alone does not decode or render correctly: JPEG-LS, 12-bit
+//! JPEG Extended, big endian samples, native YBR, 32-bit and floating point samples, signed
+//! samples without a window, and attributes encoded with VR UN.
 
 mod common;
 
@@ -9,7 +9,8 @@ use common::{App, app};
 use dicom_core::value::{PixelFragmentSequence, Value};
 use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::tags;
-use fortitude_testkit::{Instance, Pixels};
+use fortitude_testkit::jpeg::fixture;
+use fortitude_testkit::{EXPLICIT_VR_LE, IMPLICIT_VR_LE, Instance, JPEG_EXTENDED, Pixels};
 
 const EXPLICIT_VR_BE: &str = "1.2.840.10008.1.2.2";
 const JPEG_LS_NEAR_LOSSLESS: &str = "1.2.840.10008.1.2.4.81";
@@ -353,4 +354,226 @@ async fn deflated() {
         .get(&format!("{}/rendered", path(&report)), "image/png")
         .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+/// Fragments of the JPEG fixtures `names`, one frame each.
+fn jpeg_frames(names: &[&str]) -> Pixels {
+    encapsulated(
+        names
+            .iter()
+            .map(|name| {
+                let mut stream = fixture(name).0;
+                if stream.len() % 2 == 1 {
+                    stream.push(0);
+                }
+                stream
+            })
+            .collect(),
+    )
+}
+
+/// A 61x45 image of 12-bit samples in JPEG Extended, with these frames.
+fn jpeg_12_bit(sop: &str, names: &[&str], samples_per_pixel: u16, signed: bool) -> Instance {
+    let mut instance = image(
+        sop,
+        JPEG_EXTENDED,
+        &[
+            (tags::BITS_ALLOCATED, 16),
+            (tags::BITS_STORED, 12),
+            (tags::HIGH_BIT, 11),
+            (tags::PIXEL_REPRESENTATION, u16::from(signed)),
+            (tags::SAMPLES_PER_PIXEL, samples_per_pixel),
+        ],
+        jpeg_frames(names),
+    )
+    .with(|i| {
+        i.rows = 45;
+        i.columns = 61;
+        i.frames = names.len() as u32;
+    });
+    if samples_per_pixel == 3 {
+        instance = instance
+            .element(tags::PLANAR_CONFIGURATION, VR::US, 0u16)
+            .element(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "YBR_FULL_422");
+    }
+    instance
+}
+
+/// The instance transcoded to `transfer_syntax` by WADO-RS.
+async fn transcoded(
+    app: &App,
+    instance: &Instance,
+    transfer_syntax: &str,
+) -> dicom_object::DefaultDicomObject {
+    let accept = format!(
+        r#"multipart/related; type="application/dicom"; transfer-syntax={transfer_syntax}"#
+    );
+    let reply = app.get(&path(instance), &accept).await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    let parts = reply.parts().await;
+    assert_eq!(
+        parts[0].0,
+        format!("application/dicom; transfer-syntax={transfer_syntax}")
+    );
+    let obj = dicom_object::OpenFileOptions::new()
+        .from_reader(&parts[0].1[..])
+        .expect("valid DICOM");
+    assert_eq!(
+        obj.meta().transfer_syntax().trim_end_matches('\0'),
+        transfer_syntax
+    );
+    obj
+}
+
+fn text(obj: &dicom_object::DefaultDicomObject, tag: Tag) -> String {
+    obj.element(tag)
+        .expect("element")
+        .to_str()
+        .expect("text")
+        .trim()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn jpeg_extended_12_bit_gray() {
+    let names = ["12-gray", "12-gray-restart"];
+    let instance = jpeg_12_bit("3.1.1.1", &names, 1, false);
+    let app = stored(&[&instance]).await;
+    let expected: Vec<Vec<u8>> = names.iter().map(|n| fixture(n).1.to_le_bytes()).collect();
+    assert_eq!(decoded(&app, &instance, 1).await, expected[0]);
+    assert_eq!(decoded(&app, &instance, 2).await, expected[1]);
+
+    // Rendered with the range of values as window: the square is at the top of the range.
+    let image = rendered(&app, &instance).await;
+    assert_eq!(image.dimensions(), (61, 45));
+    assert!(
+        image.get_pixel(20, 15).0[0] >= 250,
+        "{:?}",
+        image.get_pixel(20, 15)
+    );
+    let last = app
+        .get(
+            &format!("{}/frames/2/rendered", path(&instance)),
+            "image/jpeg",
+        )
+        .await;
+    assert_eq!(last.status, StatusCode::OK);
+    let thumbnail = app
+        .get(&format!("{}/thumbnail", path(&instance)), "image/jpeg")
+        .await;
+    assert_eq!(thumbnail.status, StatusCode::OK);
+
+    // Transcoded instances hold all the frames.
+    for transfer_syntax in [EXPLICIT_VR_LE, IMPLICIT_VR_LE] {
+        let obj = transcoded(&app, &instance, transfer_syntax).await;
+        let pixels = obj.element(tags::PIXEL_DATA).unwrap().to_bytes().unwrap();
+        assert_eq!(pixels.as_ref(), expected.concat(), "{transfer_syntax}");
+        assert_eq!(text(&obj, tags::NUMBER_OF_FRAMES), "2");
+        assert_eq!(text(&obj, tags::PHOTOMETRIC_INTERPRETATION), "MONOCHROME2");
+    }
+
+    // Frames as stored, untouched.
+    let as_stored = app
+        .get(
+            &format!("{}/frames/1", path(&instance)),
+            &format!(r#"multipart/related; type="image/jpeg"; transfer-syntax={JPEG_EXTENDED}"#),
+        )
+        .await;
+    assert_eq!(as_stored.status, StatusCode::OK);
+    let mut stream = fixture(names[0]).0;
+    if stream.len() % 2 == 1 {
+        stream.push(0);
+    }
+    assert_eq!(as_stored.parts().await[0].1, stream);
+}
+
+#[tokio::test]
+async fn jpeg_extended_12_bit_signed() {
+    let instance = jpeg_12_bit("3.1.1.1", &["12-gray"], 1, true);
+    let app = stored(&[&instance]).await;
+    // Samples are sign extended from bit 11.
+    let expected: Vec<u16> = fixture("12-gray")
+        .1
+        .samples
+        .iter()
+        .map(|&s| ((s << 4) as i16 >> 4) as u16)
+        .collect();
+    assert!(expected.iter().any(|&s| (s as i16) < 0));
+    assert_eq!(decoded(&app, &instance, 1).await, le16(&expected));
+    assert_eq!(rendered(&app, &instance).await.dimensions(), (61, 45));
+}
+
+#[tokio::test]
+async fn jpeg_extended_12_bit_color() {
+    let instance = jpeg_12_bit("3.1.1.1", &["12-ycbcr-420"], 3, false);
+    let app = stored(&[&instance]).await;
+    // Converted to RGB, as the photometric interpretation is YBR_FULL_422.
+    let expected = fixture("12-ycbcr-420").1.to_le_bytes();
+    assert_eq!(decoded(&app, &instance, 1).await, expected);
+    // A red square on a colored background.
+    let image = rendered(&app, &instance).await;
+    assert_eq!(image.dimensions(), (61, 45));
+    let [red, green, blue] = image.get_pixel(20, 15).0;
+    assert!(
+        red > 200 && green < 50 && blue > 200,
+        "{red} {green} {blue}"
+    );
+
+    let obj = transcoded(&app, &instance, EXPLICIT_VR_LE).await;
+    assert_eq!(text(&obj, tags::PHOTOMETRIC_INTERPRETATION), "RGB");
+    assert_eq!(
+        obj.element(tags::PLANAR_CONFIGURATION)
+            .unwrap()
+            .to_int::<u16>()
+            .unwrap(),
+        0
+    );
+    let pixels = obj.element(tags::PIXEL_DATA).unwrap().to_bytes().unwrap();
+    assert_eq!(pixels.as_ref(), expected);
+}
+
+#[tokio::test]
+async fn jpeg_extended_12_bit_invalid() {
+    // Frame of 61x45 pixels, Rows and Columns of 8x8.
+    let wrong_size = image(
+        "3.1.1.1",
+        JPEG_EXTENDED,
+        &[
+            (tags::BITS_ALLOCATED, 16),
+            (tags::BITS_STORED, 12),
+            (tags::HIGH_BIT, 11),
+        ],
+        jpeg_frames(&["12-gray"]),
+    );
+    // Truncated in its headers.
+    let mut stream = fixture("12-gray").0;
+    stream.truncate(100);
+    let truncated = jpeg_12_bit("3.1.1.2", &[], 1, false).with(|i| {
+        i.frames = 1;
+        i.pixels = encapsulated(vec![stream]);
+    });
+    let app = stored(&[&wrong_size, &truncated]).await;
+    for instance in [&wrong_size, &truncated] {
+        let reply = app
+            .get(
+                &format!("{}/frames/1/rendered", path(instance)),
+                "image/png",
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_ACCEPTABLE,
+            "{}",
+            instance.sop_uid
+        );
+        let reply = app
+            .get(&format!("{}/frames/1", path(instance)), DECODED)
+            .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_ACCEPTABLE,
+            "{}",
+            instance.sop_uid
+        );
+    }
 }

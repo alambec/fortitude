@@ -13,9 +13,12 @@ use dicom_dictionary_std::{tags, uids};
 use dicom_object::mem::InMemElement;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 
+pub mod jpeg;
+
 pub const EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
 pub const IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
 pub const JPEG_BASELINE: &str = "1.2.840.10008.1.2.4.50";
+pub const JPEG_EXTENDED: &str = "1.2.840.10008.1.2.4.51";
 
 #[derive(Debug, Clone)]
 pub enum Pixels {

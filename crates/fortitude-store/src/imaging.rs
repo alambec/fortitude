@@ -20,7 +20,7 @@ use dicom_pixeldata::{
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use dicom_transfer_syntax_registry::entries::{
     DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN, EXPLICIT_VR_BIG_ENDIAN, EXPLICIT_VR_LITTLE_ENDIAN,
-    IMPLICIT_VR_LITTLE_ENDIAN, RLE_LOSSLESS,
+    IMPLICIT_VR_LITTLE_ENDIAN, JPEG_BASELINE, JPEG_EXTENDED, RLE_LOSSLESS,
 };
 use image::DynamicImage;
 use image::imageops::FilterType;
@@ -29,6 +29,7 @@ use crate::Store;
 use crate::convert::{self, SampleFormat};
 use crate::index::IndexError;
 use crate::ingest::resolve_unknown_vrs;
+use crate::jpeg;
 use crate::pixel::{PixelLayout, Range, Sample};
 use crate::retrieve::{PixelSource, Scope};
 
@@ -355,8 +356,21 @@ fn render(
     frame: u32,
     options: RenderOptions,
 ) -> Result<Vec<u8>, ImagingError> {
+    if is_jpeg_12_bit(obj) {
+        return render(&jpeg_frame_natively(obj, frame)?, 0, options);
+    }
     let format = SampleFormat::of(obj);
-    let mut image = if format.is_imageable() {
+    // dicom-pixeldata scales RGB samples of more than 8 bits from Bits Allocated rather than
+    // Bits Stored (12-bit RGB came out nearly black): they are rendered here.
+    let wide_rgb = matches!(format, SampleFormat::Integer { bits_allocated, .. } if bits_allocated > 8)
+        && int(obj, tags::SAMPLES_PER_PIXEL) == Some(3)
+        && obj
+            .element_opt(tags::PHOTOMETRIC_INTERPRETATION)
+            .ok()
+            .flatten()
+            .and_then(|e| e.to_str().ok())
+            .is_some_and(|p| p.trim_matches([' ', '\0']) == "RGB");
+    let mut image = if format.is_imageable() && !wide_rgb {
         let decoded = obj.decode_pixel_data_frame(frame).map_err(unsupported)?;
         let mut convert = ConvertOptions::new().with_bit_depth(BitDepthOption::Force8Bit);
         let window = options.window.or_else(|| {
@@ -442,6 +456,9 @@ fn jpeg(
 
 /// Frame `frame` of `obj` as native little endian samples.
 fn decode_frame(obj: &DefaultDicomObject, frame: u32) -> Result<Vec<u8>, ImagingError> {
+    if is_jpeg_12_bit(obj) {
+        return decode_frame(&jpeg_frame_natively(obj, frame)?, 0);
+    }
     let format = SampleFormat::of(obj);
     let ts = obj.meta().transfer_syntax();
     let int = |tag| {
@@ -499,8 +516,174 @@ fn transcode(
     mut obj: DefaultDicomObject,
     ts: &dicom_encoding::TransferSyntax,
 ) -> Result<Vec<u8>, ImagingError> {
+    if is_jpeg_12_bit(&obj) {
+        // Decoded here to Explicit VR Little Endian, the starting point of other syntaxes.
+        let frames = int(&obj, tags::NUMBER_OF_FRAMES).unwrap_or(1).max(1) as u32;
+        let pixels = (0..frames)
+            .map(|frame| decode_jpeg(&obj, frame))
+            .collect::<Result<Vec<_>, _>>()?;
+        make_native(&mut obj, pixels);
+    }
     obj.transcode(ts).map_err(unsupported)?;
     let mut out = Vec::new();
     obj.write_all(&mut out).map_err(unsupported)?;
     Ok(out)
+}
+
+/// Whether the pixel data of `obj` is JPEG with 12-bit samples (JPEG Extended, process 4),
+/// which dicom-pixeldata does not decode (jpeg-decoder supports 8-bit DCT-based JPEG only),
+/// from the frame header of its first fragment. JPEG Baseline is included for 12-bit streams
+/// labeled as such.
+fn is_jpeg_12_bit(obj: &DefaultDicomObject) -> bool {
+    let ts = obj.meta().transfer_syntax();
+    if ts != JPEG_EXTENDED.uid() && ts != JPEG_BASELINE.uid() {
+        return false;
+    }
+    obj.element_opt(tags::PIXEL_DATA)
+        .ok()
+        .flatten()
+        .and_then(|e| e.value().fragments()?.first().and_then(|f| jpeg::header(f)))
+        .is_some_and(|header| header.precision > 8)
+}
+
+/// The JPEG stream of frame `frame` of `obj`: its fragments, attributed to frames as one per
+/// frame, all to a single frame, or else by the start of each stream (SOI marker).
+fn jpeg_stream(obj: &DefaultDicomObject, frame: u32) -> Result<Vec<u8>, ImagingError> {
+    let frames = int(obj, tags::NUMBER_OF_FRAMES).unwrap_or(1).max(1) as usize;
+    let frame = frame as usize;
+    let fragments = obj
+        .element_opt(tags::PIXEL_DATA)
+        .ok()
+        .flatten()
+        .and_then(|e| e.value().fragments())
+        .ok_or(ImagingError::NoPixelData)?;
+    if frames == 1 {
+        return if frame == 0 {
+            Ok(fragments.concat())
+        } else {
+            Err(ImagingError::NoFrame(frame))
+        };
+    }
+    if fragments.len() == frames {
+        return fragments
+            .get(frame)
+            .cloned()
+            .ok_or(ImagingError::NoFrame(frame));
+    }
+    let mut streams: Vec<Vec<u8>> = Vec::new();
+    for fragment in fragments {
+        match streams.last_mut() {
+            Some(stream) if !fragment.starts_with(&[0xFF, 0xD8]) => stream.extend(fragment),
+            _ => streams.push(fragment.clone()),
+        }
+    }
+    if streams.len() != frames {
+        return Err(ImagingError::Unsupported(format!(
+            "cannot attribute {} fragments to {frames} frames",
+            fragments.len()
+        )));
+    }
+    streams
+        .into_iter()
+        .nth(frame)
+        .ok_or(ImagingError::NoFrame(frame))
+}
+
+/// Frame `frame` of `obj`, JPEG with 12-bit samples, decoded: little endian 16-bit samples
+/// (sign extended from Bits Stored when signed), and whether they were converted from YCbCr
+/// to RGB.
+fn decode_jpeg(obj: &DefaultDicomObject, frame: u32) -> Result<(Vec<u8>, bool), ImagingError> {
+    let stream = jpeg_stream(obj, frame)?;
+    let photometric = obj
+        .element_opt(tags::PHOTOMETRIC_INTERPRETATION)
+        .ok()
+        .flatten()
+        .and_then(|e| e.to_str().ok())
+        .map(|p| p.trim_matches([' ', '\0']).to_owned())
+        .unwrap_or_default();
+    // As DCMTK does by default: YCbCr when the photometric interpretation says so.
+    let ycbcr = photometric.starts_with("YBR");
+    let image = jpeg::decode(&stream, ycbcr)
+        .map_err(|e| ImagingError::Unsupported(format!("cannot decode JPEG frame: {e}")))?;
+    let expected = (
+        int(obj, tags::COLUMNS).unwrap_or(0) as usize,
+        int(obj, tags::ROWS).unwrap_or(0) as usize,
+        int(obj, tags::SAMPLES_PER_PIXEL).unwrap_or(1) as usize,
+    );
+    if (image.width, image.height, image.components) != expected {
+        return Err(ImagingError::Unsupported(format!(
+            "JPEG frame of {}x{} pixels and {} components, {}x{} and {} expected",
+            image.width, image.height, image.components, expected.0, expected.1, expected.2
+        )));
+    }
+    let SampleFormat::Integer {
+        bits_allocated: 16,
+        bits_stored,
+        signed,
+    } = SampleFormat::of(obj)
+    else {
+        return Err(ImagingError::Unsupported(
+            "12-bit JPEG frames need 16 bits allocated".into(),
+        ));
+    };
+    let unused = 16 - u32::from(bits_stored);
+    let bytes = image
+        .samples
+        .iter()
+        .flat_map(|&sample| {
+            let sample = if signed {
+                (((sample << unused) as i16) >> unused) as u16
+            } else {
+                sample
+            };
+            sample.to_le_bytes()
+        })
+        .collect();
+    Ok((bytes, ycbcr && image.components == 3))
+}
+
+/// `obj` with the decoded frames `pixels` as native pixel data, in Explicit VR Little Endian.
+fn make_native(obj: &mut DefaultDicomObject, pixels: Vec<(Vec<u8>, bool)>) {
+    let rgb = pixels.iter().any(|(_, rgb)| *rgb);
+    let data: Vec<u8> = pixels.into_iter().flat_map(|(bytes, _)| bytes).collect();
+    obj.meta_mut()
+        .set_transfer_syntax(&EXPLICIT_VR_LITTLE_ENDIAN);
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        PrimitiveValue::from(data),
+    ));
+    if rgb {
+        obj.put_str(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "RGB");
+    }
+    if int(obj, tags::SAMPLES_PER_PIXEL).unwrap_or(1) > 1 {
+        obj.put(DataElement::new(
+            tags::PLANAR_CONFIGURATION,
+            VR::US,
+            PrimitiveValue::from(0u16),
+        ));
+    }
+}
+
+/// Frame `frame` of `obj`, JPEG with 12-bit samples, as the only frame of a native object.
+fn jpeg_frame_natively(
+    obj: &DefaultDicomObject,
+    frame: u32,
+) -> Result<DefaultDicomObject, ImagingError> {
+    let pixels = decode_jpeg(obj, frame)?;
+    let mut native = obj.clone();
+    if native
+        .element_opt(tags::NUMBER_OF_FRAMES)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        native.put_str(tags::NUMBER_OF_FRAMES, VR::IS, "1");
+    }
+    make_native(&mut native, vec![pixels]);
+    Ok(native)
+}
+
+fn int(obj: &DefaultDicomObject, tag: dicom_core::Tag) -> Option<u32> {
+    obj.element_opt(tag).ok().flatten()?.to_int::<u32>().ok()
 }

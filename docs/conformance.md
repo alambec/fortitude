@@ -143,14 +143,14 @@ Missing `requestType=WADO` or UIDs answer `400`; unknown objects `404`.
 
 ## Codecs
 
-Pixel data is decoded (for rendering, uncompressed frames, and transcoding) with dicom-rs, and
-CharLS for JPEG-LS:
+Pixel data is decoded (for rendering, uncompressed frames, and transcoding) with dicom-rs,
+CharLS for JPEG-LS, and Fortitude's own decoder for 12-bit JPEG Extended:
 
 | Transfer syntax | Decoding |
 |---|---|
 | Implicit and Explicit VR Little Endian, Explicit VR Big Endian, Deflated Explicit VR Little Endian | yes |
 | JPEG Baseline (Process 1), JPEG Lossless (Process 14, SV1) | yes |
-| JPEG Extended (Process 2 & 4), 8-bit | yes; 12-bit is not supported |
+| JPEG Extended (Process 2 & 4), 8 and 12 bits | yes (sequential DCT with Huffman coding; samples identical to libjpeg-turbo's) |
 | JPEG 2000 (lossless and lossy) | yes |
 | RLE Lossless | yes (8, 16 and 32 bits per sample) |
 | JPEG-LS (lossless and near-lossless) | yes |

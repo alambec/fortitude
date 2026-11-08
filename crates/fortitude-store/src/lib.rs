@@ -8,6 +8,7 @@ pub mod imaging;
 pub mod index;
 pub mod ingest;
 pub mod integrity;
+pub mod jpeg;
 mod locations;
 pub mod modalities;
 pub mod pixel;
