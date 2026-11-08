@@ -1,7 +1,12 @@
 //! Pool of read connections. Queries run on the blocking thread pool, at most one per
 //! connection; with SQLite, WAL mode lets them proceed while the writer commits.
+//!
+//! Metrics: `fortitude_index_read_wait_seconds`, the time a query waits for a connection
+//! and a blocking thread, and `fortitude_index_read_seconds`, the time it runs (a round trip
+//! to PostgreSQL included).
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::Semaphore;
 
@@ -42,6 +47,7 @@ impl Readers {
         F: FnOnce(&mut Connection) -> Result<R, IndexError> + Send + 'static,
         R: Send + 'static,
     {
+        let queued = Instant::now();
         let _permit = self
             .permits
             .acquire()
@@ -51,6 +57,9 @@ impl Readers {
         let idle = self.idle.clone();
         let open = self.open.clone();
         tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            metrics::histogram!("fortitude_index_read_wait_seconds")
+                .record(started.duration_since(queued).as_secs_f64());
             // A connection is missing if a query panicked while holding it, or if it was
             // closed (e.g. the database server restarted).
             let mut conn = match popped {
@@ -58,6 +67,8 @@ impl Readers {
                 None => open()?,
             };
             let result = query(&mut conn);
+            metrics::histogram!("fortitude_index_read_seconds")
+                .record(started.elapsed().as_secs_f64());
             if conn.is_usable() {
                 idle.lock().unwrap_or_else(|e| e.into_inner()).push(conn);
             }

@@ -213,6 +213,49 @@ async fn retrieves_native_frames() {
     );
 }
 
+/// Frame locations are cached by series: instances stored after a series was cached are
+/// still found, and deleted ones are not.
+#[tokio::test]
+async fn frames_follow_stores_and_deletes() {
+    let f = fixture().await;
+    let frame = |sop: &str| format!("/studies/1.2.3/series/1.2.3.1/instances/{sop}/frames/1");
+    let cached = f.app.get(&frame("1.2.3.1.1"), ANY_OCTETS).await;
+    assert_eq!(cached.status, StatusCode::OK);
+
+    let late = Instance::new("1.2.3", "1.2.3.1", "1.2.3.1.9").with(|i| i.instance_number = Some(9));
+    assert_eq!(
+        f.app.stow("/studies", &[&late]).await.status,
+        StatusCode::OK
+    );
+    let reply = f.app.get(&frame("1.2.3.1.9"), ANY_OCTETS).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.parts().await[0].1, late.frame(0));
+
+    let deleted = f
+        .app
+        .store
+        .delete(fortitude_store::retrieve::Scope::instance(
+            "1.2.3",
+            "1.2.3.1",
+            "1.2.3.1.2",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert_eq!(
+        f.app.get(&frame("1.2.3.1.2"), ANY_OCTETS).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.app.get(&frame("1.2.3.1.3"), ANY_OCTETS).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.app.get(&frame("1.2.3.1.404"), ANY_OCTETS).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
 #[tokio::test]
 async fn retrieves_encapsulated_frames() {
     let f = fixture().await;

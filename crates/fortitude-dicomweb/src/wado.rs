@@ -316,7 +316,7 @@ pub async fn frames(
     }
     let indexes: Vec<usize> = numbers.iter().map(|n| n - 1).collect();
     let data = if plan.decode {
-        match s.store.decoded_frames(scope, indexes).await {
+        match s.store.decoded_frames(&source, indexes).await {
             Ok(data) => data,
             Err(e) => return imaging_error(e),
         }
@@ -420,7 +420,7 @@ pub async fn bulk(
             };
             let data = if plan.decode {
                 let frames = (0..layout.frame_count().max(1)).collect();
-                match s.store.decoded_frames(scope, frames).await {
+                match s.store.decoded_frames(&source, frames).await {
                     Ok(frames) => vec![frames.concat()],
                     Err(e) => return imaging_error(e),
                 }

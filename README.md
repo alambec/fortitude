@@ -58,6 +58,8 @@ bulk_delete = true         # DeleteObjects requests; false for services lacking 
 [index]
 backend = "sqlite"         # or "postgres"
 readers = 0                # read connections; 0 = one per CPU
+location_cache_mib = 64    # pixel data locations of recently read series (0 = disabled)
+location_cache_ttl_secs = 300   # how long a series' locations are kept after loading
 # postgres_url = "postgres://fortitude:secret@db:5432/fortitude"   # or "host=db user=… dbname=…"
 
 [dicomweb]
@@ -319,6 +321,10 @@ DIMSE has no authentication beyond AE titles: restrict its port at the network l
 | `fortitude_stow_instances_total` | `outcome`: `stored`, `duplicate`, `failed` |
 | `fortitude_index_batch_size` (histogram: instances per index transaction) | |
 | `fortitude_index_commit_seconds` (histogram) | |
+| `fortitude_index_read_wait_seconds` (histogram: wait for a read connection) | |
+| `fortitude_index_read_seconds` (histogram: index query, database round trip included) | |
+| `fortitude_location_cache_lookups_total` (pixel data locations, by frame or bulk data request) | `outcome`: `hit`, `load` (series loaded or joined), `absent` (instance not in the cached series) |
+| `fortitude_files_read_seconds` (histogram: frames and other byte ranges of stored files) | |
 | `fortitude_dimse_associations_total` | |
 | `fortitude_dimse_requests_total` | `command`, `status`: `success`, `warning`, `failure`, `cancel` |
 | `fortitude_dimse_request_duration_seconds` (histogram) | `command` |

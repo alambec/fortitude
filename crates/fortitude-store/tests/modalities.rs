@@ -15,6 +15,8 @@ async fn register_update_and_remove() {
             fortitude_store::IndexBackend::Postgres,
         ),
         index_readers: 2,
+        location_cache_bytes: 1 << 20,
+        location_cache_ttl: std::time::Duration::from_secs(60),
         inline_binary_max: 64,
     })
     .unwrap();

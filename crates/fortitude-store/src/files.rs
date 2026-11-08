@@ -362,7 +362,15 @@ impl FileStore {
     }
 
     /// Parts of a file, each the concatenation of byte ranges (e.g. frames, made of fragments).
+    /// The time taken is recorded in `fortitude_files_read_seconds`.
     pub async fn read_parts(&self, key: &str, parts: Vec<Vec<Range>>) -> io::Result<Vec<Vec<u8>>> {
+        let started = std::time::Instant::now();
+        let read = self.read_ranges(key, parts).await;
+        metrics::histogram!("fortitude_files_read_seconds").record(started.elapsed().as_secs_f64());
+        read
+    }
+
+    async fn read_ranges(&self, key: &str, parts: Vec<Vec<Range>>) -> io::Result<Vec<Vec<u8>>> {
         match &*self.backend {
             Backend::Local { root, .. } => {
                 let path = root.join(key);

@@ -158,6 +158,8 @@ impl Store {
             .index()
             .delete_study_unchanged_since(&study.study_uid, cutoff_ms)
             .await;
+        self.locations
+            .invalidate(&crate::retrieve::Scope::study(&study.study_uid));
         let paths = match deleted {
             Ok(paths) if paths.is_empty() => return None,
             Ok(paths) => paths,

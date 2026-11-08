@@ -9,6 +9,7 @@ use fortitude_core::json;
 
 use crate::Store;
 use crate::index::{Connection, IndexError, Row, Value};
+use crate::locations::{Lookup, SeriesLocations};
 use crate::pixel::PixelLayout;
 use crate::walker::PIXEL_TAGS;
 
@@ -121,7 +122,7 @@ pub struct PixelSource {
 #[derive(Debug)]
 pub enum BulkData {
     /// Pixel data: frames of the stored file.
-    Pixels(PixelSource),
+    Pixels(Arc<PixelSource>),
     Bytes(Vec<u8>),
 }
 
@@ -212,21 +213,77 @@ impl Store {
     }
 
     /// Pixel data location of an instance; `None` when the instance does not exist.
-    pub async fn pixels(self: &Arc<Self>, scope: Scope) -> Result<Option<PixelSource>, IndexError> {
+    ///
+    /// With an instance scope, locations come from the [cache](crate::locations), which loads
+    /// those of the whole series on the first request.
+    pub async fn pixels(
+        self: &Arc<Self>,
+        scope: Scope,
+    ) -> Result<Option<Arc<PixelSource>>, IndexError> {
+        if let (Some(series), Some(instance)) = (&scope.series, &scope.instance)
+            && self.locations.enabled()
+        {
+            match self.locations.lookup(&scope.study, series, instance) {
+                Lookup::Found(source) => {
+                    metrics::counter!("fortitude_location_cache_lookups_total", "outcome" => "hit")
+                        .increment(1);
+                    return Ok(Some(source));
+                }
+                Lookup::Absent => {
+                    metrics::counter!("fortitude_location_cache_lookups_total", "outcome" => "absent")
+                        .increment(1);
+                }
+                Lookup::Load(load) => {
+                    metrics::counter!("fortitude_location_cache_lookups_total", "outcome" => "load")
+                        .increment(1);
+                    let loaded = load
+                        .cell
+                        .get_or_init(|| async {
+                            match self.series_locations(&scope.study, series).await {
+                                Ok(locations) => Some(Arc::new(locations)),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "cannot load the pixel data locations of a series");
+                                    None
+                                }
+                            }
+                        })
+                        .await
+                        .clone();
+                    self.locations.finish(&scope.study, series, &load);
+                    // Otherwise, stored since the load started, not stored, or the load failed.
+                    if let Some(source) = loaded.and_then(|l| l.get(instance).cloned()) {
+                        return Ok(Some(source));
+                    }
+                }
+            }
+        }
         let found = self
             .index()
             .readers()
-            .run(move |conn| {
-                query(conn, &scope, "i.path, i.transfer_syntax, i.pixel", |row| {
-                    Ok(PixelSource {
-                        path: row.str(0)?.to_owned(),
-                        transfer_syntax: row.str(1)?.to_owned(),
-                        layout: row.opt_bytes(2)?.and_then(PixelLayout::decode),
-                    })
-                })
-            })
+            .run(move |conn| query(conn, &scope, PIXEL_COLUMNS, |row| pixel_source(row, 0)))
             .await?;
-        Ok(found.into_iter().next())
+        Ok(found.into_iter().next().map(Arc::new))
+    }
+
+    /// Pixel data locations of the instances of a series, by SOP Instance UID.
+    async fn series_locations(
+        self: &Arc<Self>,
+        study: &str,
+        series: &str,
+    ) -> Result<SeriesLocations, IndexError> {
+        let scope = Scope::series(study, series);
+        self.index()
+            .readers()
+            .run(move |conn| {
+                let mut locations = SeriesLocations::new();
+                let (sql, params) = scope.select(&format!("i.sop_uid, {PIXEL_COLUMNS}"));
+                conn.for_each(&sql, &params, |row| {
+                    locations.insert(row.str(0)?.to_owned(), Arc::new(pixel_source(row, 1)?));
+                    Ok(true)
+                })?;
+                Ok(locations)
+            })
+            .await
     }
 
     /// Bulk data at `path` (`GGGGEEEE[/item/GGGGEEEE…]`) of an instance; `None` when the
@@ -255,6 +312,17 @@ impl Store {
             .and_then(|header| read_element(&header, &steps))
             .map(BulkData::Bytes))
     }
+}
+
+const PIXEL_COLUMNS: &str = "i.path, i.transfer_syntax, i.pixel";
+
+/// The pixel data location in the columns of [`PIXEL_COLUMNS`], from `first`.
+fn pixel_source(row: &Row<'_>, first: usize) -> Result<PixelSource, IndexError> {
+    Ok(PixelSource {
+        path: row.str(first)?.to_owned(),
+        transfer_syntax: row.str(first + 1)?.to_owned(),
+        layout: row.opt_bytes(first + 2)?.and_then(PixelLayout::decode),
+    })
 }
 
 const STORED_COLUMNS: &str =

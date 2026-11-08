@@ -100,13 +100,10 @@ impl Store {
     /// Frames (0-based) decoded to native little endian pixels.
     pub async fn decoded_frames(
         self: &Arc<Self>,
-        scope: Scope,
+        source: &PixelSource,
         frames: Vec<usize>,
     ) -> Result<Vec<Vec<u8>>, ImagingError> {
-        let source = self.pixels(scope).await?.ok_or(ImagingError::NotFound)?;
-        let objects = self
-            .frame_objects(&source, &frames, Purpose::Decode)
-            .await?;
+        let objects = self.frame_objects(source, &frames, Purpose::Decode).await?;
         blocking(move || {
             objects
                 .iter()

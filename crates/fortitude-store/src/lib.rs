@@ -8,6 +8,7 @@ pub mod imaging;
 pub mod index;
 pub mod ingest;
 pub mod integrity;
+mod locations;
 pub mod modalities;
 pub mod pixel;
 pub mod retention;
@@ -17,12 +18,14 @@ pub mod walker;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::files::{FileBackend, FileStore};
 use crate::index::{Database, Index, IndexError, InsertOutcome};
 use crate::ingest::{Identifiers, IngestError, IngestOptions};
+use crate::locations::LocationCache;
 
 /// Database of the index.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -56,6 +59,11 @@ pub struct StoreOptions {
     pub index: IndexBackend,
     /// Number of read connections to the index.
     pub index_readers: usize,
+    /// Memory for the pixel data locations of recently read series, in bytes; 0 disables
+    /// the cache.
+    pub location_cache_bytes: usize,
+    /// How long the locations of a series are kept after they were loaded.
+    pub location_cache_ttl: Duration,
     /// Binary values up to this size are inlined in metadata.
     pub inline_binary_max: usize,
 }
@@ -119,6 +127,7 @@ pub struct StoreResult {
 pub struct Store {
     files: FileStore,
     index: Index,
+    locations: LocationCache,
     options: StoreOptions,
 }
 
@@ -137,6 +146,7 @@ impl Store {
         Ok(Arc::new(Self {
             files,
             index,
+            locations: LocationCache::new(options.location_cache_bytes, options.location_cache_ttl),
             options,
         }))
     }
@@ -235,7 +245,9 @@ pub struct Statistics {
 impl Store {
     /// Delete the instances of `scope` and their files; returns how many were deleted.
     pub async fn delete(self: &Arc<Self>, scope: retrieve::Scope) -> Result<usize, IndexError> {
-        let paths = self.index.delete(scope).await?;
+        let deleted = self.index.delete(scope.clone()).await;
+        self.locations.invalidate(&scope);
+        let paths = deleted?;
         let count = paths.len();
         for e in self.files.remove_all(paths).await {
             tracing::warn!(error = %e, "cannot remove deleted file");

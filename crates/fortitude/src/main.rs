@@ -67,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
             0 => cpus,
             n => n,
         },
+        location_cache_bytes: config.index.location_cache_mib << 20,
+        location_cache_ttl: std::time::Duration::from_secs(config.index.location_cache_ttl_secs),
         inline_binary_max: config.storage.inline_binary_max,
     })
     .with_context(|| format!("cannot open storage at {}", config.storage.path.display()))?;

@@ -154,7 +154,7 @@ impl StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
     /// Database holding the index.
@@ -165,6 +165,26 @@ pub struct IndexConfig {
     /// (`postgres://user:password@host:5432/database`) or key-value pairs
     /// (`host=… user=… password=… dbname=…`). Required by the `postgres` backend.
     pub postgres_url: Option<String>,
+    /// Memory for the pixel data locations of recently read series, in MiB: the first frame
+    /// requested of a series loads those of all its instances in one query, sparing the
+    /// index a query per frame. 0 disables the cache.
+    pub location_cache_mib: usize,
+    /// How long the locations of a series stay cached after they were loaded. Deletions
+    /// through this server evict them at once; this bounds staleness when other servers
+    /// delete from a shared PostgreSQL index.
+    pub location_cache_ttl_secs: u64,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            backend: IndexBackend::default(),
+            readers: 0,
+            postgres_url: None,
+            location_cache_mib: 64,
+            location_cache_ttl_secs: 300,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -144,6 +144,17 @@ impl PixelLayout {
         }
     }
 
+    /// Approximate size of the layout on the heap, in bytes.
+    pub fn heap_size(&self) -> usize {
+        match self {
+            PixelLayout::Native { .. } => 0,
+            PixelLayout::Encapsulated { frames } => frames
+                .iter()
+                .map(|f| size_of::<Vec<Range>>() + f.len() * size_of::<Range>())
+                .sum(),
+        }
+    }
+
     pub fn is_encapsulated(&self) -> bool {
         matches!(self, PixelLayout::Encapsulated { .. })
     }
