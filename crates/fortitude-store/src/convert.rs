@@ -202,6 +202,47 @@ impl SampleFormat {
         matches!(self, SampleFormat::Integer { bits_allocated, .. } if bits_allocated <= 16)
     }
 
+    /// The smallest and largest finite little endian samples of `data`.
+    fn range(self, data: &[u8]) -> Option<(f64, f64)> {
+        let finite = |values: &mut dyn Iterator<Item = f64>| {
+            let (low, high) = values
+                .filter(|v| v.is_finite())
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                    (lo.min(v), hi.max(v))
+                });
+            (low <= high).then_some((low, high))
+        };
+        match self {
+            SampleFormat::Float => finite(
+                &mut data
+                    .chunks_exact(4)
+                    .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap_or_default()))),
+            ),
+            SampleFormat::Double => finite(
+                &mut data
+                    .chunks_exact(8)
+                    .map(|b| f64::from_le_bytes(b.try_into().unwrap_or_default())),
+            ),
+            SampleFormat::Integer {
+                bits_allocated,
+                bits_stored,
+                signed,
+            } => {
+                let unused = 64 - u32::from(bits_stored);
+                match usize::from(bits_allocated).div_ceil(8).clamp(1, 8) {
+                    1 => integer_range::<1>(data, unused, signed),
+                    2 => integer_range::<2>(data, unused, signed),
+                    3 => integer_range::<3>(data, unused, signed),
+                    4 => integer_range::<4>(data, unused, signed),
+                    5 => integer_range::<5>(data, unused, signed),
+                    6 => integer_range::<6>(data, unused, signed),
+                    7 => integer_range::<7>(data, unused, signed),
+                    _ => integer_range::<8>(data, unused, signed),
+                }
+            }
+        }
+    }
+
     /// The little endian samples of `data`.
     fn values(self, data: &[u8]) -> Vec<f64> {
         match self {
@@ -235,6 +276,27 @@ impl SampleFormat {
                     .collect()
             }
         }
+    }
+}
+
+/// The smallest and largest of the little endian `SIZE`-byte samples of `data`, of which the
+/// low `64 - unused` bits are stored.
+fn integer_range<const SIZE: usize>(data: &[u8], unused: u32, signed: bool) -> Option<(f64, f64)> {
+    // The stored bits moved to the top of the word compare like the samples (as signed words
+    // for signed samples), so the loop is a plain integer minimum and maximum.
+    let words = data.chunks_exact(SIZE).map(|b| {
+        let mut word = [0; 8];
+        word[..SIZE].copy_from_slice(b);
+        u64::from_le_bytes(word) << unused
+    });
+    if signed {
+        let (low, high) = words
+            .map(|w| w as i64)
+            .fold((i64::MAX, i64::MIN), |(lo, hi), w| (lo.min(w), hi.max(w)));
+        (low <= high).then(|| ((low >> unused) as f64, (high >> unused) as f64))
+    } else {
+        let (low, high) = words.fold((u64::MAX, u64::MIN), |(lo, hi), w| (lo.min(w), hi.max(w)));
+        (low <= high).then(|| ((low >> unused) as f64, (high >> unused) as f64))
     }
 }
 
@@ -321,14 +383,19 @@ pub fn wide_image(
 /// Monochrome `values` through the modality rescale (not applied to float samples, which are
 /// real world values).
 fn modality_values(obj: &DefaultDicomObject, format: SampleFormat, values: &[f64]) -> Vec<f64> {
-    let (slope, intercept) = match format {
+    let (slope, intercept) = rescale(obj, format);
+    values.iter().map(|v| v * slope + intercept).collect()
+}
+
+/// The modality rescale (slope, intercept) of `format` samples.
+fn rescale(obj: &DefaultDicomObject, format: SampleFormat) -> (f64, f64) {
+    match format {
         SampleFormat::Integer { .. } => (
             float(obj, tags::RESCALE_SLOPE).unwrap_or(1.0),
             float(obj, tags::RESCALE_INTERCEPT).unwrap_or(0.0),
         ),
         _ => (1.0, 0.0),
-    };
-    values.iter().map(|v| v * slope + intercept).collect()
+    }
 }
 
 /// The first window (center, width) of the instance.
@@ -357,7 +424,12 @@ pub fn auto_window(
     if !monochrome || has_voi {
         return None;
     }
-    let (low, high) = range(&modality_values(obj, format, &format.values(data)));
+    // The rescale is monotonic: the range of rescaled values is that of the samples, rescaled
+    // (without making a rescaled copy of the frame, which took most of the rendering time).
+    let (low, high) = format.range(data)?;
+    let (slope, intercept) = rescale(obj, format);
+    let (a, b) = (low * slope + intercept, high * slope + intercept);
+    let (low, high) = (a.min(b), a.max(b));
     (low <= high).then(|| ((low + high) / 2.0, (high - low).max(1.0)))
 }
 
@@ -479,5 +551,105 @@ mod tests {
         };
         // 0xF800: high bits are not stored; 0x800 is -2048 in 12 bits.
         assert_eq!(signed12.values(&[0x00, 0xF8]), [-2048.0]);
+    }
+
+    #[test]
+    fn sample_ranges() {
+        // Pseudo-random bytes, with garbage in the bits that are not stored.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        for bits_allocated in [1, 8, 12, 16, 24, 32, 64] {
+            for bits_stored in [1, 7, 8, 12, 15, 16, 31, 32, 63, 64] {
+                for signed in [false, true] {
+                    if bits_stored > bits_allocated {
+                        continue;
+                    }
+                    let format = SampleFormat::Integer {
+                        bits_allocated,
+                        bits_stored,
+                        signed,
+                    };
+                    let expected = range(&format.values(&data));
+                    assert_eq!(format.range(&data), Some(expected), "{format:?}");
+                }
+            }
+        }
+        let floats: Vec<u8> = [1.5f32, f32::NAN, -3.0, f32::INFINITY, 2.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(SampleFormat::Float.range(&floats), Some((-3.0, 2.0)));
+        let doubles: Vec<u8> = [f64::NEG_INFINITY, 0.25, 8.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(SampleFormat::Double.range(&doubles), Some((0.25, 8.0)));
+        assert_eq!(SampleFormat::Double.range(&f64::NAN.to_le_bytes()), None);
+        assert_eq!(SampleFormat::of(&monochrome(&[])).range(&[]), None);
+    }
+
+    fn monochrome(elements: &[(Tag, dicom_core::VR, &str)]) -> DefaultDicomObject {
+        use dicom_core::{DataElement, PrimitiveValue, VR};
+        use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+        let mut obj = InMemDicomObject::new_empty();
+        let mut put = |tag, vr, value: &str| {
+            obj.put(DataElement::new(tag, vr, PrimitiveValue::from(value)));
+        };
+        put(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "MONOCHROME2");
+        put(tags::BITS_ALLOCATED, VR::US, "16");
+        put(tags::BITS_STORED, VR::US, "12");
+        put(tags::PIXEL_REPRESENTATION, VR::US, "1");
+        for (tag, vr, value) in elements {
+            put(*tag, *vr, value);
+        }
+        obj.with_meta(
+            FileMetaTableBuilder::new()
+                .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2")
+                .media_storage_sop_instance_uid("1.2.3")
+                .transfer_syntax("1.2.840.10008.1.2.1"),
+        )
+        .expect("valid meta")
+    }
+
+    #[test]
+    fn auto_windows() {
+        use dicom_core::VR;
+        // -2048, 100 and 2047 in 12 bits.
+        let data = [0x00, 0x08, 0x64, 0x00, 0xFF, 0x07];
+        let window_of = |elements: &[(Tag, VR, &str)], data: &[u8]| {
+            let obj = monochrome(elements);
+            auto_window(&obj, SampleFormat::of(&obj), data)
+        };
+        let window = |elements: &[(Tag, VR, &str)]| window_of(elements, &data);
+        assert_eq!(window(&[]), Some((-0.5, 4095.0)));
+        assert_eq!(
+            window(&[
+                (tags::RESCALE_SLOPE, VR::DS, "-2"),
+                (tags::RESCALE_INTERCEPT, VR::DS, "10"),
+            ]),
+            // From 4106 (-2048) down to -4084 (2047).
+            Some((11.0, 8190.0))
+        );
+        // Flat frames get a width of 1; empty ones no window.
+        assert_eq!(window_of(&[], &data[2..4]), Some((100.0, 1.0)));
+        assert_eq!(window_of(&[], &[]), None);
+        assert_eq!(
+            window(&[
+                (tags::WINDOW_CENTER, VR::DS, "40"),
+                (tags::WINDOW_WIDTH, VR::DS, "400")
+            ]),
+            None
+        );
+        assert_eq!(
+            window(&[(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "RGB")]),
+            None
+        );
     }
 }
