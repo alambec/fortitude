@@ -1,6 +1,7 @@
 //! Pixel data that dicom-pixeldata alone does not decode or render correctly: JPEG-LS, 12-bit
 //! JPEG Extended, big endian samples, native YBR, 32-bit and floating point samples, signed
-//! samples without a window, and attributes encoded with VR UN.
+//! samples without a window, attributes encoded with VR UN, PALETTE COLOR, and 1-bit frames that
+//! do not start on a byte.
 
 mod common;
 
@@ -574,6 +575,104 @@ async fn jpeg_extended_12_bit_invalid() {
             StatusCode::NOT_ACCEPTABLE,
             "{}",
             instance.sop_uid
+        );
+    }
+}
+
+#[tokio::test]
+async fn palette_color() {
+    // Indices 0 to 63 into a 16-bit palette: red rises, blue falls.
+    let lut = |f: fn(u16) -> u16| PrimitiveValue::U16((0..256).map(|i| f(i) << 8).collect());
+    let mut palette = image(
+        "3.1.1.1",
+        fortitude_testkit::EXPLICIT_VR_LE,
+        &[],
+        native(
+            VR::OB,
+            PrimitiveValue::from((0..PIXELS as u8).collect::<Vec<_>>()),
+        ),
+    )
+    .element(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "PALETTE COLOR");
+    for (descriptor, data, values) in [
+        (
+            tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            lut(|i| i),
+        ),
+        (
+            tags::GREEN_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            tags::GREEN_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            lut(|_| 0),
+        ),
+        (
+            tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            lut(|i| 255 - i),
+        ),
+    ] {
+        palette = palette
+            .element(
+                descriptor,
+                VR::US,
+                PrimitiveValue::U16(vec![256, 0, 16].into()),
+            )
+            .element(data, VR::OW, values);
+    }
+    let app = stored(&[&palette]).await;
+    let image = rendered(&app, &palette).await;
+    assert_eq!(image.dimensions(), (u32::from(COLUMNS), u32::from(ROWS)));
+    assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255]);
+    assert_eq!(image.get_pixel(5, 2).0, [21, 0, 234]);
+    assert_eq!(image.get_pixel(7, 7).0, [63, 0, 192]);
+    // Frames are returned as stored: the indices.
+    assert_eq!(
+        decoded(&app, &palette, 1).await,
+        (0..PIXELS as u8).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn one_bit_frames() {
+    // Two frames of 3x3 1-bit samples: the second one starts at bit 9, in the second byte.
+    let frames: [[u8; 9]; 2] = [[1, 0, 1, 1, 0, 0, 0, 0, 1], [0, 1, 1, 1, 0, 1, 0, 0, 1]];
+    let mut packed = vec![0u8; 4];
+    for (i, &sample) in frames.concat().iter().enumerate() {
+        packed[i / 8] |= sample << (i % 8);
+    }
+    let instance = Instance::new("3.1", "3.1.1", "3.1.1.1")
+        .with(|i| {
+            i.rows = 3;
+            i.columns = 3;
+            i.frames = 2;
+            i.transfer_syntax = fortitude_testkit::EXPLICIT_VR_LE.into();
+            i.pixels = native(VR::OB, PrimitiveValue::from(packed));
+        })
+        .element(tags::BITS_ALLOCATED, VR::US, 1_u16)
+        .element(tags::BITS_STORED, VR::US, 1_u16)
+        .element(tags::HIGH_BIT, VR::US, 0_u16);
+    let app = stored(&[&instance]).await;
+    for (number, samples) in [(1, frames[0]), (2, frames[1])] {
+        let reply = app
+            .get(
+                &format!("{}/frames/{number}/rendered", path(&instance)),
+                "image/png",
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        let image = image::load_from_memory(&reply.body)
+            .expect("PNG")
+            .to_luma8();
+        let luma: Vec<u8> = image.pixels().map(|p| p.0[0]).collect();
+        assert_eq!(luma, samples.map(|s| s * 255), "frame {number}");
+        // Each frame's bits, from the first bit of its first byte.
+        let mut expected = vec![0u8; 2];
+        for (i, &sample) in samples.iter().enumerate() {
+            expected[i / 8] |= sample << (i % 8);
+        }
+        assert_eq!(
+            decoded(&app, &instance, number).await,
+            expected,
+            "frame {number}"
         );
     }
 }

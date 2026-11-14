@@ -14,7 +14,10 @@ use fortitude_store::imaging::ImagingError;
 use fortitude_store::retrieve::{BulkData, PixelSource, Scope, StoredInstance};
 use futures::{StreamExt, stream};
 
-use crate::negotiate::{self, DEFLATED_EXPLICIT_VR_LE, InstanceFormat, PixelPlan, Representation};
+use crate::negotiate::{
+    self, DEFLATED_EXPLICIT_VR_LE, EXPLICIT_VR_LE, IMPLICIT_VR_LE, InstanceFormat, PixelPlan,
+    Representation,
+};
 use crate::{BaseUrl, DICOM_JSON, DicomWeb, error, media};
 
 /// Instance files up to this size are read in one operation, larger ones are streamed.
@@ -315,7 +318,14 @@ pub async fn frames(
         return not_acceptable();
     }
     let indexes: Vec<usize> = numbers.iter().map(|n| n - 1).collect();
-    let data = if plan.decode {
+    // Native little endian frames that cannot be located by byte ranges (1-bit frames that do
+    // not start on a byte) are the same once decoded.
+    let unlocated = source.layout.as_ref().is_some_and(|layout| {
+        !layout.is_encapsulated()
+            && layout.frame_count() == 0
+            && [EXPLICIT_VR_LE, IMPLICIT_VR_LE].contains(&source.transfer_syntax.as_str())
+    });
+    let data = if plan.decode || unlocated {
         match s.store.decoded_frames(&source, indexes).await {
             Ok(data) => data,
             Err(e) => return imaging_error(e),

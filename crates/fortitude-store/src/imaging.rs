@@ -26,7 +26,7 @@ use image::DynamicImage;
 use image::imageops::FilterType;
 
 use crate::Store;
-use crate::convert::{self, SampleFormat};
+use crate::convert::{self, Palette, SampleFormat};
 use crate::index::IndexError;
 use crate::ingest::resolve_unknown_vrs;
 use crate::jpeg;
@@ -360,17 +360,36 @@ fn render(
         return render(&jpeg_frame_natively(obj, frame)?, 0, options);
     }
     let format = SampleFormat::of(obj);
+    let photometric = obj
+        .element_opt(tags::PHOTOMETRIC_INTERPRETATION)
+        .ok()
+        .flatten()
+        .and_then(|e| e.to_str().ok())
+        .map(|p| p.trim_matches([' ', '\0']).to_owned())
+        .unwrap_or_default();
+    // dicom-pixeldata renders the indices of PALETTE COLOR as grey levels, and expects the
+    // frames of 1-bit samples to start on a byte: both are rendered here.
+    let one_bit = matches!(
+        format,
+        SampleFormat::Integer {
+            bits_allocated: 1,
+            ..
+        }
+    );
     // dicom-pixeldata scales RGB samples of more than 8 bits from Bits Allocated rather than
     // Bits Stored (12-bit RGB came out nearly black): they are rendered here.
     let wide_rgb = matches!(format, SampleFormat::Integer { bits_allocated, .. } if bits_allocated > 8)
         && int(obj, tags::SAMPLES_PER_PIXEL) == Some(3)
-        && obj
-            .element_opt(tags::PHOTOMETRIC_INTERPRETATION)
-            .ok()
-            .flatten()
-            .and_then(|e| e.to_str().ok())
-            .is_some_and(|p| p.trim_matches([' ', '\0']) == "RGB");
-    let mut image = if format.is_imageable() && !wide_rgb {
+        && photometric == "RGB";
+    let mut image = if one_bit {
+        let data = decode_frame(obj, frame)?;
+        convert::one_bit_image(obj, &data).map_err(ImagingError::Unsupported)?
+    } else if photometric == "PALETTE COLOR" {
+        let data = decode_frame(obj, frame)?;
+        Palette::of(obj)
+            .and_then(|palette| palette.image(obj, format, &data))
+            .map_err(ImagingError::Unsupported)?
+    } else if format.is_imageable() && !wide_rgb {
         let decoded = obj.decode_pixel_data_frame(frame).map_err(unsupported)?;
         let mut convert = ConvertOptions::new().with_bit_depth(BitDepthOption::Force8Bit);
         let window = options.window.or_else(|| {
@@ -477,6 +496,23 @@ fn decode_frame(obj: &DefaultDicomObject, frame: u32) -> Result<Vec<u8>, Imaging
         .is_some_and(|p| p.trim_matches([' ', '\0']) == "YBR_FULL_422");
     let packed =
         matches!(format, SampleFormat::Integer { bits_allocated, .. } if bits_allocated % 8 != 0);
+    if matches!(
+        format,
+        SampleFormat::Integer {
+            bits_allocated: 1,
+            ..
+        }
+    ) && let Some(element) = obj.element_opt(tags::PIXEL_DATA).ok().flatten()
+        && element.value().fragments().is_none()
+    {
+        // The frame's bits, packed again from the first bit of its first byte (dicom-pixeldata
+        // unpacks them to bytes of 0 and 255, and expects each frame to start on a byte).
+        let bytes = element.to_bytes().map_err(unsupported)?;
+        let count = pixels * samples_per_pixel;
+        let samples = convert::unpack_bits(&bytes, frame as usize * count, count)
+            .ok_or(ImagingError::NoFrame(frame as usize))?;
+        return Ok(convert::pack_bits(&samples));
+    }
     if !packed && (ts == EXPLICIT_VR_LITTLE_ENDIAN.uid() || ts == IMPLICIT_VR_LITTLE_ENDIAN.uid()) {
         // Native samples are already little endian; also the only way to get float samples.
         let element = [

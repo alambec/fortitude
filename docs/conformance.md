@@ -95,6 +95,9 @@ without decoding:
   cannot be attributed to frames answer `404` for frame requests.
 - Float and Double Float Pixel Data frames are supported. Native YBR_FULL_422 frames account
   for chroma subsampling.
+- Frames of 1-bit samples are returned packed, from the first bit of their first byte. When
+  frames do not start on a byte (their number of pixels is not a multiple of 8), they are
+  extracted from the bit stream (uncompressed little endian instances only).
 - Decoded frames of Explicit VR Big Endian instances are byte-swapped to little endian (by
   sample, or by 16-bit word for 8-bit OW data).
 - Frames of Deflated Explicit VR Little Endian instances are only available decoded (the file
@@ -111,8 +114,9 @@ default) or PNG, 8 bits per sample:
   ratio; never scaled up), `quality=1..100`. `annotation` and `charset` are ignored.
 - Without `window`, the instance's VOI LUT or first window is applied, or the range of the
   frame's values (after the modality rescale) is used as window.
-- Monochrome samples of up to 32 bits, Float and Double Float Pixel Data, and RGB samples of
-  up to 32 bits are rendered. Native YBR_FULL and YBR_FULL_422 frames are converted to RGB.
+- Monochrome samples of 1 to 32 bits, Float and Double Float Pixel Data, and RGB samples of
+  up to 32 bits are rendered. Native YBR_FULL and YBR_FULL_422 frames are converted to RGB, and
+  PALETTE COLOR frames through their palette (segmented palettes are not supported: `406`).
 - A rendered instance is its first frame.
 - Thumbnails fit in 128×128 pixels unless a viewport is given. The thumbnail of a series is
   its middle instance (by instance number); that of a study is the thumbnail of its first

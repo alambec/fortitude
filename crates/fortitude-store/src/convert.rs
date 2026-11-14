@@ -1,8 +1,9 @@
 //! Pixel conversions done here rather than by dicom-pixeldata, which does not support them:
 //! big endian samples, native YBR_FULL_422 frames, RLE Lossless with more than 16 bits per
-//! sample, and rendering of 32-bit integer and floating point samples.
+//! sample, 1-bit frames that do not start on a byte, and rendering of 32-bit integer and
+//! floating point samples and of PALETTE COLOR.
 
-use dicom_core::Tag;
+use dicom_core::{PrimitiveValue, Tag};
 use dicom_dictionary_std::tags;
 use dicom_object::DefaultDicomObject;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -443,6 +444,194 @@ fn range(values: &[f64]) -> (f64, f64) {
         })
 }
 
+/// `count` samples of 1 bit (0 or 1) from bit `start` of `data`. The bits of 1-bit pixel data
+/// follow each other from the lowest bit of each byte, frames included (PS3.5 8.1.1): a frame
+/// whose number of samples is not a multiple of 8 does not end on a byte.
+pub fn unpack_bits(data: &[u8], start: usize, count: usize) -> Option<Vec<u8>> {
+    if (start + count).div_ceil(8) > data.len() {
+        return None;
+    }
+    Some(
+        (start..start + count)
+            .map(|i| (data[i / 8] >> (i % 8)) & 1)
+            .collect(),
+    )
+}
+
+/// Samples of 0 and 1 packed in bits, the first in the lowest bit of the first byte.
+pub fn pack_bits(samples: &[u8]) -> Vec<u8> {
+    samples
+        .chunks(8)
+        .map(|byte| {
+            byte.iter()
+                .enumerate()
+                .fold(0, |acc, (bit, &sample)| acc | (sample & 1) << bit)
+        })
+        .collect()
+}
+
+/// An 8-bit image of a native little endian frame of 1-bit samples (`data`, from its first bit).
+pub fn one_bit_image(obj: &DefaultDicomObject, data: &[u8]) -> Result<DynamicImage, String> {
+    let rows = int(obj, tags::ROWS).ok_or("missing Rows")?;
+    let columns = int(obj, tags::COLUMNS).ok_or("missing Columns")?;
+    if int(obj, tags::SAMPLES_PER_PIXEL).unwrap_or(1) != 1 {
+        return Err("1-bit samples need 1 sample per pixel".into());
+    }
+    let pixels = rows as usize * columns as usize;
+    let samples = unpack_bits(data, 0, pixels).ok_or_else(|| {
+        format!(
+            "frame has {} bytes, {} expected",
+            data.len(),
+            pixels.div_ceil(8)
+        )
+    })?;
+    let on = if text(obj, tags::PHOTOMETRIC_INTERPRETATION).as_deref() == Some("MONOCHROME1") {
+        0
+    } else {
+        255
+    };
+    let luma = samples
+        .into_iter()
+        .map(|s| if s == 1 { on } else { 255 - on })
+        .collect();
+    GrayImage::from_raw(columns, rows, luma)
+        .map(DynamicImage::ImageLuma8)
+        .ok_or_else(|| "invalid frame size".into())
+}
+
+/// The colors of the palette of a PALETTE COLOR instance (PS3.3 C.7.6.3.1.5 and C.7.6.3.1.6),
+/// in 8 bits, and the stored value of its first entry. Segmented palettes are not supported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Palette {
+    pub colors: Vec<[u8; 3]>,
+    pub first: i64,
+}
+
+impl Palette {
+    pub fn of(obj: &DefaultDicomObject) -> Result<Palette, String> {
+        let (red, first) = palette_channel(
+            obj,
+            tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            "Red",
+        )?;
+        let (green, _) = palette_channel(
+            obj,
+            tags::GREEN_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            tags::GREEN_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            "Green",
+        )?;
+        let (blue, _) = palette_channel(
+            obj,
+            tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            "Blue",
+        )?;
+        if green.len() != red.len() || blue.len() != red.len() {
+            return Err("the red, green and blue palettes have different lengths".into());
+        }
+        let colors = red
+            .into_iter()
+            .zip(green)
+            .zip(blue)
+            .map(|((r, g), b)| [r, g, b])
+            .collect();
+        Ok(Palette { colors, first })
+    }
+
+    /// The RGB image of a native little endian frame of indices (`data`); the values out of
+    /// the palette take its first or last entry.
+    pub fn image(
+        &self,
+        obj: &DefaultDicomObject,
+        format: SampleFormat,
+        data: &[u8],
+    ) -> Result<DynamicImage, String> {
+        let rows = int(obj, tags::ROWS).ok_or("missing Rows")?;
+        let columns = int(obj, tags::COLUMNS).ok_or("missing Columns")?;
+        let SampleFormat::Integer {
+            bits_allocated: 8 | 16,
+            ..
+        } = format
+        else {
+            return Err("PALETTE COLOR needs 8 or 16 bits allocated".into());
+        };
+        let pixels = rows as usize * columns as usize;
+        let values = format.values(data);
+        if values.len() < pixels {
+            return Err(format!(
+                "frame has {} samples, {pixels} expected",
+                values.len()
+            ));
+        }
+        let last = self.colors.len() as i64 - 1;
+        let rgb = values[..pixels]
+            .iter()
+            .flat_map(|&v| self.colors[(v as i64 - self.first).clamp(0, last) as usize])
+            .collect();
+        RgbImage::from_raw(columns, rows, rgb)
+            .map(DynamicImage::ImageRgb8)
+            .ok_or_else(|| "invalid frame size".into())
+    }
+}
+
+/// The entries of one palette in 8 bits, and the stored value of its first entry.
+fn palette_channel(
+    obj: &DefaultDicomObject,
+    descriptor_tag: Tag,
+    data_tag: Tag,
+    name: &str,
+) -> Result<(Vec<u8>, i64), String> {
+    let descriptor: Vec<i64> = obj
+        .element_opt(descriptor_tag)
+        .ok()
+        .flatten()
+        .and_then(|e| e.to_multi_int::<i64>().ok())
+        .ok_or_else(|| format!("no {name} Palette Color Lookup Table Descriptor"))?;
+    let [entries, first, bits] = descriptor[..] else {
+        return Err(format!(
+            "invalid {name} Palette Color Lookup Table Descriptor: {descriptor:?}"
+        ));
+    };
+    // 0 entries means 65536; the first stored value mapped is unsigned with US, signed with SS.
+    let entries = if entries == 0 {
+        65536
+    } else {
+        entries as u16 as usize
+    };
+    let first = if first < 0 { first } else { first & 0xFFFF };
+    let element = obj.element_opt(data_tag).ok().flatten().ok_or_else(|| {
+        format!("no {name} Palette Color Lookup Table Data (segmented palettes are not supported)")
+    })?;
+    let words: Vec<u16> = match element.value().primitive() {
+        Some(PrimitiveValue::U16(words)) => words.to_vec(),
+        // 8-bit entries in bytes.
+        Some(PrimitiveValue::U8(bytes)) if bits == 8 && bytes.len() == entries => {
+            bytes.iter().map(|&b| u16::from(b)).collect()
+        }
+        Some(PrimitiveValue::U8(bytes)) => bytes
+            .chunks_exact(2)
+            .map(|w| u16::from_le_bytes([w[0], w[1]]))
+            .collect(),
+        _ => return Err(format!("invalid {name} Palette Color Lookup Table Data")),
+    };
+    if words.len() < entries {
+        return Err(format!(
+            "{} entries in the {name} Palette Color Lookup Table Data, {entries} expected",
+            words.len()
+        ));
+    }
+    // 8-bit entries are in the low byte of 16-bit words (or, by some writers, in the high one).
+    let high = bits == 16 || words[..entries].iter().any(|&w| w > 255);
+    Ok((
+        words[..entries]
+            .iter()
+            .map(|&w| if high { (w >> 8) as u8 } else { w as u8 })
+            .collect(),
+        first,
+    ))
+}
+
 fn int(obj: &DefaultDicomObject, tag: Tag) -> Option<u32> {
     obj.element_opt(tag).ok().flatten()?.to_int::<u32>().ok()
 }
@@ -616,6 +805,76 @@ mod tests {
                 .transfer_syntax("1.2.840.10008.1.2.1"),
         )
         .expect("valid meta")
+    }
+
+    #[test]
+    fn one_bit_samples() {
+        // The second sample of 9 starts at bit 9.
+        let samples = [1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1];
+        let packed = pack_bits(&samples);
+        assert_eq!(packed, [0b0000_1101, 0b0101_1101, 0b0000_0010]);
+        assert_eq!(unpack_bits(&packed, 0, 18).as_deref(), Some(&samples[..]));
+        assert_eq!(unpack_bits(&packed, 9, 9).as_deref(), Some(&samples[9..]));
+        assert_eq!(unpack_bits(&packed, 9, 16), None);
+    }
+
+    #[test]
+    fn palettes() {
+        use dicom_core::{DataElement, PrimitiveValue, VR};
+        let mut obj = monochrome(&[]);
+        // 8-bit entries in 16-bit words, from the stored value 10.
+        for (descriptor, data, scale) in [
+            (
+                tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+                tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+                1,
+            ),
+            (
+                tags::GREEN_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+                tags::GREEN_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+                2,
+            ),
+            (
+                tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+                tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+                3,
+            ),
+        ] {
+            let descriptor_value = PrimitiveValue::U16(vec![4, 10, 8].into());
+            obj.put(DataElement::new(descriptor, VR::US, descriptor_value));
+            let entries = PrimitiveValue::U16((0..4).map(|i| i * scale * 10).collect());
+            obj.put(DataElement::new(data, VR::OW, entries));
+        }
+        let palette = Palette::of(&obj).expect("palette");
+        assert_eq!(palette.first, 10);
+        assert_eq!(
+            palette.colors,
+            [[0, 0, 0], [10, 20, 30], [20, 40, 60], [30, 60, 90]]
+        );
+        obj.put(DataElement::new(
+            tags::ROWS,
+            VR::US,
+            PrimitiveValue::from(1_u16),
+        ));
+        obj.put(DataElement::new(
+            tags::COLUMNS,
+            VR::US,
+            PrimitiveValue::from(3_u16),
+        ));
+        let format = SampleFormat::Integer {
+            bits_allocated: 8,
+            bits_stored: 8,
+            signed: false,
+        };
+        // Below, in and above the palette.
+        let image = palette.image(&obj, format, &[2, 11, 200]).expect("image");
+        assert_eq!(
+            image.to_rgb8().into_raw(),
+            [0, 0, 0, 10, 20, 30, 30, 60, 90]
+        );
+        obj.remove_element(tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DATA);
+        let error = Palette::of(&obj).expect_err("segmented");
+        assert!(error.contains("segmented"), "{error}");
     }
 
     #[test]
