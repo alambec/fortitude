@@ -36,6 +36,22 @@ docker run -p 8042:8042 -v fortitude-data:/var/lib/fortitude fortitude
 
 Building needs CMake and a C++ compiler: CharLS, the JPEG-LS codec, is built from source.
 
+Each version tag `vX.Y.Z` publishes the image (x86_64) as `ghcr.io/alambec/fortitude`, tagged
+`X.Y.Z`, `X.Y` and `latest`:
+
+```yaml
+# docker-compose.yaml
+services:
+  fortitude:
+    image: ghcr.io/alambec/fortitude:0.1
+    ports: ["8042:8042"]
+    environment:
+      FORTITUDE_AUTH__USERS: '[{name="admin",password="change-me"}]'
+    volumes: ["fortitude-data:/var/lib/fortitude"]
+volumes:
+  fortitude-data:
+```
+
 Configuration is layered: defaults, then the TOML file, then `FORTITUDE_*` environment
 variables with `__` between sections.
 
