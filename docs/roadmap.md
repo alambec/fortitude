@@ -11,7 +11,7 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 | Protocols | DICOMweb first (STOW-RS, WADO-RS, QIDO-RS, WADO-URI), then DIMSE as SCP (C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET) and as SCU of the known peers (C-ECHO, C-FIND, C-MOVE, C-STORE), with `dicom-ul` for PDU encoding. |
 | Duplicates | An instance whose SOP Instance UID is already stored is **discarded**. The STOW-RS response still lists it in ReferencedSOPSequence (it is retrievable at its RetrieveURL) with the implementation-specific Warning Reason **`0xB111` "Duplicate SOP Instance, discarded"** (PS3.18 §I.2.1 allows additional warning codes; must appear in the conformance statement), so the response status is 202. |
 | Out of scope | Lua, plugin SDK, jobs engine, a built-in viewer (use OHIF; the explorer only searches and browses), Orthanc REST API compatibility. |
-| License | Proprietary, Alambec. |
+| License | Open source: AGPL-3.0, with commercial licenses sold by Alambec. Pull requests are not accepted, so that Alambec owns all of the code. |
 
 ## Performance principles
 

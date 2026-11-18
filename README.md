@@ -6,6 +6,14 @@ Fortitude aims to be faster than Orthanc on the workloads viewers and archives d
 (ingest, QIDO-RS, WADO-RS metadata and frames) with a deliberately smaller feature set.
 See [docs/roadmap.md](docs/roadmap.md) for the design decisions and phases.
 
+Fortitude is open source, under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
+Alambec also offers commercial licenses, to use it without the obligations of the AGPL, and paid
+support: see [License](#license).
+
+> **Not a medical device.** Fortitude is not certified for diagnostic or clinical use. It comes
+> with no warranty: you are responsible for validating it, and for the security of the health
+> data it stores.
+
 ## Layout
 
 | Path | Content |
@@ -402,6 +410,30 @@ checks with pynetdicom and Orthanc are in `tests/interop/`.
 
 Servers are pinned to CPUs 0-5 and the load generator to 6-11 (`SERVER_CPUS`, `CLIENT_CPUS`).
 
+## Contributing and security
+
+Bug reports and feature requests are welcome as GitHub issues, but pull requests are not accepted:
+see [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately, as described in
+[SECURITY.md](SECURITY.md).
+
 ## License
 
-Proprietary — Copyright (c) 2026 Alambec. All rights reserved. See [LICENSE](LICENSE).
+Copyright 2026 Alambec. Fortitude is free software: you may use, modify and redistribute it under
+the terms of the [GNU Affero General Public License, version 3](LICENSE) (AGPL-3.0-only). If you
+distribute a modified version, or let users interact with one over a network, you must offer them
+its complete source code under the same license.
+
+To use Fortitude without these obligations, for example in a proprietary product or service,
+Alambec offers commercial licenses. For a commercial license or paid support, write to
+gabriel.couture@alambec.com.
+
+The Docker image includes the licenses of the third-party software in the binary
+(`/usr/share/doc/fortitude/THIRD-PARTY-NOTICES.txt`). After a change of the dependencies, regenerate
+the file with [cargo-about](https://github.com/EmbarkStudios/cargo-about):
+
+```sh
+cargo about generate --locked --fail -m crates/fortitude/Cargo.toml about.hbs -o THIRD-PARTY-NOTICES.txt
+```
+
+A new license in the dependencies must be added to `accepted` in `about.toml`, only if it is
+permissive.
