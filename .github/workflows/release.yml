@@ -32,6 +32,8 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
+          # The checked-out tag, not the commit the workflow runs from (run by hand: main).
+          context: git
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           # 0.1.0 and 0.1; latest only for a release (no pre-release suffix such as -rc.1).
