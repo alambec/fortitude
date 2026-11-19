@@ -165,10 +165,10 @@ mod tests {
     #[test]
     fn base_url_follows_proxies() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("internal:8042"));
+        headers.insert(header::HOST, HeaderValue::from_static("internal:8080"));
         assert_eq!(
             base_url(&headers, &config(None)),
-            "http://internal:8042/dicom-web"
+            "http://internal:8080/dicom-web"
         );
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
         headers.insert(

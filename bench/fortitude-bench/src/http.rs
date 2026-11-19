@@ -3,7 +3,7 @@ use std::time::Duration;
 /// Server under test.
 #[derive(Debug, Clone, clap::Args)]
 pub struct Target {
-    /// DICOMweb root, e.g. `http://localhost:8042/dicom-web`.
+    /// DICOMweb root, e.g. `http://localhost:8080/dicom-web`.
     #[arg(long)]
     url: String,
     /// WADO-URI endpoint; defaults to `/wado` at the root of `--url`'s origin.
@@ -65,9 +65,9 @@ mod tests {
     #[test]
     fn wado_defaults_to_origin_root() {
         assert_eq!(
-            target("http://h:8042/dicom-web/").wado(),
-            "http://h:8042/wado"
+            target("http://h:8080/dicom-web/").wado(),
+            "http://h:8080/wado"
         );
-        assert_eq!(target("http://h:8042").wado(), "http://h:8042/wado");
+        assert_eq!(target("http://h:8080").wado(), "http://h:8080/wado");
     }
 }

@@ -126,16 +126,16 @@ to associate with it when `allow_unknown_peers` is off. A modality is identified
 title; one of the configuration file cannot be changed or removed at runtime.
 
 ```sh
-curl -X PUT -H 'Content-Type: application/json' localhost:8042/admin/modalities/PACS \
+curl -X PUT -H 'Content-Type: application/json' localhost:8080/admin/modalities/PACS \
     -d '{"host": "10.0.0.7", "port": 104, "description": "Main PACS"}'
-curl localhost:8042/admin/modalities/PACS/echo
-curl 'localhost:8042/admin/modalities/PACS/find?level=STUDY&PatientName=DOE*&StudyDate=20240101-'
-curl -X POST -H 'Content-Type: application/json' localhost:8042/admin/modalities/PACS/move \
+curl localhost:8080/admin/modalities/PACS/echo
+curl 'localhost:8080/admin/modalities/PACS/find?level=STUDY&PatientName=DOE*&StudyDate=20240101-'
+curl -X POST -H 'Content-Type: application/json' localhost:8080/admin/modalities/PACS/move \
     -d '{"level": "STUDY", "keys": {"StudyInstanceUID": "1.2.3"}}'
-curl localhost:8042/admin/moves
-curl -X POST -H 'Content-Type: application/json' localhost:8042/admin/modalities/PACS/store \
+curl localhost:8080/admin/moves
+curl -X POST -H 'Content-Type: application/json' localhost:8080/admin/modalities/PACS/store \
     -d '{"level": "SERIES", "keys": {"StudyInstanceUID": "1.2.3", "SeriesInstanceUID": "1.2.3.4"}}'
-curl localhost:8042/admin/sends
+curl localhost:8080/admin/sends
 ```
 
 - **Queries** take a level (`PATIENT`, `STUDY`, `SERIES` or `IMAGE`) and matching keys, by

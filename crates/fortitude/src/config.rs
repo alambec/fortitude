@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Server configuration, layered as: built-in defaults, then the TOML file (if any), then
 /// `FORTITUDE_*` environment variables, where `__` separates sections
-/// (e.g. `FORTITUDE_HTTP__LISTEN=0.0.0.0:8042`).
+/// (e.g. `FORTITUDE_HTTP__LISTEN=0.0.0.0:8080`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -42,7 +42,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::from(([0, 0, 0, 0], 8042)),
+            listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
             dicomweb_root: "/dicom-web".to_owned(),
             wado_root: "/wado".to_owned(),
             public_url: None,
@@ -567,7 +567,7 @@ mod tests {
                 "fortitude.toml",
                 r#"
                 [dimse]
-                listen = "0.0.0.0:4242"
+                listen = "0.0.0.0:104"
                 [[dimse.peers]]
                 ae_title = "VIEWER"
                 host = "10.0.0.5"
@@ -575,7 +575,7 @@ mod tests {
                 "#,
             )?;
             let config = Config::load(Some(Path::new("fortitude.toml"))).map_err(|e| *e)?;
-            assert_eq!(config.dimse.listen, Some("0.0.0.0:4242".parse().unwrap()));
+            assert_eq!(config.dimse.listen, Some("0.0.0.0:104".parse().unwrap()));
             let service = config.dimse.service(1 << 20).unwrap();
             assert_eq!(service.ae_title, "FORTITUDE");
             assert_eq!(service.peers.all()[0].port, 104);

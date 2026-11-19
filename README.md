@@ -27,11 +27,11 @@ services:
   fortitude:
     image: ghcr.io/alambec/fortitude:0.1
     ports:
-      - "8042:8042"   # HTTP: DICOMweb and web explorer
-      - "4242:4242"   # DIMSE
+      - "8080:8080"   # HTTP: DICOMweb and web explorer
+      - "104:104"     # DIMSE
     environment:
       FORTITUDE_AUTH__USERS: '[{name="admin",password="change-me"}]'
-      FORTITUDE_DIMSE__LISTEN: "0.0.0.0:4242"
+      FORTITUDE_DIMSE__LISTEN: "0.0.0.0:104"
     volumes:
       - fortitude-data:/var/lib/fortitude
     restart: unless-stopped
@@ -43,14 +43,14 @@ volumes:
 docker compose up -d
 ```
 
-- **Web explorer**: <http://localhost:8042/>, as `admin`.
-- **DICOMweb**: `http://localhost:8042/dicom-web`, the root to give your viewer (OHIF, for
+- **Web explorer**: <http://localhost:8080/>, as `admin`.
+- **DICOMweb**: `http://localhost:8080/dicom-web`, the root to give your viewer (OHIF, for
   example), with the same credentials.
-- **DIMSE**: AE title `FORTITUDE`, port 4242.
+- **DIMSE**: AE title `FORTITUDE`, port 104.
 
 ```sh
-dcmsend -aec FORTITUDE localhost 4242 image.dcm                   # store a file (DCMTK)
-curl -u admin:change-me http://localhost:8042/dicom-web/studies   # list the studies
+dcmsend -aec FORTITUDE localhost 104 image.dcm                    # store a file (DCMTK)
+curl -u admin:change-me http://localhost:8080/dicom-web/studies   # list the studies
 ```
 
 The image is built for x86_64. Its tags follow the releases: `0.1.0`, `0.1` and `latest`.
@@ -64,7 +64,7 @@ variable), then `FORTITUDE_*` environment variables, with `__` between the secti
 | Setting | Default | |
 |---|---|---|
 | `auth.users`, `auth.tokens` | none | HTTP Basic users and Bearer tokens (`read_only` for read access only). Without any, authentication is **disabled**, and the web explorer is not served. |
-| `dimse.listen` | unset | Address of the DIMSE service (e.g. `0.0.0.0:4242`); unset, it is disabled. |
+| `dimse.listen` | unset | Address of the DIMSE service (e.g. `0.0.0.0:104`); unset, it is disabled. |
 | `dimse.ae_title` | `FORTITUDE` | Fortitude's AE title. |
 | `dimse.peers` | none | Known DICOM nodes (AE title, host, port): C-MOVE destinations, and nodes to query or send to. They can also be registered from the web explorer. |
 | `index.backend` | `sqlite` | `postgres`, with `index.postgres_url`. |

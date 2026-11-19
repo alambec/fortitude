@@ -1,7 +1,7 @@
 # Fortitude server image.
 #
 #   docker build -t fortitude .
-#   docker run -p 8042:8042 -v fortitude-data:/var/lib/fortitude fortitude
+#   docker run -p 8080:8080 -v fortitude-data:/var/lib/fortitude fortitude
 
 FROM rust:1.92-bookworm AS build
 # CMake: CharLS, the JPEG-LS codec, is built from source.
@@ -26,6 +26,6 @@ COPY LICENSE THIRD-PARTY-NOTICES.txt /usr/share/doc/fortitude/
 USER fortitude
 ENV FORTITUDE_STORAGE__PATH=/var/lib/fortitude \
     FORTITUDE_LOG__FORMAT=json
-EXPOSE 8042
+EXPOSE 8080 104
 VOLUME /var/lib/fortitude
 ENTRYPOINT ["fortitude"]

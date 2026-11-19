@@ -53,11 +53,11 @@ jobs:
       - name: Smoke test
         run: |
           # The web explorer is only served to configured users.
-          docker run -d --name fortitude -p 8042:8042 \
+          docker run -d --name fortitude -p 8080:8080 \
             -e FORTITUDE_AUTH__USERS='[{name="ci",password="ci"}]' fortitude:ci
-          for i in $(seq 30); do curl -sf localhost:8042/health && break; sleep 1; done
-          curl -sf -u ci:ci -H 'Accept: application/dicom+json' localhost:8042/dicom-web/studies
-          curl -sf localhost:8042/metrics | grep -q fortitude_http_requests_total
-          curl -sf -u ci:ci localhost:8042/ui/ | grep -q dicomweb-root
-          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8042/ui/)" = 401
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 1; done
+          curl -sf -u ci:ci -H 'Accept: application/dicom+json' localhost:8080/dicom-web/studies
+          curl -sf localhost:8080/metrics | grep -q fortitude_http_requests_total
+          curl -sf -u ci:ci localhost:8080/ui/ | grep -q dicomweb-root
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/ui/)" = 401
           docker rm -f fortitude

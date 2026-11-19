@@ -17,7 +17,7 @@
 cargo run --release -p fortitude -- --config fortitude.toml
 # or
 docker build -t fortitude .
-docker run -p 8042:8042 -v fortitude-data:/var/lib/fortitude fortitude
+docker run -p 8080:8080 -v fortitude-data:/var/lib/fortitude fortitude
 ```
 
 Building needs CMake and a C++ compiler: CharLS, the JPEG-LS codec, is built from source.

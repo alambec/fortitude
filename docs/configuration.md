@@ -22,8 +22,8 @@ services:
   fortitude:
     image: ghcr.io/alambec/fortitude:0.1
     ports:
-      - "8042:8042"
-      - "4242:4242"
+      - "8080:8080"
+      - "104:104"
     environment:
       FORTITUDE_CONFIG: /etc/fortitude/fortitude.toml
     volumes:
@@ -57,7 +57,7 @@ backend = "postgres"
 postgres_url = "postgres://fortitude:secret@db:5432/fortitude"
 
 [dimse]
-listen = "0.0.0.0:4242"
+listen = "0.0.0.0:104"
 [[dimse.peers]]
 ae_title = "VIEWER"
 host = "10.0.0.5"
@@ -70,6 +70,10 @@ password = "change-me"
 
 The container runs as the user 10001: the file must be readable by it.
 
+Port 104, the standard DICOM port, is below 1024: Docker lets the container's user listen on it,
+but elsewhere (a systemd service, Kubernetes) Fortitude needs the `CAP_NET_BIND_SERVICE`
+capability, or another port such as 11112, the other port registered for DICOM.
+
 ## All settings
 
 The values are the defaults, except the commented lines and the examples of `dimse.peers` and
@@ -77,7 +81,7 @@ The values are the defaults, except the commented lines and the examples of `dim
 
 ```toml
 [http]
-listen = "0.0.0.0:8042"
+listen = "0.0.0.0:8080"
 dicomweb_root = "/dicom-web"
 wado_root = "/wado"        # WADO-URI
 # public_url = "https://pacs.example.org"   # default: from Host / X-Forwarded-* headers
@@ -112,7 +116,7 @@ max_instance_size_mib = 4096
 qido_max_results = 10000   # QIDO-RS results per request (0 = no limit); page with offset
 
 [dimse]                    # C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET (SCP); C-ECHO, C-FIND, C-MOVE, C-STORE (SCU)
-# listen = "0.0.0.0:4242"  # unset: DIMSE SCP disabled (modalities can still be queried)
+# listen = "0.0.0.0:104"   # unset: DIMSE SCP disabled (modalities can still be queried)
 ae_title = "FORTITUDE"
 check_called_ae_title = false
 allow_unknown_peers = true # false: only the peers below may associate
