@@ -4,7 +4,7 @@ Fortitude stores medical images, which contain health data. If you find a vulner
 privately: do not open a public issue.
 
 - Use GitHub's private vulnerability reporting (the "Report a vulnerability" button of the
-  Security tab), or write to gabriel.couture@alambec.com.
+  Security tab), or write to contact@alambec.com.
 - Include the version or commit, the configuration involved, and the steps to reproduce.
 
 ## Deployment

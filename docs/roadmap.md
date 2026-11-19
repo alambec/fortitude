@@ -99,4 +99,4 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 
 `bench/` holds the load generator, the Orthanc baselines (PostgreSQL and SQLite index, tuned
 per the Orthanc Book) and the results. Every phase is measured against the same dataset and
-scenarios; see the [README](../README.md#benchmarks).
+scenarios; see [Development](development.md#benchmarks).

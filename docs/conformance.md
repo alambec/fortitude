@@ -409,7 +409,7 @@ Failures carry an Error Comment (0000,0902). A data set larger than
 ### SCU
 
 Fortitude verifies, queries and retrieves from its peers, and sends them stored instances,
-on request (`/admin/modalities`, see the [README](../README.md#modalities)): those of
+on request (`/admin/modalities`, see [Administration](administration.md#modalities)): those of
 `dimse.peers` and those registered at runtime. Each request opens an association of its own,
 with `dimse.ae_title` as calling AE title and `dimse.max_pdu_length` as maximum PDU length,
 proposing Explicit and Implicit VR Little Endian (and, to send instances, their stored
