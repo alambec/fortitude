@@ -460,7 +460,8 @@ impl Config {
             figment = figment.merge(Toml::file_exact(file));
         }
         figment
-            .merge(Env::prefixed("FORTITUDE_").split("__"))
+            // FORTITUDE_CONFIG is the path of the file (`--config`), not a setting.
+            .merge(Env::prefixed("FORTITUDE_").ignore(&["config"]).split("__"))
             .extract()
             .map_err(Box::new)
     }
@@ -490,6 +491,15 @@ mod tests {
             assert_eq!(config.http.listen, "127.0.0.1:9001".parse().unwrap());
             assert_eq!(config.storage.path, PathBuf::from("/srv/fortitude"));
             assert_eq!(config.http.dicomweb_root, "/dicom-web");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn config_variable_is_not_a_setting() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("FORTITUDE_CONFIG", "/etc/fortitude/fortitude.toml");
+            Config::load(None).map_err(|e| *e)?;
             Ok(())
         });
     }
