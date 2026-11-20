@@ -1,0 +1,40 @@
+name: Bug report
+description: Something does not work, or a DICOM file, viewer or modality does not work with Fortitude.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never attach files or logs that contain patient data.** Anonymize them first, or describe
+        the problem with the attributes involved (tag, VR, value).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The image tag (`0.1.0`), or the commit if built from source.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Requests, commands, or the viewer or modality involved (name and version).
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: The settings that differ from the defaults (index and storage backends, DIMSE). Remove passwords, tokens and keys.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines of the server's log, without patient data.
+      render: text

@@ -1,0 +1,16 @@
+name: Feature request
+description: A missing feature or service.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Need
+      description: What you want to do, and why Fortitude does not allow it today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it could work, and the DICOM standard parts involved, if any.

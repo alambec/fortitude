@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/alambec/fortitude/security/policy
+    about: Report vulnerabilities privately, never in a public issue.
+  - name: Commercial license or paid support
+    url: mailto:contact@alambec.com
+    about: Write to contact@alambec.com.
