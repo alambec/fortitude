@@ -25,6 +25,10 @@ const INDEX: &str = include_str!("../ui/index.html");
 const SCRIPT: &str = include_str!("../ui/app.js");
 const STYLE: &str = include_str!("../ui/style.css");
 
+/// The repository of the source code, offered to the users of the explorer (AGPL-3.0, section
+/// 13): a modified version must point to its own source code.
+const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
+
 /// At most this many names per lookup.
 const MAX_NAMES: usize = 2048;
 
@@ -32,7 +36,9 @@ const MAX_NAMES: usize = 2048;
 pub fn router(store: Arc<Store>, dicomweb_root: &str, wado_root: &str) -> Router {
     let index = INDEX
         .replace("{{DICOMWEB_ROOT}}", &escape(dicomweb_root))
-        .replace("{{WADO_ROOT}}", &escape(wado_root));
+        .replace("{{WADO_ROOT}}", &escape(wado_root))
+        .replace("{{VERSION}}", &escape(env!("CARGO_PKG_VERSION")))
+        .replace("{{SOURCE}}", &escape(SOURCE));
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui", get(|| async { Redirect::permanent("/ui/") }))

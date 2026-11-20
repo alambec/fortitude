@@ -453,6 +453,13 @@ mod tests {
             "{body}"
         );
         assert!(body.contains(r#"<meta name="wado-root" content="/wado">"#));
+        // The source-code offer of the AGPL.
+        let source = format!(
+            r#"href="https://github.com/alambec/fortitude/tree/v{}""#,
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(body.contains(&source), "{body}");
+        assert!(!body.contains("{{"), "{body}");
         for asset in ["/ui/app.js", "/ui/style.css"] {
             assert_eq!(h.send(get(asset, user)).await.0, StatusCode::OK);
         }

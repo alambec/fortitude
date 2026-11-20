@@ -126,6 +126,16 @@ main {
   gap: 16px;
 }
 
+/* License notice, for the source-code offer of the AGPL (section 13). */
+.footer {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 24px 24px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+
 /* Cards */
 
 .card {
