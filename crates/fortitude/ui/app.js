@@ -842,6 +842,55 @@ function seriesView(view, state, study, series) {
     const title = [text(item, "SeriesNumber") && `#${text(item, "SeriesNumber")}`, text(item, "SeriesDescription") || "(no description)"]
       .filter(Boolean).join(" · ");
     const sending = sendControl("SERIES", { StudyInstanceUID: study, SeriesInstanceUID: series });
+
+    // The instances as a list, or their images one slice at a time. The mode and the slice are
+    // kept in the URL without a navigation, so that a reload or a shared link opens them again.
+    const slices = seriesSlices(instances.items);
+    const signal = navigation.signal;
+    const content = h("div");
+    let mode = slices.length && state.get("view") === "viewer" ? "viewer" : "list";
+    let slice = Math.min(slices.length, Math.max(1, Number(state.get("slice")) || 1)) - 1;
+    let opened = null;
+    let urlTimer = null;
+    const keepUrl = () => {
+      clearTimeout(urlTimer);
+      urlTimer = setTimeout(() => {
+        if (signal.aborted) return;
+        const params = mode === "viewer" ? `?${new URLSearchParams({ view: "viewer", slice: slice + 1 })}` : "";
+        try { history.replaceState(history.state, "", `${seriesRoute(study, series)}${params}`); } catch { /* not kept */ }
+      }, 300);
+    };
+    const toggle = () => h("div", { class: "segmented", role: "group", "aria-label": "Display" },
+      [["list", "List"], ["viewer", "Viewer"]].map(([value, label]) => h("button", {
+        type: "button",
+        "aria-pressed": String(value === mode),
+        onclick: () => show(value),
+      }, label)));
+    const list = (head) => h("section", { class: "card" },
+      h("div", { class: "card-head" },
+        h("h2", {}, "Instances", h("span", { class: "count" }, instances.items.length)), head),
+      instances.truncated ? notice("warn", "This series has more instances than the server returns at once.") : null,
+      table.el);
+    const show = (next) => {
+      mode = next;
+      opened?.dispose();
+      opened = null;
+      if (mode === "viewer") {
+        opened = seriesViewer(study, series, slices, slice, toggle(), signal, (i) => {
+          slice = i;
+          keepUrl();
+        });
+        content.replaceChildren(...[
+          instances.truncated && notice("warn", "This series has more instances than the server returns at once: the viewer shows the first ones."),
+          opened.el,
+        ].filter(Boolean));
+      } else {
+        content.replaceChildren(list(slices.length ? toggle() : null));
+      }
+      keepUrl();
+    };
+    show(mode);
+
     return [
       titleCard(title, `${name(studyItem)} · ${text(studyItem, "StudyDescription") || formatDate(text(studyItem, "StudyDate"))}`, [
         ["Modality", badges([text(item, "Modality")])],
@@ -852,12 +901,254 @@ function seriesView(view, state, study, series) {
         ["Series Instance UID", series, { mono: true }],
       ], [archiveLink({ study, series }), sending.control]),
       sending.messages,
-      h("section", { class: "card" },
-        h("div", { class: "card-head" }, h("h2", {}, "Instances", h("span", { class: "count" }, instances.items.length))),
-        instances.truncated ? notice("warn", "This series has more instances than the server returns at once.") : null,
-        table.el),
+      content,
     ];
   });
+}
+
+/** The images of a series, one slice per frame, in the order of its instances (Instance Number). */
+function seriesSlices(instances) {
+  return instances.filter((i) => number(i, "Rows")).flatMap((instance) => {
+    const frames = Math.max(1, number(instance, "NumberOfFrames") || 1);
+    return Array.from({ length: frames }, (_, f) => ({ instance, frame: f + 1, frames }));
+  });
+}
+
+const renderedUrl = (study, series, { instance, frame, frames }) => {
+  const base = instanceUrl(study, series, text(instance, "SOPInstanceUID"));
+  return frames > 1 ? `${base}/frames/${frame}/rendered` : `${base}/rendered`;
+};
+
+/** Slices fetched on each side of the one shown, so that scrolling does not wait for the server. */
+const SLICE_WINDOW = 16;
+/** Rendered slices fetched at once. */
+const SLICE_CONCURRENCY = 4;
+/** Rendered slices kept in memory: the farthest from the one shown are dropped first. */
+const SLICE_CACHE = 400;
+
+/** Fetches rendered slices, nearest to the current one first, as object URLs. */
+class SliceLoader {
+  constructor(urls, onLoad) {
+    this.urls = urls;
+    this.onLoad = onLoad;
+    /** Slice index: `{ src }`, or `{ error: true }` when it cannot be rendered. */
+    this.loaded = new Map();
+    /** Slice index: AbortController of its request. */
+    this.running = new Map();
+    this.current = 0;
+    this.disposed = false;
+  }
+
+  focus(index) {
+    this.current = index;
+    // Requests for slices scrolled past make room for the ones now needed.
+    for (const [i, request] of this.running) {
+      if (Math.abs(i - index) > SLICE_WINDOW) request.abort();
+    }
+    this.pump();
+  }
+
+  next() {
+    for (let d = 0; d <= SLICE_WINDOW; d++) {
+      for (const i of d ? [this.current + d, this.current - d] : [this.current]) {
+        if (i >= 0 && i < this.urls.length && !this.loaded.has(i) && !this.running.has(i)) return i;
+      }
+    }
+    return null;
+  }
+
+  pump() {
+    while (!this.disposed && this.running.size < SLICE_CONCURRENCY) {
+      const i = this.next();
+      if (i == null) return;
+      this.fetch(i);
+    }
+  }
+
+  async fetch(i) {
+    const request = new AbortController();
+    this.running.set(i, request);
+    try {
+      const response = await get(this.urls[i], "image/jpeg", request.signal);
+      const blob = await response.blob();
+      if (this.disposed) return;
+      this.loaded.set(i, { src: URL.createObjectURL(blob) });
+      this.evict();
+    } catch (e) {
+      if (e.name !== "AbortError" && !this.disposed) this.loaded.set(i, { error: true });
+    } finally {
+      this.running.delete(i);
+      if (!this.disposed) {
+        if (this.loaded.has(i)) this.onLoad(i);
+        this.pump();
+      }
+    }
+  }
+
+  evict() {
+    if (this.loaded.size <= SLICE_CACHE) return;
+    const farthest = [...this.loaded.keys()].sort((a, b) => Math.abs(b - this.current) - Math.abs(a - this.current));
+    for (const i of farthest.slice(0, this.loaded.size - SLICE_CACHE)) {
+      if (Math.abs(i - this.current) <= SLICE_WINDOW) break;
+      const { src } = this.loaded.get(i);
+      if (src) URL.revokeObjectURL(src);
+      this.loaded.delete(i);
+    }
+  }
+
+  dispose() {
+    this.disposed = true;
+    for (const request of this.running.values()) request.abort();
+    for (const { src } of this.loaded.values()) if (src) URL.revokeObjectURL(src);
+    this.loaded.clear();
+  }
+}
+
+/**
+ * The instance viewer for a whole series: the mouse wheel over the image, the slider or the
+ * arrow keys scroll through the slices, and the tags follow the instance shown.
+ */
+function seriesViewer(study, series, slices, start, toggle, signal, onSlice) {
+  let index = start;
+  const loader = new SliceLoader(slices.map((s) => renderedUrl(study, series, s)), (i) => {
+    if (i === index) draw();
+  });
+  const metadata = new Map();
+
+  const stage = h("div", { class: "stage" });
+  const unrenderable = () => h("div", { class: "empty" }, "This slice cannot be rendered.");
+  const img = h("img", { alt: "Rendered slice" });
+  img.addEventListener("error", () => img.isConnected && stage.replaceChildren(unrenderable()));
+  const count = h("span", { class: "count" });
+  const label = h("span", { class: "muted mono" });
+  const slider = slices.length > 1 ? h("input", {
+    type: "range", min: 1, max: slices.length, value: index + 1, "aria-label": "Slice",
+    oninput: (e) => go(Number(e.target.value) - 1),
+  }) : null;
+  const info = h("div");
+  const tags = h("div", {}, loading());
+
+  function draw() {
+    const entry = loader.loaded.get(index);
+    if (entry?.src) {
+      if (img.getAttribute("src") !== entry.src) img.src = entry.src;
+      if (!img.isConnected) stage.replaceChildren(img);
+    } else if (entry?.error) {
+      stage.replaceChildren(unrenderable());
+    }
+    // Until it arrives, the previous slice stays on screen.
+    stage.classList.toggle("pending", !entry);
+  }
+
+  function describe() {
+    const { instance, frame, frames } = slices[index];
+    const sop = text(instance, "SOPInstanceUID");
+    const instanceNumber = text(instance, "InstanceNumber");
+    count.textContent = `${index + 1} of ${slices.length}`;
+    label.textContent = [instanceNumber && `Instance ${instanceNumber}`, frames > 1 && `frame ${frame} / ${frames}`].filter(Boolean).join(" · ");
+    const download = `${WADO}?${new URLSearchParams({
+      requestType: "WADO", studyUID: study, seriesUID: series, objectUID: sop, contentType: "application/dicom",
+    })}`;
+    info.replaceChildren(
+      details([
+        ["SOP class", knownNames.uids.get(text(instance, "SOPClassUID")) || text(instance, "SOPClassUID")],
+        ["Size", text(instance, "Rows") ? `${text(instance, "Columns")} × ${text(instance, "Rows")}` : ""],
+        ["Frames", frames > 1 ? String(frames) : ""],
+        ["SOP Instance UID", sop, { mono: true }],
+      ]),
+      h("div", { class: "actions", style: "margin-top: 14px" },
+        h("a", { class: "button small", href: instanceRoute(study, series, sop) }, "Open instance"),
+        h("a", { class: "button small", href: download, download: `${sop}.dcm` }, "Download DICOM"),
+        h("a", { class: "button small", href: renderedUrl(study, series, slices[index]), target: "_blank" }, "Open image")));
+  }
+
+  // The tags of the instance shown, once the scrolling pauses.
+  let tagsFor = null;
+  let tagsTimer = null;
+  function scheduleTags() {
+    clearTimeout(tagsTimer);
+    tagsTimer = setTimeout(async () => {
+      const sop = text(slices[index].instance, "SOPInstanceUID");
+      if (sop === tagsFor) return;
+      try {
+        let dataset = metadata.get(sop);
+        if (!dataset) {
+          const response = await get(`${instanceUrl(study, series, sop)}/metadata`, "application/dicom+json", signal);
+          dataset = (await response.json())[0] || {};
+          metadata.set(sop, dataset);
+          await lookupNames({ tags: collectTags(dataset) });
+        }
+        if (signal.aborted || sop !== text(slices[index].instance, "SOPInstanceUID")) return;
+        tagsFor = sop;
+        const query = tags.querySelector(".filter")?.value || "";
+        tags.replaceChildren(tagsCard(dataset, query));
+      } catch (e) {
+        if (e.name !== "AbortError") tags.replaceChildren(notice("error", e.message));
+      }
+    }, 250);
+  }
+
+  function go(target) {
+    const next = Math.min(slices.length - 1, Math.max(0, target));
+    if (next === index) return;
+    index = next;
+    if (slider) slider.value = index + 1;
+    loader.focus(index);
+    draw();
+    describe();
+    scheduleTags();
+    onSlice(index);
+  }
+
+  // One slice per notch of a mouse wheel; small trackpad deltas add up.
+  let wheel = 0;
+  if (slices.length > 1) stage.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const pixels = e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1);
+    if (Math.abs(pixels) >= 50) {
+      wheel = 0;
+      go(index + Math.sign(pixels));
+      return;
+    }
+    wheel += pixels;
+    if (Math.abs(wheel) >= 30) {
+      const steps = Math.trunc(wheel / 30);
+      wheel -= steps * 30;
+      go(index + steps);
+    }
+  }, { passive: false });
+
+  // Arrow keys: previous and next slice; page up and down: ten slices; home and end.
+  const keys = (e) => {
+    if (e.target.closest("input, select, textarea") || e.altKey || e.ctrlKey || e.metaKey) return;
+    const steps = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1, PageDown: 10, PageUp: -10 }[e.key];
+    if (steps) go(index + steps);
+    else if (e.key === "Home") go(0);
+    else if (e.key === "End") go(slices.length - 1);
+    else return;
+    e.preventDefault();
+  };
+  document.addEventListener("keydown", keys);
+
+  function dispose() {
+    document.removeEventListener("keydown", keys);
+    clearTimeout(tagsTimer);
+    loader.dispose();
+  }
+  signal.addEventListener("abort", dispose, { once: true });
+
+  loader.focus(index);
+  describe();
+  scheduleTags();
+
+  const el = h("div", { class: "instance" },
+    h("section", { class: "card viewer" },
+      h("div", { class: "card-head" }, h("h2", {}, "Slice", count), toggle),
+      stage,
+      slider ? h("div", { class: "controls" }, slider, label) : h("div", { class: "controls" }, label),
+      h("div", { class: "card-body" }, info)),
+    tags);
+  return { el, dispose };
 }
 
 function instanceView(view, state, study, series, instance) {
@@ -983,8 +1274,9 @@ function formatValue(element) {
   return joined.length > 600 ? `${joined.slice(0, 600)}… (${integer.format(list.length)} values)` : joined;
 }
 
-function tagsCard(dataset) {
+function tagsCard(dataset, query = "") {
   const filter = h("input", { class: "filter", type: "search", placeholder: "Filter tags…", "aria-label": "Filter tags" });
+  filter.value = query;
   const body = h("tbody");
 
   function rows(items, depth, query) {
