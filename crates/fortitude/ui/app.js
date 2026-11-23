@@ -75,6 +75,26 @@ function h(tag, attrs, ...children) {
 const loading = (text = "Loading…") => h("div", { class: "loading" }, text);
 const notice = (kind, text) => h("div", { class: `notice ${kind}` }, text);
 
+/**
+ * Copy text to the clipboard. The Clipboard API needs a secure context (HTTPS or localhost):
+ * over plain HTTP, a selected text area and the copy command do it.
+ */
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = h("textarea", { readonly: true, style: "position: fixed; top: 0; left: 0; opacity: 0" });
+  area.value = text;
+  document.body.append(area);
+  area.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("copy refused");
+  } finally {
+    area.remove();
+  }
+}
+
 function copyButton(text) {
   return h("button", {
     class: "ghost small copy",
@@ -83,7 +103,7 @@ function copyButton(text) {
       e.stopPropagation();
       const button = e.currentTarget;
       try {
-        await navigator.clipboard.writeText(text);
+        await copyText(text);
         button.textContent = "Copied";
       } catch {
         button.textContent = "Failed";
@@ -91,6 +111,44 @@ function copyButton(text) {
       setTimeout(() => (button.textContent = "Copy"), 1200);
     },
   }, "Copy");
+}
+
+/** An SVG icon, drawn with `currentColor` strokes (24 × 24). */
+function icon(paths) {
+  const template = document.createElement("template");
+  template.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>`;
+  return template.content.firstChild;
+}
+
+const ICONS = {
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  cross: '<path d="M18 6 6 18M6 6l12 12"/>',
+};
+
+/** A small icon button that copies `text`, and shows whether it did. */
+function copyIcon(text, label = "Copy the value") {
+  const button = h("button", { type: "button", class: "ghost icon-button copy-value", title: label, "aria-label": label }, icon(ICONS.copy));
+  let timer = null;
+  button.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    let copied = true;
+    try {
+      await copyText(text);
+    } catch {
+      copied = false;
+    }
+    button.replaceChildren(icon(copied ? ICONS.check : ICONS.cross));
+    button.title = copied ? "Copied" : "Copy failed";
+    button.classList.add(copied ? "copied" : "failed");
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      button.replaceChildren(icon(ICONS.copy));
+      button.title = label;
+      button.classList.remove("copied", "failed");
+    }, 1200);
+  });
+  return button;
 }
 
 function details(entries) {
@@ -1256,16 +1314,21 @@ function collectTags(dataset, into = []) {
   return into;
 }
 
+/** Values of a DICOM JSON element as text, to join with backslashes (not for sequences and binary data). */
+function valueList(element) {
+  return (element.Value || []).map((v) => {
+    if (v && typeof v === "object") return element.vr === "PN" ? v.Alphabetic || "" : JSON.stringify(v);
+    return String(v);
+  });
+}
+
 function formatValue(element) {
   if (element.BulkDataURI) return h("a", { href: element.BulkDataURI, target: "_blank" }, "bulk data");
   if (element.InlineBinary != null) {
     const bytes = Math.floor((element.InlineBinary.length * 3) / 4);
     return h("span", { class: "muted" }, `binary, ~${integer.format(bytes)} bytes`);
   }
-  const list = (element.Value || []).map((v) => {
-    if (v && typeof v === "object") return element.vr === "PN" ? v.Alphabetic || "" : JSON.stringify(v);
-    return String(v);
-  });
+  const list = valueList(element);
   if (element.vr === "UI") {
     const known = list.map((v) => knownNames.uids.get(v)).filter(Boolean);
     if (known.length) return [list.join("\\"), " ", h("span", { class: "muted" }, `(${known.join(", ")})`)];
@@ -1301,12 +1364,19 @@ function tagsCard(dataset, query = "") {
           h("td", { class: "tag" }, label),
           h("td", {}, keyword || h("span", { class: "muted" }, parseInt(tag.slice(0, 4), 16) & 1 ? "private" : "unknown")),
           h("td", { class: "vr" }, element.vr),
-          h("td", { class: "value" }, value)));
+          h("td", { class: "value" }, h("div", { class: "value-cell" }, h("span", {}, value), copyable(element)))));
         out.push(...nested);
       }
     }
     return out;
   }
+
+  // The whole value is copied, even when the table shortens it.
+  const copyable = (element) => {
+    if (element.vr === "SQ" || element.BulkDataURI || element.InlineBinary != null) return null;
+    const value = valueList(element).join("\\");
+    return value ? copyIcon(value) : null;
+  };
 
   const draw = () => {
     const result = rows(dataset, 0, filter.value.trim().toLowerCase());
