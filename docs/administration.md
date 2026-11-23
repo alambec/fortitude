@@ -36,8 +36,10 @@ scrolls through its slices (one per frame) with the mouse wheel, the slider or t
 with the tags of the instance shown. Patients, studies and series download as ZIP archives
 (`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files; they can
 also be sent to a modality, or deleted after a confirmation (with the `DELETE` of DICOMweb,
-study by study for a patient, so not by read-only users). Its upload page stores files or whole folders with
-STOW-RS, one request per file, and reports each failure. Its modalities page registers,
+study by study for a patient, so not by read-only users). Its upload page stores files, whole folders or ZIP
+archives with STOW-RS, one request per file, and reports each failure. The browser reads the
+archives (stored or deflated entries, ZIP64; not encrypted ones) and sends their files one at a
+time, so their size is not limited by memory. Its modalities page registers,
 verifies, queries and retrieves from modalities, and follows the sends (see below). Text fields match prefixes (IDs) or substrings (name,
 description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
 case-insensitively. It is served only when `auth.users` is configured, and only to those

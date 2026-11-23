@@ -358,6 +358,7 @@ td.thumb { width: 64px; padding-top: 4px; padding-bottom: 4px; }
   transition: border-color .15s, background .15s;
 }
 .dropzone.over { border-color: var(--accent); background: var(--accent-soft); }
+.dropzone.reading { opacity: .6; cursor: progress; }
 .dropzone-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
 
 .progress { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }

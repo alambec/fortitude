@@ -1626,7 +1626,7 @@ class Upload {
     while (this.queue.length) {
       const file = this.queue.shift();
       try {
-        const outcome = await stowFile(file, this.controller.signal);
+        const outcome = await stowFile(file instanceof Blob ? file : await file.open(), this.controller.signal);
         if (outcome.study) this.studies.add(outcome.study);
         if (outcome.failure) this.failed.push({ name: fileName(file), reason: outcome.failure });
         else if (outcome.duplicate) this.duplicates++;
@@ -1668,6 +1668,122 @@ window.addEventListener("beforeunload", (e) => {
 });
 
 const fileName = (file) => file.webkitRelativePath || file.relativePath || file.name;
+
+// ZIP archives are read in the browser: their central directory when added, then each entry
+// when its turn comes, so that an archive of any size uploads like a folder, one file at a time.
+// Stored and deflated entries (DecompressionStream), ZIP64; not encrypted ones.
+
+const isZip = (file) => /\.zip$/i.test(file.name) || ["application/zip", "application/x-zip-compressed"].includes(file.type);
+
+async function zipBytes(blob, start, end) {
+  return new DataView(await blob.slice(start, end).arrayBuffer());
+}
+
+const u16 = (view, at) => view.getUint16(at, true);
+const u32 = (view, at) => view.getUint32(at, true);
+const u64 = (view, at) => Number(view.getBigUint64(at, true));
+
+/** The file entries of a ZIP archive, from its central directory. */
+async function zipEntries(archive) {
+  // The end of central directory record: 22 bytes, then a comment of up to 65,535.
+  const tailStart = Math.max(0, archive.size - 22 - 65535);
+  const tail = await zipBytes(archive, tailStart, archive.size);
+  let end = -1;
+  for (let i = tail.byteLength - 22; i >= 0; i--) {
+    if (u32(tail, i) === 0x06054b50) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) throw new Error("Not a ZIP archive");
+  let count = u16(tail, end + 10);
+  let size = u32(tail, end + 12);
+  let offset = u32(tail, end + 16);
+  if (count === 0xffff || size === 0xffffffff || offset === 0xffffffff) {
+    // ZIP64: its locator precedes the record, and points to the ZIP64 record.
+    const locator = end - 20;
+    if (locator < 0 || u32(tail, locator) !== 0x07064b50) throw new Error("Corrupted ZIP64 archive");
+    const at = u64(tail, locator + 8);
+    const record = await zipBytes(archive, at, at + 56);
+    if (record.byteLength < 56 || u32(record, 0) !== 0x06064b50) throw new Error("Corrupted ZIP64 archive");
+    count = u64(record, 32);
+    size = u64(record, 40);
+    offset = u64(record, 48);
+  }
+  const directory = await zipBytes(archive, offset, offset + size);
+  const decoder = new TextDecoder();
+  const entries = [];
+  for (let p = 0, i = 0; i < count; i++) {
+    if (p + 46 > directory.byteLength || u32(directory, p) !== 0x02014b50) throw new Error("Corrupted ZIP archive");
+    const nameLength = u16(directory, p + 28);
+    const extraLength = u16(directory, p + 30);
+    const entry = {
+      path: decoder.decode(new Uint8Array(directory.buffer, p + 46, nameLength)),
+      flags: u16(directory, p + 8),
+      method: u16(directory, p + 10),
+      compressed: u32(directory, p + 20),
+      size: u32(directory, p + 24),
+      local: u32(directory, p + 42),
+    };
+    // ZIP64 extended information: the 64-bit values of the fields set to 0xFFFFFFFF, in order.
+    for (let e = p + 46 + nameLength, stop = e + extraLength; e + 4 <= stop; e += 4 + u16(directory, e + 2)) {
+      if (u16(directory, e) !== 0x0001) continue;
+      let field = e + 4;
+      for (const key of ["size", "compressed", "local"]) {
+        if (entry[key] === 0xffffffff) {
+          entry[key] = u64(directory, field);
+          field += 8;
+        }
+      }
+    }
+    p += 46 + nameLength + extraLength + u16(directory, p + 32);
+    if (!entry.path.endsWith("/")) entries.push(entry);
+  }
+  return entries;
+}
+
+/** The content of a ZIP entry, decompressed. */
+async function zipContent(archive, entry) {
+  if (entry.flags & 1) throw new Error("Encrypted in the ZIP archive");
+  const header = await zipBytes(archive, entry.local, entry.local + 30);
+  if (header.byteLength < 30 || u32(header, 0) !== 0x04034b50) throw new Error("Corrupted ZIP archive");
+  const start = entry.local + 30 + u16(header, 26) + u16(header, 28);
+  const data = archive.slice(start, start + entry.compressed);
+  if (entry.method === 0) return data;
+  if (entry.method !== 8) throw new Error(`Compressed with a method browsers cannot read (ZIP method ${entry.method})`);
+  const content = await new Response(data.stream().pipeThrough(new DecompressionStream("deflate-raw"))).blob();
+  if (content.size !== entry.size) throw new Error("Corrupted ZIP archive");
+  return content;
+}
+
+/**
+ * Files to upload, with the entries of ZIP archives in place of the archives. An entry is
+ * `{ name, relativePath, size, open() }`, `open()` resolving to its content; an archive that
+ * cannot be read is one that fails when opened.
+ */
+async function expandArchives(files) {
+  const out = [];
+  for (const file of files) {
+    if (!isZip(file)) {
+      out.push(file);
+      continue;
+    }
+    const path = fileName(file);
+    try {
+      for (const entry of await zipEntries(file)) {
+        out.push({
+          name: entry.path.split("/").pop(),
+          relativePath: `${path}/${entry.path}`,
+          size: entry.size,
+          open: () => zipContent(file, entry),
+        });
+      }
+    } catch (e) {
+      out.push({ name: file.name, relativePath: path, size: 0, open: () => Promise.reject(e) });
+    }
+  }
+  return out;
+}
 
 /** Store one file with STOW-RS; resolves to `{ study?, duplicate?, failure? }`. */
 async function stowFile(file, signal) {
@@ -1764,7 +1880,15 @@ function uploadView(view) {
     });
   }
 
-  const start = (files) => {
+  const start = async (files) => {
+    if (files.some(isZip)) {
+      zone.classList.add("reading");
+      try {
+        files = await expandArchives(files);
+      } finally {
+        zone.classList.remove("reading");
+      }
+    }
     if (!files.length) return;
     if (!upload.running) {
       const listeners = upload.listeners;
@@ -1775,8 +1899,8 @@ function uploadView(view) {
   };
 
   const zone = h("div", { class: "dropzone" },
-    h("div", { class: "dropzone-title" }, "Drop DICOM files or folders here"),
-    h("div", { class: "muted" }, "Each file is stored with STOW-RS; files already stored are reported, not duplicated."),
+    h("div", { class: "dropzone-title" }, "Drop DICOM files, folders or ZIP archives here"),
+    h("div", { class: "muted" }, "Each file, also inside ZIP archives, is stored with STOW-RS; files already stored are reported, not duplicated."),
     h("div", { class: "actions", style: "justify-content: center; margin-top: 14px" },
       h("button", { class: "primary", onclick: () => filesInput.click() }, "Choose files"),
       h("button", { onclick: () => folderInput.click() }, "Choose a folder")),

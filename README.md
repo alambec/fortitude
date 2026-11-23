@@ -9,7 +9,7 @@ Fortitude aims to be faster than Orthanc on the workloads viewers and archives d
 - **DIMSE**: C-ECHO, C-STORE, C-FIND, C-MOVE and C-GET; queries, retrievals and sends to
   other DICOM nodes.
 - **Storage**: SQLite or PostgreSQL index; files on disk or in an S3-compatible bucket.
-- **Web explorer**: search, browse, download, upload, send and delete studies.
+- **Web explorer**: search, browse, download, upload (files, folders, ZIP archives), send and delete studies.
 - **Operations**: integrity checks, retention by age, Prometheus metrics.
 
 Fortitude is open source, under the [GNU AGPL-3.0](LICENSE). Alambec also offers commercial
