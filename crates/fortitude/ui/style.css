@@ -368,6 +368,9 @@ td.thumb { width: 64px; padding-top: 4px; padding-bottom: 4px; }
 }
 .viewer .stage img { max-width: 100%; max-height: 72vh; object-fit: contain; }
 .viewer .stage .empty { color: #8d96a5; }
+/* A slice still loading: the previous one stays, dimmed if the wait lasts. */
+.viewer .stage.pending img { opacity: .55; transition: opacity .15s .3s; }
+.card-head .segmented button { padding: 3px 11px; font-size: 12.5px; }
 .viewer .controls { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--border); }
 .viewer .controls input[type="range"] { flex: 1; padding: 0; border: 0; }
 

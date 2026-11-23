@@ -31,7 +31,9 @@ are open to read-only users.
 
 The web explorer searches patients (grouped from matching studies), studies or series by
 patient ID, name, accession number, study description, study date and modality, and opens a
-study, series or instance by UID. Patients, studies and series download as ZIP archives
+study, series or instance by UID. A series shows its instances as a list or in a viewer that
+scrolls through its slices (one per frame) with the mouse wheel, the slider or the arrow keys,
+with the tags of the instance shown. Patients, studies and series download as ZIP archives
 (`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files; they can
 also be sent to a modality. Its upload page stores files or whole folders with
 STOW-RS, one request per file, and reports each failure. Its modalities page registers,
