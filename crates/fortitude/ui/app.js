@@ -759,6 +759,89 @@ function titleCard(title, subtitle, entries, actions = []) {
 const archiveLink = (params) =>
   h("a", { class: "button small", href: `api/archive?${new URLSearchParams(params)}`, download: true }, "Download ZIP");
 
+/** DELETE on a DICOMweb resource; one already gone counts as deleted. */
+async function deleteResource(url) {
+  const response = await fetch(url, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    const reason = (await response.text()).trim();
+    throw new HttpError(`${response.status} ${response.statusText}${reason ? `: ${reason}` : ""}`);
+  }
+}
+
+/** Whether a QIDO-RS search finds anything. */
+const found = (path, params) => async () => (await qido(path, { ...params, limit: 1 }, null)).items.length > 0;
+
+/** The first route of `[route, exists]` whose resource still exists, else the search. */
+async function nearestRoute(steps) {
+  for (const [route, exists] of steps) {
+    try {
+      if (route && (await exists())) return route;
+    } catch {
+      // Try the next one.
+    }
+  }
+  return lastSearch;
+}
+
+/** Routes up from a study, once something in it was deleted: the patient, else the search. */
+const patientStep = (item) => [
+  text(item, "PatientID") ? patientHref(item) : null,
+  found("/studies", text(item, "IssuerOfPatientID")
+    ? { PatientID: text(item, "PatientID"), IssuerOfPatientID: text(item, "IssuerOfPatientID") }
+    : { PatientID: text(item, "PatientID") }),
+];
+
+/**
+ * A Delete button that asks first, in a dialog saying what goes and that it cannot be undone.
+ * `run(progress)` deletes; then the view goes to the route `after()` resolves to.
+ */
+function deleteButton({ title, warning, run, after }) {
+  const open = () => {
+    const status = h("div", { class: "muted", "aria-live": "polite" });
+    const error = h("div");
+    const cancel = h("button", { type: "button", onclick: () => dialog.close() }, "Cancel");
+    const confirm = h("button", { type: "button", class: "danger" }, "Delete");
+    let running = false;
+    const dialog = h("dialog", { class: "confirm" },
+      h("h2", {}, title),
+      h("p", {}, warning),
+      h("p", { class: "danger-text" }, h("b", {}, "This cannot be undone.")),
+      status,
+      error,
+      h("div", { class: "actions" }, cancel, confirm));
+    // No closing with Escape while deleting.
+    dialog.addEventListener("cancel", (e) => running && e.preventDefault());
+    dialog.addEventListener("close", () => dialog.remove());
+    navigation.signal.addEventListener("abort", () => dialog.close(), { once: true });
+    confirm.addEventListener("click", async () => {
+      running = true;
+      cancel.disabled = confirm.disabled = true;
+      error.replaceChildren();
+      status.textContent = "Deleting…";
+      try {
+        await run((text) => (status.textContent = text));
+        status.textContent = "Deleted.";
+        refreshStatistics();
+        const target = await after();
+        dialog.close();
+        if (location.hash === target) route();
+        else location.hash = target;
+      } catch (e) {
+        status.textContent = "";
+        error.replaceChildren(notice("error", e.message));
+        refreshStatistics();
+      } finally {
+        running = false;
+        cancel.disabled = confirm.disabled = false;
+      }
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+    cancel.focus();
+  };
+  return h("button", { type: "button", class: "small delete", onclick: open }, "Delete");
+}
+
 /** Render `build()` into `view` once its data is loaded, or the error. */
 async function render(view, build) {
   view.replaceChildren(loading());
@@ -797,6 +880,29 @@ function patientView(view, state) {
     ], { href: studyHref, sort: byDateDesc(0) });
     table.set(items);
     const sending = id ? sendControl("PATIENT", issuer ? { PatientID: id, IssuerOfPatientID: issuer } : { PatientID: id }) : null;
+    const instanceCount = items.reduce((sum, s) => sum + (number(s, "NumberOfStudyRelatedInstances") ?? 0), 0);
+    const removal = id ? deleteButton({
+      title: "Delete this patient?",
+      warning: `All the studies of ${name(patient) || "(no name)"} (patient ID ${id}${issuer ? `, issuer ${issuer}` : ""}) are deleted from the server: `
+        + `${truncated ? "more than " : ""}${integer.format(items.length)} ${items.length === 1 ? "study" : "studies"}, `
+        + `${truncated ? "more than " : ""}${integer.format(instanceCount)} instance${instanceCount === 1 ? "" : "s"}.`,
+      run: async (progress) => {
+        // Searched again until none is left: the list shown may be cut at its maximum.
+        const deleted = new Set();
+        for (;;) {
+          const { items: left } = await qido("/studies", { ...params, limit: PATIENT_STUDIES }, null);
+          if (!left.length) return;
+          const pending = left.map((s) => text(s, "StudyInstanceUID")).filter((uid) => !deleted.has(uid));
+          if (!pending.length) throw new HttpError("Some studies of this patient are still listed after their deletion.");
+          for (const uid of pending) {
+            await deleteResource(studyUrl(uid));
+            deleted.add(uid);
+            progress(`Deleted ${integer.format(deleted.size)} ${deleted.size === 1 ? "study" : "studies"}…`);
+          }
+        }
+      },
+      after: async () => lastSearch,
+    }) : null;
     return [
       titleCard(name(patient) || "(no name)", `Patient ${id}`, [
         ["Patient ID", id, { mono: true }],
@@ -804,7 +910,7 @@ function patientView(view, state) {
         ["Birth date", formatDate(text(patient, "PatientBirthDate"))],
         ["Sex", text(patient, "PatientSex")],
         ["Studies", integer.format(items.length)],
-      ], id ? [archiveLink(issuer ? { patient: id, issuer } : { patient: id }), sending.control] : []),
+      ], id ? [archiveLink(issuer ? { patient: id, issuer } : { patient: id }), sending.control, removal] : []),
       sending ? sending.messages : null,
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Studies", h("span", { class: "count" }, items.length))),
@@ -839,6 +945,17 @@ function studyView(view, state, study) {
     ], { href: (s) => seriesRoute(study, text(s, "SeriesInstanceUID")) });
     table.set(series.items);
     const sending = sendControl("STUDY", { StudyInstanceUID: study });
+    const seriesCount = number(item, "NumberOfStudyRelatedSeries") ?? series.items.length;
+    const instanceCount = number(item, "NumberOfStudyRelatedInstances") ?? 0;
+    const removal = deleteButton({
+      title: "Delete this study?",
+      warning: `The study ${text(item, "StudyDescription") ? `“${text(item, "StudyDescription")}” ` : ""}`
+        + `${formatDate(text(item, "StudyDate")) ? `of ${formatDate(text(item, "StudyDate"))} ` : ""}`
+        + `of ${name(item) || "(no name)"} is deleted from the server: `
+        + `${integer.format(seriesCount)} series, ${integer.format(instanceCount)} instance${instanceCount === 1 ? "" : "s"}.`,
+      run: () => deleteResource(studyUrl(study)),
+      after: () => nearestRoute([patientStep(item)]),
+    });
     return [
       titleCard(text(item, "StudyDescription") || "(no description)", dateTime(item, "StudyDate", "StudyTime"), [
         ["Patient", patientLink(item)],
@@ -852,7 +969,7 @@ function studyView(view, state, study) {
         ["Series", integer.format(number(item, "NumberOfStudyRelatedSeries") ?? 0)],
         ["Instances", integer.format(number(item, "NumberOfStudyRelatedInstances") ?? 0)],
         ["Study Instance UID", study, { mono: true }],
-      ], [archiveLink({ study }), sending.control]),
+      ], [archiveLink({ study }), sending.control, removal]),
       sending.messages,
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "Series", h("span", { class: "count" }, series.items.length))),
@@ -900,6 +1017,14 @@ function seriesView(view, state, study, series) {
     const title = [text(item, "SeriesNumber") && `#${text(item, "SeriesNumber")}`, text(item, "SeriesDescription") || "(no description)"]
       .filter(Boolean).join(" · ");
     const sending = sendControl("SERIES", { StudyInstanceUID: study, SeriesInstanceUID: series });
+    const instanceCount = number(item, "NumberOfSeriesRelatedInstances") ?? instances.items.length;
+    const removal = deleteButton({
+      title: "Delete this series?",
+      warning: `The series ${title} of ${name(studyItem) || "(no name)"} is deleted from the server: `
+        + `${integer.format(instanceCount)} instance${instanceCount === 1 ? "" : "s"}.`,
+      run: () => deleteResource(seriesUrl(study, series)),
+      after: () => nearestRoute([[studyRoute(study), found("/studies", { StudyInstanceUID: study })], patientStep(studyItem)]),
+    });
 
     // The instances as a list, or their images one slice at a time. The mode and the slice are
     // kept in the URL without a navigation, so that a reload or a shared link opens them again.
@@ -957,7 +1082,7 @@ function seriesView(view, state, study, series) {
         ["Date", dateTime(item, "SeriesDate", "SeriesTime")],
         ["Instances", integer.format(number(item, "NumberOfSeriesRelatedInstances") ?? instances.items.length)],
         ["Series Instance UID", series, { mono: true }],
-      ], [archiveLink({ study, series }), sending.control]),
+      ], [archiveLink({ study, series }), sending.control, removal]),
       sending.messages,
       content,
     ];
@@ -1225,13 +1350,24 @@ function instanceView(view, state, study, series, instance) {
       [`Instance ${text(dataset, "InstanceNumber") || index + 1}`],
     ]);
     await lookupNames({ tags: collectTags(dataset), uids: [text(dataset, "SOPClassUID")] });
+    const removal = deleteButton({
+      title: "Delete this instance?",
+      warning: `Instance ${text(dataset, "InstanceNumber") || index + 1} of `
+        + `${crumb.series(study, seriesItem)[0]} is deleted from the server (SOP Instance UID ${instance}).`,
+      run: () => deleteResource(instanceUrl(study, series, instance)),
+      after: () => nearestRoute([
+        [seriesRoute(study, series), found(`/studies/${encodeURIComponent(study)}/series`, { SeriesInstanceUID: series })],
+        [studyRoute(study), found("/studies", { StudyInstanceUID: study })],
+        patientStep(studyItem),
+      ]),
+    });
     return h("div", { class: "instance" },
-      viewer(study, series, instance, dataset, instances.items, index),
+      viewer(study, series, instance, dataset, instances.items, index, removal),
       tagsCard(dataset));
   });
 }
 
-function viewer(study, series, instance, dataset, siblings, index) {
+function viewer(study, series, instance, dataset, siblings, index, removal) {
   const base = instanceUrl(study, series, instance);
   const frames = Math.max(1, Number(text(dataset, "NumberOfFrames")) || 1);
   const hasPixels = Boolean(dataset["7FE00010"] || dataset["7FE00008"] || dataset["7FE00009"]);
@@ -1302,7 +1438,8 @@ function viewer(study, series, instance, dataset, siblings, index) {
       ]),
       h("div", { class: "actions", style: "margin-top: 14px" },
         h("a", { class: "button small", href: download, download: `${instance}.dcm` }, "Download DICOM"),
-        openImage)));
+        openImage,
+        removal)));
 }
 
 /** Tags of a DICOM JSON dataset and of its sequence items. */
