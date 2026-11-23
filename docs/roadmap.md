@@ -56,7 +56,8 @@ archives (ingest, QIDO-RS, WADO-RS metadata and frames), while staying deliberat
 9. **Web explorer** — `/ui/`: search patients, studies and series, open a study, series or
    instance by UID, browse down to an instance's tags and rendered frames, scroll through the
    slices of a series, download patients,
-   studies and series as ZIP archives, upload files and folders. A static page
+   studies and series as ZIP archives, upload files and folders, delete patients, studies,
+   series and instances. A static page
    embedded in the binary, over QIDO-RS, WADO-RS, STOW-RS and WADO-URI only (plus a dictionary lookup
    for tag and SOP class names, and the ZIP archives). *(done)*
 10. **Integrity** — periodic and on-demand check of the files against the index, one key

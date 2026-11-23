@@ -219,6 +219,26 @@ button.small, a.button.small { padding: 3px 9px; font-size: 12.5px; }
 button.ghost { border-color: transparent; background: transparent; color: var(--muted); }
 button.ghost:hover { color: var(--text); background: var(--surface-2); }
 button:disabled { opacity: .5; cursor: default; }
+button.danger { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 500; }
+button.danger:hover { background: var(--danger); filter: brightness(1.07); }
+button.delete { color: var(--danger); }
+button.delete:hover { background: var(--danger-soft); border-color: var(--danger); }
+.danger-text { color: var(--danger); }
+
+dialog.confirm {
+  width: min(460px, calc(100% - 32px));
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 25%);
+}
+dialog.confirm::backdrop { background: rgb(0 0 0 / 45%); }
+dialog.confirm h2 { margin: 0 0 10px; font-size: 17px; font-weight: 600; }
+dialog.confirm p { margin: 0 0 10px; overflow-wrap: anywhere; }
+dialog.confirm .notice { margin-top: 10px; }
+dialog.confirm .actions { justify-content: flex-end; margin-top: 18px; }
 
 .segmented {
   display: inline-flex;

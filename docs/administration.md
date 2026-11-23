@@ -35,7 +35,8 @@ study, series or instance by UID. A series shows its instances as a list or in a
 scrolls through its slices (one per frame) with the mouse wheel, the slider or the arrow keys,
 with the tags of the instance shown. Patients, studies and series download as ZIP archives
 (`{study}/{series}/{instance}.dcm` entries, stored as is), instances as DICOM files; they can
-also be sent to a modality. Its upload page stores files or whole folders with
+also be sent to a modality, or deleted after a confirmation (with the `DELETE` of DICOMweb,
+study by study for a patient, so not by read-only users). Its upload page stores files or whole folders with
 STOW-RS, one request per file, and reports each failure. Its modalities page registers,
 verifies, queries and retrieves from modalities, and follows the sends (see below). Text fields match prefixes (IDs) or substrings (name,
 description) unless they contain `*` or `?`; like QIDO-RS, only patient names match
