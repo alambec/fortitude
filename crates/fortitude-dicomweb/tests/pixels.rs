@@ -218,21 +218,44 @@ async fn native_ybr() {
             PrimitiveValue::from("YBR_FULL_422"),
         ));
     });
-    let app = stored(&[&full, &subsampled]).await;
-    for instance in [&full, &subsampled] {
+    // The same in the BT.601 studio range: Y 145, Cb 54, Cr 34.
+    let partial = image(
+        "3.1.1.3",
+        fortitude_testkit::EXPLICIT_VR_LE,
+        &[
+            (tags::SAMPLES_PER_PIXEL, 3),
+            (tags::PLANAR_CONFIGURATION, 0),
+        ],
+        native(
+            VR::OB,
+            PrimitiveValue::from([145, 145, 54, 34].repeat(PIXELS)),
+        ),
+    )
+    .with(|i| {
+        i.frames = 2;
+        i.extra.push(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("YBR_PARTIAL_422"),
+        ));
+    });
+    let app = stored(&[&full, &subsampled, &partial]).await;
+    for instance in [&full, &subsampled, &partial] {
         let image = rendered(&app, instance).await;
         assert_eq!(image.dimensions(), (u32::from(COLUMNS), u32::from(ROWS)));
         assert_eq!(image.get_pixel(5, 5).0, [0, 255, 1], "{}", instance.sop_uid);
     }
-    let last = app
-        .get(
-            &format!("{}/frames/2/rendered", path(&subsampled)),
-            "image/png",
-        )
-        .await;
-    assert_eq!(last.status, StatusCode::OK);
-    // Frames are returned as stored: two samples per pixel.
-    assert_eq!(decoded(&app, &subsampled, 2).await.len(), PIXELS * 2);
+    for instance in [&subsampled, &partial] {
+        let last = app
+            .get(
+                &format!("{}/frames/2/rendered", path(instance)),
+                "image/png",
+            )
+            .await;
+        assert_eq!(last.status, StatusCode::OK, "{}", instance.sop_uid);
+        // Frames are returned as stored: two samples per pixel.
+        assert_eq!(decoded(&app, instance, 2).await.len(), PIXELS * 2);
+    }
 }
 
 #[tokio::test]

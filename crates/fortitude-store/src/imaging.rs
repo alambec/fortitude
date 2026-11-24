@@ -231,8 +231,8 @@ impl Store {
                 range.length = (range.length + lead).next_multiple_of(swap as u64);
             }
         }
-        // dicom-pixeldata supports neither native YBR_FULL_422 nor (correctly) the YBR_FULL
-        // to RGB conversion: rendered frames are converted to RGB here.
+        // dicom-pixeldata supports neither native YBR_FULL_422 and YBR_PARTIAL_422 nor
+        // (correctly) the YBR_FULL to RGB conversion: rendered frames are converted to RGB here.
         let photometric = header
             .element_opt(tags::PHOTOMETRIC_INTERPRETATION)
             .ok()
@@ -243,7 +243,11 @@ impl Store {
         let to_rgb = native
             && purpose == Purpose::Render
             && bits_allocated == 8
-            && matches!(photometric.as_str(), "YBR_FULL" | "YBR_FULL_422");
+            && matches!(
+                photometric.as_str(),
+                "YBR_FULL" | "YBR_FULL_422" | "YBR_PARTIAL_422"
+            );
+        let subsampled = matches!(photometric.as_str(), "YBR_FULL_422" | "YBR_PARTIAL_422");
         let planar = header
             .element_opt(tags::PLANAR_CONFIGURATION)
             .ok()
@@ -252,7 +256,7 @@ impl Store {
             == Some(1);
         if to_rgb {
             header.put_str(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "RGB");
-            if photometric == "YBR_FULL_422" {
+            if subsampled {
                 header.put(DataElement::new(
                     tags::PLANAR_CONFIGURATION,
                     VR::US,
@@ -271,10 +275,14 @@ impl Store {
                 bytes.truncate(lead + length);
                 bytes.drain(..lead);
                 if to_rgb {
-                    if photometric == "YBR_FULL_422" {
+                    if subsampled {
                         *bytes = convert::upsample_422(bytes, 1);
                     }
-                    convert::ybr_full_to_rgb(bytes, planar && photometric == "YBR_FULL");
+                    convert::ybr_to_rgb(
+                        bytes,
+                        planar && photometric == "YBR_FULL",
+                        photometric == "YBR_PARTIAL_422",
+                    );
                 }
             }
         }
@@ -493,7 +501,12 @@ fn decode_frame(obj: &DefaultDicomObject, frame: u32) -> Result<Vec<u8>, Imaging
         .ok()
         .flatten()
         .and_then(|e| e.to_str().ok())
-        .is_some_and(|p| p.trim_matches([' ', '\0']) == "YBR_FULL_422");
+        .is_some_and(|p| {
+            matches!(
+                p.trim_matches([' ', '\0']),
+                "YBR_FULL_422" | "YBR_PARTIAL_422"
+            )
+        });
     let packed =
         matches!(format, SampleFormat::Integer { bits_allocated, .. } if bits_allocated % 8 != 0);
     if matches!(
@@ -524,7 +537,7 @@ fn decode_frame(obj: &DefaultDicomObject, frame: u32) -> Result<Vec<u8>, Imaging
         .find_map(|tag| obj.element_opt(tag).ok().flatten())
         .ok_or(ImagingError::NoPixelData)?;
         let bytes = element.to_bytes().map_err(unsupported)?;
-        // Native YBR_FULL_422 stores two samples per pixel.
+        // Native YBR_FULL_422 and YBR_PARTIAL_422 store two samples per pixel.
         let samples = if subsampled { 2 } else { samples_per_pixel };
         let length = pixels * samples * format.bytes();
         let start = frame as usize * length;
