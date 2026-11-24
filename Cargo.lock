@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "fortitude"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "fortitude-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "fortitude-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "dicom-core",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "fortitude-dicomweb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "fortitude-dimse"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dicom-core",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "fortitude-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "charls",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "fortitude-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dicom-core",
  "dicom-dictionary-std",

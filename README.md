@@ -25,7 +25,7 @@ licenses and paid support: see [License](#license).
 # docker-compose.yaml
 services:
   fortitude:
-    image: ghcr.io/alambec/fortitude:0.1
+    image: ghcr.io/alambec/fortitude:0.2
     ports:
       - "8080:8080"   # HTTP: DICOMweb and web explorer
       - "104:104"     # DIMSE
@@ -53,7 +53,7 @@ dcmsend -aec FORTITUDE localhost 104 image.dcm                    # store a file
 curl -u admin:change-me http://localhost:8080/dicom-web/studies   # list the studies
 ```
 
-The image is built for x86_64. Its tags follow the releases: `0.1.0`, `0.1` and `latest`.
+The image is built for x86_64. Its tags follow the releases: `0.2.0`, `0.2` and `latest`.
 
 ## Configuration
 

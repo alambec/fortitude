@@ -20,7 +20,7 @@ The Docker image sets `FORTITUDE_STORAGE__PATH=/var/lib/fortitude` (its volume) 
 # docker-compose.yaml
 services:
   fortitude:
-    image: ghcr.io/alambec/fortitude:0.1
+    image: ghcr.io/alambec/fortitude:0.2
     ports:
       - "8080:8080"
       - "104:104"
