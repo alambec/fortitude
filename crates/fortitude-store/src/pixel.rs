@@ -60,7 +60,8 @@ pub struct ImageInfo {
     pub samples_per_pixel: u32,
     pub bits_allocated: u32,
     pub frames: u32,
-    /// Native YBR_FULL_422: chroma is subsampled, two samples per pixel are stored.
+    /// Native YBR_FULL_422 or YBR_PARTIAL_422: chroma is subsampled, two samples per pixel are
+    /// stored.
     pub ybr_422: bool,
 }
 

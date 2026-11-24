@@ -1,5 +1,5 @@
 //! Pixel conversions done here rather than by dicom-pixeldata, which does not support them:
-//! big endian samples, native YBR_FULL_422 frames, RLE Lossless with more than 16 bits per
+//! big endian samples, native YBR_FULL_422 and YBR_PARTIAL_422 frames, RLE Lossless with more than 16 bits per
 //! sample, 1-bit frames that do not start on a byte, and rendering of 32-bit integer and
 //! floating point samples and of PALETTE COLOR.
 
@@ -28,8 +28,8 @@ pub fn swap_bytes(data: &mut [u8], unit: usize) {
     }
 }
 
-/// A native YBR_FULL_422 frame (Y1 Y2 Cb Cr for each pair of pixels) as YBR_FULL (Y Cb Cr for
-/// each pixel), with samples of `sample_bytes` bytes.
+/// A native YBR_FULL_422 or YBR_PARTIAL_422 frame (Y1 Y2 Cb Cr for each pair of pixels) as
+/// YBR_FULL or YBR_PARTIAL (Y Cb Cr for each pixel), with samples of `sample_bytes` bytes.
 pub fn upsample_422(data: &[u8], sample_bytes: usize) -> Vec<u8> {
     let s = sample_bytes;
     let mut out = Vec::with_capacity(data.len() / 4 * 6);
@@ -49,11 +49,22 @@ pub fn upsample_422(data: &[u8], sample_bytes: usize) -> Vec<u8> {
     out
 }
 
-/// Convert 8-bit YBR_FULL samples to RGB in place (PS3.3 C.7.6.3.1.2), pixel-interleaved or,
-/// when `planar`, as three planes.
-pub fn ybr_full_to_rgb(data: &mut [u8], planar: bool) {
+/// Convert 8-bit YBR_FULL samples, or YBR_PARTIAL when `partial` (Y from 16 to 235, Cb and Cr
+/// from 16 to 240), to RGB in place (PS3.3 C.7.6.3.1.2), pixel-interleaved or, when `planar`,
+/// as three planes.
+pub fn ybr_to_rgb(data: &mut [u8], planar: bool, partial: bool) {
+    // YBR_PARTIAL is YBR_FULL with luma scaled to 219 levels and chroma to 224.
+    let (luma, chroma, black) = if partial {
+        (255.0 / 219.0, 255.0 / 224.0, 16.0)
+    } else {
+        (1.0, 1.0, 0.0)
+    };
     let convert = |y: u8, cb: u8, cr: u8| {
-        let (y, cb, cr) = (f32::from(y), f32::from(cb) - 128.0, f32::from(cr) - 128.0);
+        let y = (f32::from(y) - black) * luma;
+        let (cb, cr) = (
+            (f32::from(cb) - 128.0) * chroma,
+            (f32::from(cr) - 128.0) * chroma,
+        );
         let channel = |v: f32| v.round().clamp(0.0, 255.0) as u8;
         [
             channel(y + 1.402 * cr),
@@ -688,11 +699,24 @@ mod tests {
     fn converts_ybr_full() {
         // Pure red, green and blue, as written by pydicom's RGB to YBR_FULL conversion.
         let mut data = vec![76, 85, 255, 150, 44, 21, 29, 255, 107];
-        ybr_full_to_rgb(&mut data, false);
+        ybr_to_rgb(&mut data, false, false);
         assert_eq!(data, [254, 0, 0, 0, 255, 1, 0, 0, 254]);
         let mut planar = vec![76, 150, 85, 44, 255, 21];
-        ybr_full_to_rgb(&mut planar, true);
+        ybr_to_rgb(&mut planar, true, false);
         assert_eq!(planar[0], 254);
+    }
+
+    #[test]
+    fn converts_ybr_partial() {
+        // Pure red, green and blue, black and white, in the BT.601 studio range.
+        let mut data = vec![
+            81, 90, 240, 145, 54, 34, 41, 240, 110, 16, 128, 128, 235, 128, 128,
+        ];
+        ybr_to_rgb(&mut data, false, true);
+        assert_eq!(
+            data,
+            [254, 0, 0, 0, 255, 1, 0, 0, 255, 0, 0, 0, 255, 255, 255]
+        );
     }
 
     /// RLE frame of `segments` (each already PackBits encoded).

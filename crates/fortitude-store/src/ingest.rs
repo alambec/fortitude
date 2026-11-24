@@ -139,7 +139,10 @@ fn build(
         samples_per_pixel: integer(obj, tags::SAMPLES_PER_PIXEL),
         bits_allocated: integer(obj, tags::BITS_ALLOCATED),
         frames: integer(obj, tags::NUMBER_OF_FRAMES).max(1),
-        ybr_422: string(obj, tags::PHOTOMETRIC_INTERPRETATION).as_deref() == Some("YBR_FULL_422"),
+        ybr_422: matches!(
+            string(obj, tags::PHOTOMETRIC_INTERPRETATION).as_deref(),
+            Some("YBR_FULL_422" | "YBR_PARTIAL_422")
+        ),
     };
 
     let mut metadata = String::new();
