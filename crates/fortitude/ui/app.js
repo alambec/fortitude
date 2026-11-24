@@ -1043,23 +1043,24 @@ function seriesView(view, state, study, series) {
         try { history.replaceState(history.state, "", `${seriesRoute(study, series)}${params}`); } catch { /* not kept */ }
       }, 300);
     };
-    const toggle = () => h("div", { class: "segmented", role: "group", "aria-label": "Display" },
-      [["list", "List"], ["viewer", "Viewer"]].map(([value, label]) => h("button", {
-        type: "button",
-        "aria-pressed": String(value === mode),
-        onclick: () => show(value),
-      }, label)));
-    const list = (head) => h("section", { class: "card" },
+    const modes = [["list", "List"], ["viewer", "Viewer"]].map(([value, label]) => h("button", {
+      type: "button",
+      value,
+      onclick: () => show(value),
+    }, label));
+    const toggle = slices.length ? h("div", { class: "segmented small", role: "group", "aria-label": "Display" }, modes) : null;
+    const list = () => h("section", { class: "card" },
       h("div", { class: "card-head" },
-        h("h2", {}, "Instances", h("span", { class: "count" }, instances.items.length)), head),
+        h("h2", {}, "Instances", h("span", { class: "count" }, instances.items.length))),
       instances.truncated ? notice("warn", "This series has more instances than the server returns at once.") : null,
       table.el);
     const show = (next) => {
       mode = next;
+      for (const button of modes) button.setAttribute("aria-pressed", String(button.value === mode));
       opened?.dispose();
       opened = null;
       if (mode === "viewer") {
-        opened = seriesViewer(study, series, slices, slice, toggle(), signal, (i) => {
+        opened = seriesViewer(study, series, slices, slice, signal, (i) => {
           slice = i;
           keepUrl();
         });
@@ -1068,7 +1069,7 @@ function seriesView(view, state, study, series) {
           opened.el,
         ].filter(Boolean));
       } else {
-        content.replaceChildren(list(slices.length ? toggle() : null));
+        content.replaceChildren(list());
       }
       keepUrl();
     };
@@ -1082,7 +1083,7 @@ function seriesView(view, state, study, series) {
         ["Date", dateTime(item, "SeriesDate", "SeriesTime")],
         ["Instances", integer.format(number(item, "NumberOfSeriesRelatedInstances") ?? instances.items.length)],
         ["Series Instance UID", series, { mono: true }],
-      ], [archiveLink({ study, series }), sending.control, removal]),
+      ], [toggle, archiveLink({ study, series }), sending.control, removal]),
       sending.messages,
       content,
     ];
@@ -1191,7 +1192,7 @@ class SliceLoader {
  * The instance viewer for a whole series: the mouse wheel over the image, the slider or the
  * arrow keys scroll through the slices, and the tags follow the instance shown.
  */
-function seriesViewer(study, series, slices, start, toggle, signal, onSlice) {
+function seriesViewer(study, series, slices, start, signal, onSlice) {
   let index = start;
   const loader = new SliceLoader(slices.map((s) => renderedUrl(study, series, s)), (i) => {
     if (i === index) draw();
@@ -1326,7 +1327,7 @@ function seriesViewer(study, series, slices, start, toggle, signal, onSlice) {
 
   const el = h("div", { class: "instance" },
     h("section", { class: "card viewer" },
-      h("div", { class: "card-head" }, h("h2", {}, "Slice", count), toggle),
+      h("div", { class: "card-head" }, h("h2", {}, "Slice", count)),
       stage,
       slider ? h("div", { class: "controls" }, slider, label) : h("div", { class: "controls" }, label),
       h("div", { class: "card-body" }, info)),
@@ -2358,7 +2359,8 @@ let sendTarget = null;
  */
 function sendControl(level, keys) {
   const messages = h("div");
-  const control = h("span", { class: "actions" });
+  // Hidden until there is a modality to send to, so that it leaves no gap among the buttons.
+  const control = h("span", { class: "actions", hidden: true });
   loadModalities().then((data) => {
     const titles = data.modalities.map((m) => m.ae_title);
     if (!titles.length) return;
@@ -2387,6 +2389,7 @@ function sendControl(level, keys) {
       },
     }, "Send");
     control.replaceChildren(h("label", { class: "inline-field" }, "Send to", target), button);
+    control.hidden = false;
   }, () => {
     // Without the administration API (or access to it), no sending.
   });
